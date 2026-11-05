@@ -1,0 +1,17 @@
+diff --git a/ffi/src/lib.rs b/ffi/src/lib.rs
+index b68e81f..4635ee0 100644
+--- a/ffi/src/lib.rs
++++ b/ffi/src/lib.rs
+@@ -278,6 +278,12 @@ pub unsafe extern "C" fn rutabaga_init(builder: &rutabaga_builder, ptr: &mut *mu
+             .set_debug_handler(debug_handler_opt)
+             .set_rutabaga_paths(rutabaga_paths_opt)
+             .set_renderer_features(renderer_features_opt)
++            .set_display_width(
++                std::env::var("RUTABAGA_DISPLAY_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1280),
++            )
++            .set_display_height(
++                std::env::var("RUTABAGA_DISPLAY_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(1024),
++            )
+             .build();
+ 
+         let rtbg = return_on_error!(result);

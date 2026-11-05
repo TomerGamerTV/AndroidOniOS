@@ -1,0 +1,7 @@
+build/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.DS_Store
+*.ipa
+/app/AndroidOniOS.xcodeproj/

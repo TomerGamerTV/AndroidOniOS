@@ -1,0 +1,6 @@
+# AndroidOniOS: adb before boot completion.
+on property:sys.usb.config=none && property:init.svc.ranchu-adb-setup=stopped
+    write /data/misc/adb/adb_keys ${ro.boot.qemu.adb.pubkey}
+    chown system shell /data/misc/adb/adb_keys
+    chmod 0640 /data/misc/adb/adb_keys
+    setprop sys.usb.config adb

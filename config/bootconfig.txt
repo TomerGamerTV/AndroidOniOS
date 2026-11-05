@@ -1,0 +1,27 @@
+# Android bootconfig (androidboot.* -> ro.boot.*) for the Google Play emulator image on our QEMU.
+androidboot.hardware=ranchu
+androidboot.boot_devices=a003600.virtio_mmio
+androidboot.qemu=1
+androidboot.serialno=DROID0IOS0001
+androidboot.dalvik.vm.heapsize=512m
+androidboot.debug.hwui.renderer=skiagl
+androidboot.logcat=*:I
+# Graphics: gfxstream over virtio-gpu (rutabaga) instead of the goldfish pipe.
+androidboot.hardware.gltransport=virtio-gpu-asg
+androidboot.qemu.gltransport.name=virtio-gpu-asg
+androidboot.qemu.gltransport.drawFlushInterval=800
+androidboot.hardware.vulkan=ranchu
+androidboot.hardware.gralloc=minigbm
+androidboot.opengles.version=196609
+androidboot.qemu.vsync=60
+androidboot.qemu.virtiowifi=0
+androidboot.qemu.settings.system.screen_off_timeout=2147483647
+androidboot.qemu.hwcodec.avcdec=2
+androidboot.qemu.hwcodec.hevcdec=2
+androidboot.qemu.hwcodec.vpxdec=2
+androidboot.qemu.camera_protocol_ver=1
+androidboot.qemu.camera_hq_edge_processing=0
+androidboot.vbmeta.digest=9c0297e096ea94dd9a2f586e8e754abfe4160934d9346c54a8de119cabb44499
+androidboot.vbmeta.hash_alg=sha256
+androidboot.vbmeta.size=6720
+androidboot.veritymode=enforcing

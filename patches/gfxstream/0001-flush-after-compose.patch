@@ -1,0 +1,14 @@
+diff --git a/host/gl/compositor_gl.cpp b/host/gl/compositor_gl.cpp
+index c6ef5f7..346e965 100644
+--- a/host/gl/compositor_gl.cpp
++++ b/host/gl/compositor_gl.cpp
+@@ -103,6 +103,9 @@ Compositor::CompositionFinishedWaitable CompositorGl::compose(
+     m_textureDraw->cleanupForDrawLayer();
+ 
+     targetCbGl->setSync();
++    // ANGLE (Metal) shares one MTLCommandQueue across contexts: commit now so a
++    // readback from another context does not wait on an uncommitted buffer forever.
++    s_gles2.glFlush();
+ 
+     // Note: This should be returning a future when all work, both CPU and GPU, is
+     // complete but is currently only returning a future when all CPU work is completed.
