@@ -73,6 +73,10 @@ You need an Apple Silicon Mac with Xcode, Rust (`rustup`), Python 3, Meson and N
 
 `scripts/run-macos.sh` boots the same Android image with a macOS build of QEMU (`scripts/build-deps.sh macos`, `build-gfxstream.sh macos`, `build-rutabaga.sh macos`, `build-qemu.sh macos`). It uses Hypervisor.framework, so it's the fast way to test device and graphics changes. Set `ACCEL=tcg` to use the same CPU emulation as the iPhone.
 
+## Experimental: Android without a virtual machine
+
+`userland/` holds **onirun**, a prototype that runs Android's own arm64 programs directly on the host. There's no virtual machine and no Linux kernel: a block translator copies Android code almost unchanged, and a Linux system-call layer runs on Darwin. It currently runs Android's shell and toybox on macOS. See [userland/README.md](userland/README.md).
+
 ## Credits and licenses
 
 See [NOTICE.md](NOTICE.md). QEMU is GPL-2.0. gfxstream, rutabaga_gfx and MoltenVK are Apache-2.0 / BSD-3-Clause. The JIT and loopback VPN approach builds on StikJIT/StikDebug and the SideStore team's StosVPN and LocalDevVPN.
