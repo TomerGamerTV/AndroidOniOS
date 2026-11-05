@@ -1,0 +1,49 @@
+--- a/tcg/region.c	2026-11-05 02:15:51
++++ b/tcg/region.c	2026-11-05 02:15:51
+@@ -649,13 +649,33 @@
+ 
+     /* P_TRACED means the process is being debugged */
+     return (info.kp_proc.p_flag & P_TRACED) != 0;
++}
++
++/*
++ * StikDebug/StikJIT "universal" JIT protocol (TXM devices, iOS 26+): the attached
++ * debugger script prepares RX regions on `brk #0xf00d` with x16 = command.
++ */
++__attribute__((noinline, optnone, naked))
++static void *jit26_prepare_region(void *addr, size_t len)
++{
++    asm("mov x16, #1\n"
++        "brk #0xf00d\n"
++        "ret");
++}
++
++__attribute__((noinline, optnone, naked))
++static void jit26_detach(void)
++{
++    asm("mov x16, #0\n"
++        "brk #0xf00d\n"
++        "ret");
+ }
+ 
+ static void break_prepare_jit_region(mach_vm_address_t addr, size_t len)
+ {
+-    asm ("mov x0, %0\n"
+-         "mov x1, %1\n"
+-         "brk #0x69" :: "r" (addr), "r" (len) : "x0", "x1");
++    jit26_prepare_region((void *)addr, len);
++    /* All executable memory is allocated up front; release the debugger. */
++    jit26_detach();
+ }
+ #endif
+ 
+--- a/ui/meson.build	2026-11-05 02:15:51
++++ b/ui/meson.build	2026-11-05 02:15:51
+@@ -4,6 +4,7 @@
+ 
+ system_ss.add(png)
+ system_ss.add(files(
++  'droid.c',
+   'clipboard.c',
+   'console.c',
+   'cursor.c',

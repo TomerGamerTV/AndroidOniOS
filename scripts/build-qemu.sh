@@ -27,6 +27,10 @@ if [ -d "$ROOT/qemu-src" ]; then
 fi
 
 BDIR="$QSRC/build-$VARIANT"
+# TCTI's gadget generator needs Python >= 3.10.
+PY="${PYTHON:-$HOME/miniconda3/bin/python3.13}"; [ -x "$PY" ] || PY=python3
+# Some generators run via '#!/usr/bin/env python3'; make that resolve to $PY.
+[ -x "$TOOLS/py3/python3" ] && export PATH="$TOOLS/py3:$PATH"
 COMMON=(--prefix="$PREFIX/qemu-$VARIANT" --target-list=aarch64-softmmu --disable-docs --disable-werror
     --enable-slirp --enable-rutabaga-gfx --enable-pixman --disable-gnutls --disable-nettle --disable-gcrypt
     --disable-curl --disable-libssh --disable-vnc-sasl --disable-vnc-jpeg --disable-png --disable-spice
@@ -56,9 +60,13 @@ esac
 
 if [ -z "$REBUILD" ] || [ ! -f "$BDIR/build.ninja" ]; then
     rm -rf "$BDIR"; mkdir -p "$BDIR"
-    (cd "$BDIR" && ../configure "${COMMON[@]}" "${EXTRA[@]}" \
+    # Meson applies CFLAGS/LDFLAGS from the environment to the *build* machine compiler
+    # when cross compiling; pass target flags only through --extra-* options.
+    # iOS binaries must never be executed during configure.
+    if [ "$PLAT" = ios ]; then printf '[properties]\nneeds_exe_wrapper = true\n' > "$QSRC/configs/meson/darwin.txt"; else rm -f "$QSRC/configs/meson/darwin.txt"; fi
+    (cd "$BDIR" && env -u CFLAGS -u CXXFLAGS -u OBJCFLAGS -u LDFLAGS -u SDKROOT ../configure "${COMMON[@]}" "${EXTRA[@]}" \
         --extra-cflags="$CFLAGS" --extra-cxxflags="$CXXFLAGS" --extra-ldflags="$LDFLAGS" \
-        --cc="$CC" --cxx="$CXX" --objcc="$CC" )
+        --cc="$CC" --cxx="$CXX" --objcc="$CC" --python="$PY" )
 fi
-(cd "$BDIR" && ninja -j "$NCPU")
+(cd "$BDIR" && env -u SDKROOT ninja -j "$NCPU")
 echo "=== qemu $VARIANT built in $BDIR"

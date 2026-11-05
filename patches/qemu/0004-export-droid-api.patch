@@ -1,0 +1,15 @@
+--- a/system/qemu.symbols	2026-11-05 02:23:26
++++ b/system/qemu.symbols	2026-11-05 02:23:26
+@@ -8,4 +8,12 @@
+   qemu_thread_create;
+   replay_mutex_lock;
+   replay_mutex_unlock;
++  droid_display_attach;
++  droid_touch;
++  droid_key;
++  droid_powerdown;
++  droid_reset;
++  droid_set_running;
++  droid_is_running;
++  vsock_host_connect_fd;
+ };

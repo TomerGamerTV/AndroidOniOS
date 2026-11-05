@@ -37,6 +37,7 @@ export RANLIB="$(xcrun --sdk $SDK --find ranlib)"
 export NM="$(xcrun --sdk $SDK --find nm)"
 export STRIP="$(xcrun --sdk $SDK --find strip)"
 ARCH_FLAGS="-arch arm64 -isysroot $SDKROOT $MINVER_FLAG"
+[ "$PLATFORM" = ios ] && ARCH_FLAGS="$ARCH_FLAGS -I$ROOT/ios-shim/include"
 export CFLAGS="$ARCH_FLAGS -O2 -I$PREFIX/include"
 export CXXFLAGS="$ARCH_FLAGS -O2 -I$PREFIX/include"
 export OBJCFLAGS="$ARCH_FLAGS -O2 -I$PREFIX/include"
@@ -48,17 +49,19 @@ mkdir -p "$PREFIX" "$SRC"
 
 meson_quote() { local out=""; for a in "$@"; do out="$out'$a', "; done; echo "${out%, }"; }
 
-MESON_CROSS="$BUILD/meson-$PLATFORM.cross"
+write_cross() { # [extra c/cxx flags] -> sets MESON_CROSS
+local extra="$1"
+MESON_CROSS="$BUILD/meson-$PLATFORM${2:+-$2}.cross"
 cat > "$MESON_CROSS" <<EOF
 [properties]
 needs_exe_wrapper = $( [ "$PLATFORM" = ios ] && echo true || echo false )
 has_function_pipe2 = false
 has_function_dup3 = false
 [built-in options]
-c_args = [$(meson_quote $CFLAGS)]
-cpp_args = [$(meson_quote $CXXFLAGS)]
-objc_args = [$(meson_quote $OBJCFLAGS)]
-objcpp_args = [$(meson_quote $OBJCFLAGS)]
+c_args = [$(meson_quote $CFLAGS $extra)]
+cpp_args = [$(meson_quote $CXXFLAGS $extra)]
+objc_args = [$(meson_quote $OBJCFLAGS $extra)]
+objcpp_args = [$(meson_quote $OBJCFLAGS $extra)]
 c_link_args = [$(meson_quote $LDFLAGS)]
 cpp_link_args = [$(meson_quote $LDFLAGS)]
 objc_link_args = [$(meson_quote $LDFLAGS)]
@@ -81,6 +84,8 @@ cpu_family = 'aarch64'
 cpu = 'aarch64'
 endian = 'little'
 EOF
+}
+write_cross
 
 fetch() { # url -> extracts into $SRC, echoes dir
     local url="$1" file dir

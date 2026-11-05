@@ -9,14 +9,15 @@ for p in "$ROOT"/patches/gfxstream/*.patch; do
     [ -f "$stamp" ] || { echo "applying $(basename "$p")"; patch -d "$D" -p1 < "$p" && touch "$stamp"; }
 done
 # QEMU_NEXT: compose/post on gfxstream's own post thread instead of an embedder UI thread.
-EXTRA_ARGS="-DQEMU_NEXT=1"
+write_cross "-DQEMU_NEXT=1" gfxstream
+# gfxstream keys all Apple code paths off system == 'darwin'.
+sed -i '' "s/^system = .*/system = 'darwin'/" "$MESON_CROSS"
 BDIR="$D/build-$PLATFORM"
 if [ -z "$REBUILD" ] || [ ! -f "$BDIR/build.ninja" ]; then
     rm -rf "$BDIR"
     meson setup "$BDIR" "$D" --prefix="$PREFIX" --libdir=lib --buildtype=release \
         --default-library=static --cross-file "$MESON_CROSS" \
-        -Ddecoders=gles,vulkan,composer -Dcpp_args="$EXTRA_ARGS" -Dc_args="$EXTRA_ARGS" \
-        -Dobjcpp_args="$EXTRA_ARGS"
+        -Ddecoders=$( [ "$PLATFORM" = ios ] && echo gles,vulkan,composer || echo gles,vulkan,composer )
 fi
 meson compile -C "$BDIR" -j "$NCPU"
 meson install -C "$BDIR" --quiet

@@ -1,0 +1,197 @@
+diff --git a/common/base/meson.build b/common/base/meson.build
+index b24bae9..1744e02 100644
+--- a/common/base/meson.build
++++ b/common/base/meson.build
+@@ -31,8 +31,13 @@ if host_machine.system() == 'windows'
+ elif host_machine.system() == 'darwin'
+   files_lib_common_base += 'SharedMemory_posix.cpp'
+   files_lib_common_base += 'Thread_pthread.cpp'
+-  files_lib_common_base += 'system-native-mac.mm'
+-  common_base_deps += dependency('appleframeworks', modules: ['Foundation', 'AppKit', 'IOKit'])
++  if is_ios
++    files_lib_common_base += 'system-native-ios.mm'
++    common_base_deps += dependency('appleframeworks', modules: ['Foundation'])
++  else
++    files_lib_common_base += 'system-native-mac.mm'
++    common_base_deps += dependency('appleframeworks', modules: ['Foundation', 'AppKit', 'IOKit'])
++  endif
+ else
+   files_lib_common_base += 'SharedMemory_posix.cpp'
+   files_lib_common_base += 'Thread_pthread.cpp'
+diff --git a/common/base/system-native-ios.mm b/common/base/system-native-ios.mm
+new file mode 100644
+index 0000000..ee5d188
+--- /dev/null
++++ b/common/base/system-native-ios.mm
+@@ -0,0 +1,33 @@
++// iOS variant of system-native-mac.mm (no AppKit / IOKit registry access).
++#include "gfxstream/Optional.h"
++#include "gfxstream/system/Memory.h"
++#include "gfxstream/system/System.h"
++
++#import <Foundation/Foundation.h>
++#include <mach/mach.h>
++#include <stdio.h>
++
++namespace gfxstream {
++namespace base {
++
++void disableAppNap_macImpl(void) {}
++
++void cpuUsageCurrentThread_macImpl(uint64_t* user, uint64_t* sys) {
++    mach_port_t thread = mach_thread_self();
++    thread_basic_info_data_t info;
++    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++    if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS) {
++        *user = info.user_time.seconds * 1000000ULL + info.user_time.microseconds;
++        *sys = info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
++    }
++    mach_port_deallocate(mach_task_self(), thread);
++}
++
++Optional<DiskKind> nativeDiskKind(int st_dev) {
++    return DiskKind::Ssd;
++}
++
++void hideDockIcon_macImpl(void) {}
++
++}  // namespace base
++}  // namespace gfxstream
+diff --git a/host/gl/glestranslator/egl/egl_os_api_egl.cpp b/host/gl/glestranslator/egl/egl_os_api_egl.cpp
+index 9a9038d..c62b3b4 100644
+--- a/host/gl/glestranslator/egl/egl_os_api_egl.cpp
++++ b/host/gl/glestranslator/egl/egl_os_api_egl.cpp
+@@ -80,7 +80,12 @@ static const char* kGLES2LibName = "libGLESv2.so";
+ 
+ #else // __APPLE__
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include "ios_native.h"
++#else
+ #include "mac_native.h"
++#endif
+ 
+ static const char* kEGLLibName = "libEGL.dylib";
+ static const char* kGLES2LibName = "libGLESv2.dylib";
+diff --git a/host/gl/glestranslator/egl/ios_native.h b/host/gl/glestranslator/egl/ios_native.h
+new file mode 100644
+index 0000000..95853a7
+--- /dev/null
++++ b/host/gl/glestranslator/egl/ios_native.h
+@@ -0,0 +1,11 @@
++// iOS stand-ins for mac_native.h used by the EGL-on-EGL (ANGLE) backend.
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++bool nsGetWinDims(void* win, unsigned int* width, unsigned int* height);
++bool nsCheckColor(void* win, int colorSize);
++void* nsGetLayer(void* nativeWin);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/host/gl/glestranslator/egl/ios_native.mm b/host/gl/glestranslator/egl/ios_native.mm
+new file mode 100644
+index 0000000..12e4e7e
+--- /dev/null
++++ b/host/gl/glestranslator/egl/ios_native.mm
+@@ -0,0 +1,25 @@
++// iOS: native windows are CALayers; host GL always goes through EGL (ANGLE).
++#import <QuartzCore/QuartzCore.h>
++#include "ios_native.h"
++#include "egl_os_api.h"
++
++extern "C" bool nsGetWinDims(void* win, unsigned int* width, unsigned int* height) {
++    if (!win) return false;
++    CALayer* layer = (__bridge CALayer*)win;
++    CGSize size = layer.bounds.size;
++    CGFloat scale = layer.contentsScale;
++    *width = (unsigned int)(size.width * scale);
++    *height = (unsigned int)(size.height * scale);
++    return true;
++}
++
++extern "C" bool nsCheckColor(void* win, int colorSize) { return true; }
++
++extern "C" void* nsGetLayer(void* nativeWin) { return nativeWin; }
++
++EglOS::Engine* EglOS::Engine::createHostInstance() {
++    return EglOS::getEgl2EglHostInstance(false);
++}
++
++// Used by the host video decoder path on macOS only; never reached on iOS.
++extern "C" void nsConvertVideoFrameToNV12Textures(void* context, void* iosurface, int Ytex, int UVtex) {}
+diff --git a/host/gl/glestranslator/egl/meson.build b/host/gl/glestranslator/egl/meson.build
+index aa89d41..98898ee 100644
+--- a/host/gl/glestranslator/egl/meson.build
++++ b/host/gl/glestranslator/egl/meson.build
+@@ -40,7 +40,10 @@ egl_cpp_args = [
+ ]
+ 
+ egl_deps = []
+-if host_machine.system() == 'darwin'
++if is_ios
++  files_lib_egl_translator += files('ios_native.mm')
++  egl_deps += dependency('appleframeworks', modules: ['QuartzCore', 'IOSurface'])
++elif host_machine.system() == 'darwin'
+   files_lib_egl_translator += files_egl_darwin
+   egl_deps += dependency('appleframeworks', modules: ['AppKit', 'IOSurface'])
+ elif host_machine.system() == 'windows'
+diff --git a/host/meson.build b/host/meson.build
+index 0bd599e..c56d9fa 100644
+--- a/host/meson.build
++++ b/host/meson.build
+@@ -157,7 +157,7 @@ if host_machine.system() == 'linux'
+ elif host_machine.system() == 'darwin'
+   deps_gfxstream_backend += [
+     thread_dep,
+-    dependency('appleframeworks', modules: ['AppKit', 'QuartzCore', 'IOSurface']),
++    dependency('appleframeworks', modules: is_ios ? ['QuartzCore', 'IOSurface', 'Metal'] : ['AppKit', 'QuartzCore', 'IOSurface']),
+   ]
+   link_args_gfxstream_backend = ['-undefined', 'dynamic_lookup', '-flat_namespace']
+ elif host_machine.system() == 'qnx'
+diff --git a/host/native_window/meson.build b/host/native_window/meson.build
+index fe6a556..5936c31 100644
+--- a/host/native_window/meson.build
++++ b/host/native_window/meson.build
+@@ -16,6 +16,8 @@ includes_lib_host_native_window = [
+ 
+ if not use_gles
+   files_lib_host_native_window += files('native_sub_window_stub.cpp')
++elif is_ios
++  files_lib_host_native_window += files('native_sub_window_stub.cpp')
+ elif host_machine.system() == 'darwin'
+   files_lib_host_native_window += files('native_sub_window_cocoa.mm')
+   includes_lib_host_native_window += [inc_opengl_headers]
+diff --git a/host/native_window/native_sub_window_stub.cpp b/host/native_window/native_sub_window_stub.cpp
+index 6375fdd..166813f 100644
+--- a/host/native_window/native_sub_window_stub.cpp
++++ b/host/native_window/native_sub_window_stub.cpp
+@@ -36,3 +36,8 @@ void* getNativeDisplay() {
+     fprintf(stderr, "%s: Unimplemented\n", __func__);
+     return nullptr;
+ }
++
++#if defined(__APPLE__)
++// iOS: native windows passed to gfxstream are already CAMetalLayer pointers.
++extern "C" void* getMetalLayerFromView(void* view) { return view; }
++#endif
+diff --git a/meson.build b/meson.build
+index 366d284..e1c52cb 100644
+--- a/meson.build
++++ b/meson.build
+@@ -18,6 +18,13 @@ if host_machine.system() == 'darwin'
+   add_languages('objc', 'objcpp')
+ endif
+ 
++# iOS builds use host_machine.system() == 'darwin' too; tell them apart here.
++is_ios = host_machine.system() == 'darwin' and cc.compiles('''#include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE
++#error not ios
++#endif
++''', name: 'targeting iOS')
++
+ #========================#
+ # Logging + error report #
+ #========================#
