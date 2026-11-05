@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <os/os_sync_wait_on_address.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -31,16 +32,21 @@ char g_exe_path[1024];
 
 static uint64_t g_sigactions[65][4];
 
+// Protects the syscall layer's tables (fd paths, directory streams, mapping notes, threads).
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LOCKED(stmt) do { pthread_mutex_lock(&g_lock); stmt; pthread_mutex_unlock(&g_lock); } while (0)
+
 // Guest path of each open fd, for /proc/self/fd/N (bionic's realpath() relies on it).
 #define MAX_FDS 4096
 static char *fd_path[MAX_FDS];
-static void fd_set_path(int fd, const char *p) {
+static void fd_set_path_locked(int fd, const char *p) {
     if (fd < 0 || fd >= MAX_FDS) return;
     free(fd_path[fd]);
     fd_path[fd] = p ? strdup(p) : NULL;
 }
+static void fd_set_path(int fd, const char *p) { LOCKED(fd_set_path_locked(fd, p)); }
 static void fd_copy(int from, int to) {
-    if (from >= 0 && from < MAX_FDS && to >= 0 && to < MAX_FDS) fd_set_path(to, fd_path[from]);
+    if (from >= 0 && from < MAX_FDS && to >= 0 && to < MAX_FDS) LOCKED(fd_set_path_locked(to, fd_path[from]));
 }
 
 // ---- errno ----
@@ -261,10 +267,11 @@ static DirState *dir_for(int fd) {
     dirs = s;
     return s;
 }
-static void dir_forget(int fd) {
+static void dir_forget_locked(int fd) {
     for (DirState **pp = &dirs; *pp; pp = &(*pp)->next)
         if ((*pp)->fd == fd) { DirState *s = *pp; *pp = s->next; closedir(s->d); free(s); return; }
 }
+static void dir_forget(int fd) { LOCKED(dir_forget_locked(fd)); }
 static uint64_t sys_getdents64(int fd, uint8_t *buf, size_t len) {
     DirState *s = dir_for(fd);
     if (!s) return ERR(9);
@@ -296,10 +303,13 @@ static uint64_t sys_getdents64(int fd, uint8_t *buf, size_t len) {
 typedef struct MapRec { uint64_t start, end, off; char *path; struct MapRec *next; } MapRec;
 static MapRec *maps;
 static void map_note(uint64_t start, uint64_t len, uint64_t off, int fd) {
-    if (fd < 0 || fd >= MAX_FDS || !fd_path[fd]) return;
-    MapRec *m = calloc(1, sizeof *m);
-    m->start = start; m->end = start + len; m->off = off; m->path = strdup(fd_path[fd]);
-    m->next = maps; maps = m;
+    pthread_mutex_lock(&g_lock);
+    if (fd >= 0 && fd < MAX_FDS && fd_path[fd]) {
+        MapRec *m = calloc(1, sizeof *m);
+        m->start = start; m->end = start + len; m->off = off; m->path = strdup(fd_path[fd]);
+        m->next = maps; maps = m;
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 void sys_note_mapping(uint64_t start, uint64_t len, uint64_t off, const char *path) {
     MapRec *m = calloc(1, sizeof *m);
@@ -488,13 +498,105 @@ static void sigreturn(GuestCtx *c) {
          (unsigned long long)c->sp, (unsigned long long)c->x[19], (unsigned long long)((uint64_t *)gptr(c->sp))[1]);
 }
 
+// Takes one deliverable signal (thread-directed first, then process-wide), or returns 0.
+static int take_signal(GuestCtx *c) {
+    for (;;) {
+        uint64_t mine = c->pending & ~c->sigmask;
+        if (mine) {
+            int sig = __builtin_ctzll(mine) + 1;
+            uint64_t bit = 1ull << (sig - 1);
+            if (__atomic_fetch_and(&c->pending, ~bit, __ATOMIC_SEQ_CST) & bit) return sig;
+            continue;
+        }
+        uint64_t pend = g_pending & ~c->sigmask;
+        if (!pend) return 0;
+        int sig = __builtin_ctzll(pend) + 1;
+        uint64_t bit = 1ull << (sig - 1);
+        if (__atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit) return sig;
+    }
+}
+
 void sys_deliver_signals(GuestCtx *c) {
-    uint64_t pend = g_pending & ~c->sigmask;
-    if (!pend) return;
-    int sig = __builtin_ctzll(pend) + 1;
-    __atomic_and_fetch(&g_pending, ~(1ull << (sig - 1)), __ATOMIC_SEQ_CST);
+    if (!((c->pending | g_pending) & ~c->sigmask)) return;
+    int sig = take_signal(c);
+    if (!sig) return;
     LOGV("[%d] deliver signal %d at pc %llx sp %llx\n", getpid(), sig, (unsigned long long)c->pc, (unsigned long long)c->sp);
     if (g_sigactions[sig][0] > 1) push_signal(c, sig, c->sigmask);
+}
+
+// ---- threads ----
+static GuestCtx *g_threads;
+static int g_nthreads;
+static uint32_t g_next_tid = 0x40000000;   // guest thread ids, distinct from host pids
+
+void sys_register_main_thread(GuestCtx *c) {
+    c->host_thread = (void *)pthread_self();
+    LOCKED({ c->next_thread = g_threads; g_threads = c; g_nthreads++; });
+}
+
+static GuestCtx *find_thread(uint64_t tid) {
+    GuestCtx *t;
+    pthread_mutex_lock(&g_lock);
+    for (t = g_threads; t && t->tid != tid; t = t->next_thread) {}
+    pthread_mutex_unlock(&g_lock);
+    return t;
+}
+
+static void *guest_thread_main(void *arg) {
+    GuestCtx *c = arg;
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16 };
+    sigaltstack(&ss, NULL);
+    c->host_thread = (void *)pthread_self();
+    tr_run(c);
+    return NULL;
+}
+
+// ---- futex ----
+static uint64_t futex_wake(uint64_t addr, uint64_t n, bool shared) {
+    os_sync_wake_by_address_flags_t f = shared ? OS_SYNC_WAKE_BY_ADDRESS_SHARED : OS_SYNC_WAKE_BY_ADDRESS_NONE;
+    if (n >= 0x7fffffff) return os_sync_wake_by_address_all(gptr(addr), 4, f) == 0 ? 1 : 0;
+    uint64_t woken = 0;
+    while (woken < n && os_sync_wake_by_address_any(gptr(addr), 4, f) == 0) woken++;
+    return woken;
+}
+
+static uint64_t sys_futex(uint64_t addr, uint64_t op_full, uint64_t val, uint64_t ts, uint64_t addr2, uint64_t val3) {
+    int op = (int)(op_full & 0x7f);
+    bool shared = !(op_full & 128), realtime = op_full & 256;
+    switch (op) {
+    case 0: case 9: {          // FUTEX_WAIT(_BITSET)
+        os_sync_wait_on_address_flags_t f = shared ? OS_SYNC_WAIT_ON_ADDRESS_SHARED : OS_SYNC_WAIT_ON_ADDRESS_NONE;
+        if (__atomic_load_n((uint32_t *)gptr(addr), __ATOMIC_SEQ_CST) != (uint32_t)val) return ERR(11);
+        int rc;
+        if (ts) {
+            const struct timespec *t = gptr(ts);
+            int64_t ns = (int64_t)t->tv_sec * 1000000000 + t->tv_nsec;
+            if (op == 9) {      // absolute timeout
+                struct timespec now;
+                clock_gettime(realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+                ns -= (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+                if (ns <= 0) return ERR(110);
+            }
+            rc = os_sync_wait_on_address_with_timeout(gptr(addr), (uint32_t)val, 4, f, OS_CLOCK_MACH_ABSOLUTE_TIME, (uint64_t)ns);
+        } else {
+            rc = os_sync_wait_on_address(gptr(addr), (uint32_t)val, 4, f);
+        }
+        if (rc < 0) return errno == ETIMEDOUT ? ERR(110) : errno == EINTR ? ERR(4) : 0;
+        return 0;
+    }
+    case 1: case 10:           // FUTEX_WAKE(_BITSET)
+        return futex_wake(addr, val, shared);
+    case 3: case 4: {          // FUTEX_(CMP_)REQUEUE: wake everyone on both (spurious wakeups are legal)
+        if (op == 4 && __atomic_load_n((uint32_t *)gptr(addr), __ATOMIC_SEQ_CST) != (uint32_t)val3) return ERR(11);
+        uint64_t n = futex_wake(addr, 0x7fffffff, shared);
+        futex_wake(addr2, 0x7fffffff, shared);
+        return n;
+    }
+    case 5:                    // FUTEX_WAKE_OP: approximate as wake both
+        return futex_wake(addr, val, shared) + futex_wake(addr2, ts, shared);
+    default:
+        return ERR(38);
+    }
 }
 
 // ---- system call table ----
@@ -556,7 +658,7 @@ void sys_dispatch(GuestCtx *c) {
         r = HOSTRET(faccessat(hfd, path, (int)a2, 0));
         break;
     }
-    case 61: r = sys_getdents64((int)a0, gptr(a1), a2); break;
+    case 61: LOCKED(r = sys_getdents64((int)a0, gptr(a1), a2)); break;
     case 17: {   // getcwd
         size_t n = strlen(g_cwd) + 1;
         if (n > a1) { r = ERR(34); break; }
@@ -641,13 +743,11 @@ void sys_dispatch(GuestCtx *c) {
         sigfillset(&all);
         sigemptyset(&none);
         sigprocmask(SIG_BLOCK, &all, &prev);
-        while (!(g_pending & ~c->sigmask)) sigsuspend(&none);
+        while (!((g_pending | c->pending) & ~c->sigmask)) sigsuspend(&none);
         sigprocmask(SIG_SETMASK, &prev, NULL);
         c->x[0] = ERR(4);
-        uint64_t pend = g_pending & ~c->sigmask;
-        int sig = __builtin_ctzll(pend) + 1;
-        __atomic_and_fetch(&g_pending, ~(1ull << (sig - 1)), __ATOMIC_SEQ_CST);
-        if (g_sigactions[sig][0] > 1) push_signal(c, sig, old);
+        int sig = take_signal(c);
+        if (sig && g_sigactions[sig][0] > 1) push_signal(c, sig, old);
         else c->sigmask = old;
         return;
     }
@@ -739,32 +839,78 @@ void sys_dispatch(GuestCtx *c) {
         for (int i = 0; i < n && i < (int)a1 * 8; i++) ((uint8_t *)gptr(a2))[i / 8] |= 1 << (i % 8);
         r = 8; break;
     }
-    case 98: {                // futex (single thread for now)
-        int op = (int)(a1 & 0x7f);
-        if (op == 0 || op == 9) r = (*(uint32_t *)gptr(a0) != (uint32_t)a2) ? ERR(11) : ERR(110);
-        else r = 0;
-        break;
+    case 98: r = sys_futex(a0, a1, a2, a3, a4, a5); break;
+    case 93: {                        // exit: this thread only
+        if (c->clear_child_tid) {
+            __atomic_store_n((uint32_t *)gptr(c->clear_child_tid), 0, __ATOMIC_SEQ_CST);
+            futex_wake(c->clear_child_tid, 0x7fffffff, true);
+            futex_wake(c->clear_child_tid, 0x7fffffff, false);
+        }
+        bool last;
+        pthread_mutex_lock(&g_lock);
+        for (GuestCtx **pp = &g_threads; *pp; pp = &(*pp)->next_thread)
+            if (*pp == c) { *pp = c->next_thread; break; }
+        last = --g_nthreads == 0;
+        pthread_mutex_unlock(&g_lock);
+        if (last) { fflush(stdout); exit((int)(a0 & 0xff)); }
+        pthread_exit(NULL);
     }
-    case 93: case 94: fflush(stdout); exit((int)(a0 & 0xff));
+    case 94: fflush(stdout); exit((int)(a0 & 0xff));
     case 129: {                       // kill
         if (a1 == 6 && ((int64_t)a0 == getpid() || a0 == 0)) { sys_backtrace(c); die("onirun: guest called abort()"); }
         int hs = a1 ? host_sig(a1) : 0;
         if (a1 && !hs) { r = 0; break; }
         r = HOSTRET(kill((pid_t)a0, hs)); break;
     }
-    case 130: case 131: {             // tkill / tgkill (single-threaded processes for now)
-        uint64_t sig = nr == 131 ? a2 : a1;
+    case 130: case 131: {             // tkill / tgkill
+        uint64_t tid = nr == 131 ? a1 : a0, sig = nr == 131 ? a2 : a1;
         if (sig == 6) { sys_backtrace(c); die("onirun: guest called abort()"); }
-        r = sig ? HOSTRET(kill(getpid(), host_sig(sig))) : 0; break;
+        GuestCtx *t = find_thread(tid);
+        if (!t) { r = ERR(3); break; }
+        if (!sig) { r = 0; break; }
+        if (sig > 64) { r = ERR(22); break; }
+        __atomic_or_fetch(&t->pending, 1ull << (sig - 1), __ATOMIC_SEQ_CST);
+        // Interrupt a blocking host call in that thread; the handler itself only marks pending.
+        int hs = host_sig(sig);
+        if (t != c && hs && g_sigactions[sig][0] > 1) pthread_kill((pthread_t)t->host_thread, hs);
+        r = 0; break;
     }
-    case 220: {                       // clone: fork-style only, on the host for now
+    case 220: {                       // clone
         uint64_t flags = a0;
-        if (flags & 0x10000) { r = ERR(38); break; }   // CLONE_THREAD: not yet
+        if (flags & 0x10000) {        // CLONE_THREAD: a guest thread on a new host thread
+            GuestCtx *nc = malloc(sizeof *nc);
+            memcpy(nc, c, sizeof *nc);
+            nc->x[0] = 0;
+            nc->sp = a1;
+            nc->pending = 0;
+            nc->clear_child_tid = (flags & 0x00200000) ? a4 : 0;
+            if (flags & 0x00080000) nc->tpidr = a3;
+            pthread_mutex_lock(&g_lock);
+            nc->tid = g_next_tid++;
+            nc->next_thread = g_threads;
+            g_threads = nc;
+            g_nthreads++;
+            pthread_mutex_unlock(&g_lock);
+            if (flags & 0x00100000) *(uint32_t *)gptr(a2) = (uint32_t)nc->tid;   // PARENT_SETTID
+            if (flags & 0x01000000) *(uint32_t *)gptr(a4) = (uint32_t)nc->tid;   // CHILD_SETTID
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_attr_setstacksize(&at, 1 << 20);
+            pthread_t th;
+            int rc = pthread_create(&th, &at, guest_thread_main, nc);
+            pthread_attr_destroy(&at);
+            r = rc ? ERR(11) : nc->tid;
+            break;
+        }
         fflush(stdout);
         pid_t pid = fork();
         if (pid == 0) {
             tr_after_fork();
             c->tid = (uint64_t)getpid();
+            g_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+            g_threads = c; c->next_thread = NULL; g_nthreads = 1;
+            c->host_thread = (void *)pthread_self();
             // arm64 argument order (as bionic's __bionic_clone passes it): flags, newsp, parent_tid,
             // tls, child_tid
             if ((flags & 0x01000000) && a4) *(uint32_t *)gptr(a4) = (uint32_t)c->tid;   // CHILD_SETTID

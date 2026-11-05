@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
     c->pc = img.entry;
     c->sp = img.sp;
     c->tid = (uint64_t)getpid();
+    sys_register_main_thread(c);
     tr_run(c);
     return 0;
 }

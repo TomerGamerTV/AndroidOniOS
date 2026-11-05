@@ -28,6 +28,9 @@ typedef struct GuestCtx {
     uint64_t tid;
     uint64_t clear_child_tid;
     uint64_t sigmask;
+    volatile uint64_t pending;     // signals sent to this thread (tgkill)
+    void *host_thread;             // pthread_t
+    struct GuestCtx *next_thread;
 } GuestCtx;
 
 #define CTX_X(n) ((n) * 8)
@@ -51,6 +54,7 @@ GuestCtx *tr_current(void);
 
 // syscall.c
 void sys_init(const char *rootfs);
+void sys_register_main_thread(GuestCtx *c);
 void sys_dispatch(GuestCtx *c);
 void sys_deliver_signals(GuestCtx *c);
 void sys_note_mapping(uint64_t start, uint64_t len, uint64_t off, const char *path);

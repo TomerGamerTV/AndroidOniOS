@@ -18,7 +18,7 @@ _Static_assert(offsetof(GuestCtx, q) == 320, "ctx layout");
 _Static_assert(offsetof(GuestCtx, host_sp) == 832, "ctx layout");
 _Static_assert(offsetof(GuestCtx, host_d) == 936, "ctx layout");
 
-#define CACHE_SIZE (96u << 20)
+#define CACHE_SIZE (256u << 20)
 #define MAX_BLOCK_INSNS 256
 #define TRAMP_WORDS 6
 
@@ -45,7 +45,7 @@ static ExitRec *exit_recs;
 // Indirect-branch lookup table, probed inline by translated code: {guest pc, host block entry}.
 #define IB_BITS 14
 typedef struct { uint64_t pc; uint32_t *host; } IbEntry;
-static IbEntry ib_table[1 << IB_BITS];
+static IbEntry ib_table[1 << IB_BITS] __attribute__((aligned(16)));
 static EmuRec *emu_recs;
 
 static Block *lookup(uint64_t pc) {
@@ -54,7 +54,9 @@ static Block *lookup(uint64_t pc) {
     return NULL;
 }
 
+static int g_flushes;
 static void cache_flush_all(void) {
+    if (++g_flushes > 1) fprintf(stderr, "onirun: warning: code cache flush #%d\n", g_flushes);
     for (unsigned i = 0; i < (1u << HBITS); i++) {
         Block *b = htab[i];
         while (b) { Block *n = b->next; free(b); b = n; }
@@ -399,8 +401,9 @@ void tr_run(GuestCtx *c) {
             pthread_mutex_lock(&tr_lock);
             uint32_t *t = get_block(c->pc);
             IbEntry *e = &ib_table[(c->pc >> 2) & ((1 << IB_BITS) - 1)];
-            e->host = t;
-            e->pc = c->pc;
+            // One 16-byte store (single-copy atomic with FEAT_LSE2) so racing threads never
+            // see a pc paired with another block's code.
+            __asm__ volatile("stp %0, %1, [%2]" :: "r"(c->pc), "r"(t), "r"(e) : "memory");
             pthread_mutex_unlock(&tr_lock);
             break;
         }
