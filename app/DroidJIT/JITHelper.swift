@@ -9,7 +9,7 @@ final class JITHelper: AppExtension {
 
     @AppExtensionPoint.Bind
     var boundExtensionPoint: AppExtensionPoint {
-        AppExtensionPoint.Identifier(host: "com.tomer.androidonios", name: "jit-helper")
+        AppExtensionPoint.Identifier(host: "com.tomergamertv.oni", name: "jit-helper")
     }
 
     var configuration: some AppExtensionConfiguration {
@@ -82,7 +82,7 @@ final class JITService: NSObject, DroidJITProtocol {
 /// Progress log shared with the app (App Group: jit.log) so JIT failures can be diagnosed.
 enum JITLog {
     private static let url = FileManager.default
-        .containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomer.androidonios")?
+        .containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomergamertv.oni")?
         .appendingPathComponent("jit.log")
 
     static func reset() {

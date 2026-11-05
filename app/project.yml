@@ -1,6 +1,6 @@
 name: AndroidOniOS
 options:
-  bundleIdPrefix: com.tomer
+  bundleIdPrefix: com.tomergamertv
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
@@ -31,7 +31,7 @@ targets:
           - "Droid.entitlements"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomergamertv.oni
         PRODUCT_NAME: Droid
         INFOPLIST_FILE: Droid/Info.plist
         CODE_SIGN_ENTITLEMENTS: Droid/Droid.entitlements
@@ -83,7 +83,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.jit
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomergamertv.oni.jit
         PRODUCT_NAME: DroidJIT
         INFOPLIST_FILE: DroidJIT/Info.plist
         CODE_SIGN_ENTITLEMENTS: DroidJIT/DroidJIT.entitlements
@@ -110,7 +110,7 @@ targets:
           - "DroidTunnel.entitlements"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.tunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomergamertv.oni.tunnel
         PRODUCT_NAME: DroidTunnel
         INFOPLIST_FILE: DroidTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: DroidTunnel/DroidTunnel.entitlements
@@ -127,7 +127,7 @@ targets:
           - "DroidShare.entitlements"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.share
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomergamertv.oni.share
         PRODUCT_NAME: DroidShare
         INFOPLIST_FILE: DroidShare/Info.plist
         CODE_SIGN_ENTITLEMENTS: DroidShare/DroidShare.entitlements

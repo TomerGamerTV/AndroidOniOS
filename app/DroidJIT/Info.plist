@@ -23,7 +23,7 @@
 	<key>EXAppExtensionAttributes</key>
 	<dict>
 		<key>EXExtensionPointIdentifier</key>
-		<string>com.tomer.androidonios.jit-helper</string>
+		<string>com.tomergamertv.oni.jit-helper</string>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connects to this device's developer tunnel to enable JIT.</string>

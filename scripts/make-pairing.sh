@@ -13,5 +13,5 @@ OUT="$ROOT/build/rp_pairing_file.plist"
 "$SRC/target/release/idevice-tools" remotepairing_lockdown pair StikJIT "$OUT"
 chmod 600 "$OUT"
 xcrun devicectl device copy to --device "$DEV" --domain-type appDataContainer \
-    --domain-identifier com.tomer.androidonios --source "$OUT" --destination Library/Android/pairingFile.plist
+    --domain-identifier com.tomergamertv.oni --source "$OUT" --destination Library/Android/pairingFile.plist
 echo "pairing file installed"

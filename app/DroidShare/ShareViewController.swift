@@ -19,7 +19,7 @@ final class ShareViewController: UIViewController {
     }
 
     private var inbox: URL {
-        let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomer.androidonios")!
+        let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomergamertv.oni")!
         let u = base.appendingPathComponent("Inbox", isDirectory: true)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u

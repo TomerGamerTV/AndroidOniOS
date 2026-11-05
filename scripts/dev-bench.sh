@@ -6,7 +6,7 @@ DEV=${DEV:?set DEV to your iPhone UDID (xcrun devicectl list devices)}
 HOST=${MONITOR_HOST:-169.254.116.178}
 sh() { echo "$1" | nc -w 120 "$HOST" 4445; }
 t0=$(date +%s)
-xcrun devicectl device process launch --device "$DEV" --terminate-existing com.tomer.androidonios >/dev/null 2>&1
+xcrun devicectl device process launch --device "$DEV" --terminate-existing com.tomergamertv.oni >/dev/null 2>&1
 sleep 15
 until [ "$(sh 'getprop sys.boot_completed' 2>/dev/null | tr -d '\r\n ')" = "1" ]; do
     sleep 2; [ $(( $(date +%s) - t0 )) -gt 400 ] && { echo "boot timeout"; exit 1; }

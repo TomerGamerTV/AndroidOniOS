@@ -4,7 +4,7 @@ import NetworkExtension
 /// 10.7.0.1. iOS asks once to "Add VPN Configurations".
 final class LoopbackVPN {
     static let shared = LoopbackVPN()
-    private let providerID = "com.tomer.androidonios.tunnel"
+    private let providerID = "com.tomergamertv.oni.tunnel"
 
     func start(timeout: TimeInterval = 15, completion: @escaping (Bool, String) -> Void) {
         NETunnelProviderManager.loadAllFromPreferences { managers, error in
@@ -15,7 +15,7 @@ final class LoopbackVPN {
             proto.providerBundleIdentifier = self.providerID
             proto.serverAddress = "On-device JIT tunnel"
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "Android JIT"
+            manager.localizedDescription = "Oni JIT"
             manager.isEnabled = true
             manager.saveToPreferences { error in
                 if let error {

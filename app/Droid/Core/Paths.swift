@@ -20,7 +20,7 @@ enum Paths {
     static var sharedStorage: URL { ensure(documents.appendingPathComponent("Android Storage", isDirectory: true)) }
 
     static var appGroup: URL? {
-        fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomer.androidonios")
+        fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.tomergamertv.oni")
     }
     /// APKs and files handed over by the share extension.
     static var inbox: URL {
