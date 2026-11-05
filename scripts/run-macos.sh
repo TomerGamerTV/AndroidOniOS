@@ -4,7 +4,7 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMG="${IMG:-$ROOT/build/images/a17/arm64-v8a}"
 VM="$ROOT/build/vm-macos"
-Q="$ROOT/build/src/qemu-10.0.12-utm/build-macos/qemu-system-aarch64-unsigned"
+Q="${QBIN:-$ROOT/build/src/qemu-10.0.12-utm/build-macos/qemu-system-aarch64-unsigned}"
 mkdir -p "$VM"
 [ -f "$VM/metadata.img" ] || cp "$IMG/encryptionkey.img" "$VM/metadata.img"
 [ -f "$VM/userdata.img" ] || truncate -s 8G "$VM/userdata.img"
@@ -30,9 +30,11 @@ export DYLD_LIBRARY_PATH="$VM/lib" DYLD_FRAMEWORK_PATH="$FW" ANGLE_DEFAULT_PLATF
 export RUTABAGA_DISPLAY_WIDTH="${WIDTH:-1080}" RUTABAGA_DISPLAY_HEIGHT="${HEIGHT:-2400}"
 pkill -f "droidsvc.py $VM/svc.sock" 2>/dev/null || true
 python3 "$ROOT/tools/droidsvc.py" "$VM/svc.sock" > "$VM/droidsvc.log" 2>&1 &
+pkill -f "modemsim $VM/modem.sock" 2>/dev/null || true
+rm -f "$VM/modem.log"; "$ROOT/build/tools/bin/modemsim" "$VM/modem.sock" "$VM/modem.log" &
 sleep 0.5
 ACCEL="${ACCEL:-hvf}"
-CPU="host"; [ "$ACCEL" = tcg ] && CPU="max"
+CPU="host"; [ "$ACCEL" != hvf ] && CPU="${TCGCPU:-max,sve=off,pauth-impdef=on}"
 exec "$VM/qemu" \
   -machine virt,highmem=on -accel "$ACCEL" -cpu "$CPU" -smp "${SMP:-4}" -m "${MEM:-3072}" \
   -nodefaults -no-user-config \
@@ -47,7 +49,9 @@ exec "$VM/qemu" \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
   -device virtio-rng-device \
   -chardev null,id=hvc0 -chardev "file,id=hvc1,path=$VM/logcat.log" \
+  -chardev "socket,id=modem,path=$VM/modem.sock,reconnect-ms=1000" \
   -device virtio-serial-pci,ioeventfd=off -device virtconsole,chardev=hvc0 -device virtconsole,chardev=hvc1 \
+  -device virtserialport,chardev=modem,name=modem \
   -device virtio-gpu-rutabaga-pci,gfxstream-vulkan=on,x-gfxstream-gles=${GLES:-off},x-gfxstream-composer=on,cross-domain=off,hostmem=1G,xres=${WIDTH:-1080},yres=${HEIGHT:-2400} \
   -device virtio-multitouch-pci -device virtio-keyboard-pci \
   -device "virtio-vsock-host-pci,guest-cid=77,forward=tcp:6520:5555,guest-forward=5000:unix:$VM/svc.sock" \

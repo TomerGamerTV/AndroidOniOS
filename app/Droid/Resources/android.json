@@ -1,0 +1,24 @@
+{
+  "name": "Android 17 (API 37.2) Google Play",
+  "url": "https://dl.google.com/android/repository/sys-img/google_apis_playstore/arm64-v8a-playstore-ps16k-37.2_r07.zip",
+  "size": 2384795563,
+  "sha1": "f122aef335c57a0ae39d0459cc796e56c912029e",
+  "files": [
+    "kernel-ranchu",
+    "ramdisk.img",
+    "system.img",
+    "vendor.img",
+    "encryptionkey.img",
+    "VerifiedBootParams.textproto",
+    "build.prop"
+  ],
+  "patches": [
+    {
+      "file": "system.img",
+      "offset": 1390501888,
+      "expect_sha256": "347dcc23e2feac8845ec9a45e9dd3b0e8c26141d1e2d84b22b25582a9e663c33",
+      "data_b64": "IyBBbmRyb2lkT25pT1M6IGFkYiBiZWZvcmUgYm9vdCBjb21wbGV0aW9uLgpvbiBwcm9wZXJ0eTpzeXMudXNiLmNvbmZpZz1ub25lICYmIHByb3BlcnR5OmluaXQuc3ZjLnJhbmNodS1hZGItc2V0dXA9c3RvcHBlZAogICAgd3JpdGUgL2RhdGEvbWlzYy9hZGIvYWRiX2tleXMgJHtyby5ib290LnFlbXUuYWRiLnB1YmtleX0KICAgIGNob3duIHN5c3RlbSBzaGVsbCAvZGF0YS9taXNjL2FkYi9hZGJfa2V5cwogICAgY2htb2QgMDY0MCAvZGF0YS9taXNjL2FkYi9hZGJfa2V5cwogICAgc2V0cHJvcCBzeXMudXNiLmNvbmZpZyBhZGIKIyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAK",
+      "why": "system_ext init.system_ext.rc: write adb key and start adbd before boot completes"
+    }
+  ]
+}

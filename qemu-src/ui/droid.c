@@ -31,6 +31,10 @@ static bool droid_attached;
 
 static void droid_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
 {
+    DisplaySurface *s = qemu_console_surface(dcl->con);
+    if (s && (s->flags & QEMU_PLACEHOLDER_FLAG)) {
+        return;
+    }
     if (droid_dpy.on_update) {
         droid_dpy.on_update(droid_dpy.opaque, x, y, w, h);
     }
@@ -41,7 +45,8 @@ static void droid_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *surface
     if (!droid_dpy.on_surface) {
         return;
     }
-    if (!surface) {
+    /* QEMU's "Display output is not active" placeholder is not guest output. */
+    if (!surface || (surface->flags & QEMU_PLACEHOLDER_FLAG)) {
         droid_dpy.on_surface(droid_dpy.opaque, NULL, 0, 0, 0);
         return;
     }

@@ -3,7 +3,7 @@
 # Usage: scripts/build-qemu.sh <macos|ios-jit|ios-tcti>
 VARIANT="$1"
 case "$VARIANT" in
-macos) PLAT=macos ;;
+macos|macos-tcti) PLAT=macos ;;
 ios-jit|ios-tcti) PLAT=ios ;;
 *) echo "usage: $0 <macos|ios-jit|ios-tcti>"; exit 1 ;;
 esac
@@ -27,6 +27,8 @@ if [ -d "$ROOT/qemu-src" ]; then
 fi
 
 BDIR="$QSRC/build-$VARIANT"
+# iOS: SDKROOT points at the iPhone SDK, which breaks host tools built during configure.
+UNSET_SDK=""; [ "$PLAT" = ios ] && UNSET_SDK="-u SDKROOT"
 # TCTI's gadget generator needs Python >= 3.10.
 PY="${PYTHON:-$HOME/miniconda3/bin/python3.13}"; [ -x "$PY" ] || PY=python3
 # Some generators run via '#!/usr/bin/env python3'; make that resolve to $PY.
@@ -43,6 +45,11 @@ COMMON=(--prefix="$PREFIX/qemu-$VARIANT" --target-list=aarch64-softmmu --disable
 case "$VARIANT" in
 macos)
     EXTRA=(--enable-hvf --enable-cocoa --enable-coreaudio --enable-vnc)
+    LDFLAGS="$LDFLAGS -framework ParavirtualizedGraphics"
+    ;;
+macos-tcti)
+    EXTRA=(--disable-hvf --disable-cocoa --enable-coreaudio --disable-vnc --enable-tcg-threaded-interpreter
+        --extra-cflags=-Wno-unused-command-line-argument)
     LDFLAGS="$LDFLAGS -framework ParavirtualizedGraphics"
     ;;
 ios-jit)
@@ -63,10 +70,13 @@ if [ -z "$REBUILD" ] || [ ! -f "$BDIR/build.ninja" ]; then
     # Meson applies CFLAGS/LDFLAGS from the environment to the *build* machine compiler
     # when cross compiling; pass target flags only through --extra-* options.
     # iOS binaries must never be executed during configure.
-    if [ "$PLAT" = ios ]; then printf '[properties]\nneeds_exe_wrapper = true\n' > "$QSRC/configs/meson/darwin.txt"; else rm -f "$QSRC/configs/meson/darwin.txt"; fi
-    (cd "$BDIR" && env -u CFLAGS -u CXXFLAGS -u OBJCFLAGS -u LDFLAGS -u SDKROOT ../configure "${COMMON[@]}" "${EXTRA[@]}" \
+    # (iOS build dirs keep referencing this file on regeneration; macOS configures hide it temporarily.)
+    printf '[properties]\nneeds_exe_wrapper = true\n' > "$QSRC/configs/meson/darwin.txt"
+    [ "$PLAT" = macos ] && mv "$QSRC/configs/meson/darwin.txt" "$QSRC/configs/meson/darwin.txt.ios"
+    (cd "$BDIR" && env -u CFLAGS -u CXXFLAGS -u OBJCFLAGS -u LDFLAGS $UNSET_SDK ../configure "${COMMON[@]}" "${EXTRA[@]}" \
         --extra-cflags="$CFLAGS" --extra-cxxflags="$CXXFLAGS" --extra-ldflags="$LDFLAGS" \
         --cc="$CC" --cxx="$CXX" --objcc="$CC" --python="$PY" )
+    [ -f "$QSRC/configs/meson/darwin.txt.ios" ] && mv "$QSRC/configs/meson/darwin.txt.ios" "$QSRC/configs/meson/darwin.txt"
 fi
-(cd "$BDIR" && env -u SDKROOT ninja -j "$NCPU")
+(cd "$BDIR" && env $UNSET_SDK ninja -j "$NCPU")
 echo "=== qemu $VARIANT built in $BDIR"

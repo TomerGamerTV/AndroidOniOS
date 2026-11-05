@@ -1,0 +1,89 @@
+name: AndroidOniOS
+options:
+  bundleIdPrefix: com.tomer
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM} # export your Apple team ID before running xcodegen
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SUPPORTS_MACCATALYST: NO
+    ENABLE_BITCODE: NO
+    ARCHS: arm64
+
+targets:
+  Droid:
+    type: application
+    platform: iOS
+    sources:
+      - path: Droid
+        excludes:
+          - "Info.plist"
+          - "Droid.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios
+        PRODUCT_NAME: Droid
+        INFOPLIST_FILE: Droid/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Droid/Droid.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Droid/Bridge/Droid-Bridging-Header.h
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/../build/frameworks"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GCC_OPTIMIZATION_LEVEL: s
+        SWIFT_OPTIMIZATION_LEVEL: -O
+        DEAD_CODE_STRIPPING: YES
+    dependencies:
+      - framework: ../build/frameworks/QEMUJIT.framework
+        embed: true
+        link: false
+        codeSign: true
+      - framework: ../build/frameworks/QEMUTCTI.framework
+        embed: true
+        link: false
+        codeSign: true
+      - framework: ../build/frameworks/MoltenVK.framework
+        embed: true
+        link: false
+        codeSign: true
+      - target: DroidShare
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreMotion.framework
+      - sdk: CoreLocation.framework
+      - sdk: Security.framework
+      - sdk: AVFoundation.framework
+
+  DroidShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DroidShare
+        excludes:
+          - "Info.plist"
+          - "DroidShare.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.share
+        PRODUCT_NAME: DroidShare
+        INFOPLIST_FILE: DroidShare/Info.plist
+        CODE_SIGN_ENTITLEMENTS: DroidShare/DroidShare.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
+
+schemes:
+  Droid:
+    build:
+      targets:
+        Droid: all
+    run:
+      config: Release
+    archive:
+      config: Release
