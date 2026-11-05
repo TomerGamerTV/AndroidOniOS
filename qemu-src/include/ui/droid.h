@@ -41,6 +41,18 @@ DROID_EXPORT void droid_reset(void);
 DROID_EXPORT void droid_set_running(bool running); /* pause/resume vCPUs */
 DROID_EXPORT bool droid_is_running(void);
 
+/* ---- save state ----
+ * droid_save_state() pauses the VM and writes its complete state (RAM, devices, GPU renderer)
+ * to `path`; `done` runs on QEMU's main-loop thread with 0 on success or a negative value. The VM
+ * stays paused; droid_set_running(true) continues it (the saved file is then stale, because the
+ * disks change). Start QEMU with "-incoming file:PATH" to restore; droid_restore_status() is 1
+ * while QEMU starts and loads, and 0 after, when the VM is paused at the saved point. A failed
+ * load exits QEMU.
+ */
+typedef void (*droid_save_done_fn)(void *opaque, int status);
+DROID_EXPORT void droid_save_state(const char *path, droid_save_done_fn done, void *opaque);
+DROID_EXPORT int droid_restore_status(void);
+
 #ifdef __cplusplus
 }
 #endif

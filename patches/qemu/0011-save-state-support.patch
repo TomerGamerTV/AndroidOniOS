@@ -1,0 +1,836 @@
+--- a/hw/display/virtio-gpu-rutabaga.c
++++ b/hw/display/virtio-gpu-rutabaga.c
+@@ -9,8 +9,13 @@
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
+ #include "hw/virtio/virtio-iommu.h"
++#include "migration/qemu-file-types.h"
++#include "migration/vmstate.h"
++#include "system/dma.h"
++#include "system/runstate.h"
+ 
+ #include <glib/gmem.h>
++#define RUTABAGA_GFX_FFI_UNSTABLE 1 /* rutabaga_snapshot() / rutabaga_restore() */
+ #include <rutabaga_gfx/rutabaga_gfx_ffi.h>
+ 
+ #define CHECK(condition, cmd)                                                 \
+@@ -23,6 +28,9 @@
+        }                                                                      \
+     } while (0)
+ 
++static void virtio_gpu_rutabaga_vm_state_change(void *opaque, bool running,
++                                                RunState state);
++
+ struct rutabaga_aio_data {
+     struct VirtIOGPURutabaga *vr;
+     struct rutabaga_fence fence;
+@@ -264,7 +272,7 @@
+         }
+     }
+ 
+-    if (!found) {
++    if (!found || !res->image) {
+         return;
+     }
+ 
+@@ -306,6 +314,7 @@
+     scanout = &vb->scanout[ss.scanout_id];
+ 
+     if (ss.resource_id == 0) {
++        vr->scanout_resource[ss.scanout_id] = 0;
+         dpy_gfx_replace_surface(scanout->con, NULL);
+         dpy_gl_scanout_disable(scanout->con);
+         return;
+@@ -334,6 +343,7 @@
+     dpy_gfx_replace_surface(scanout->con, NULL);
+     dpy_gfx_replace_surface(scanout->con, scanout->ds);
+     res->scanout_bitmask = ss.scanout_id;
++    vr->scanout_resource[ss.scanout_id] = ss.resource_id;
+ }
+ 
+ static void
+@@ -473,7 +483,8 @@
+     CHECK(!res->iov, cmd);
+ 
+     ret = virtio_gpu_create_mapping_iov(g, att_rb.nr_entries, sizeof(att_rb),
+-                                        cmd, NULL, &res->iov, &res->iov_cnt);
++                                        cmd, &res->addrs, &res->iov,
++                                        &res->iov_cnt);
+     CHECK(!ret, cmd);
+ 
+     vecs.iovecs = res->iov;
+@@ -865,11 +876,8 @@
+ }
+ 
+ static void
+-virtio_gpu_rutabaga_aio_cb(void *opaque)
++virtio_gpu_rutabaga_complete_fence(VirtIOGPU *g, struct rutabaga_fence fence_data)
+ {
+-    struct rutabaga_aio_data *data = opaque;
+-    VirtIOGPU *g = VIRTIO_GPU(data->vr);
+-    struct rutabaga_fence fence_data = data->fence;
+     struct virtio_gpu_ctrl_command *cmd, *tmp;
+ 
+     uint32_t signaled_ctx_specific = fence_data.flags &
+@@ -900,7 +908,18 @@
+         QTAILQ_REMOVE(&g->fenceq, cmd, next);
+         g_free(cmd);
+     }
++}
+ 
++static void
++virtio_gpu_rutabaga_aio_cb(void *opaque)
++{
++    struct rutabaga_aio_data *data = opaque;
++    VirtIOGPURutabaga *vr = data->vr;
++
++    qemu_mutex_lock(&vr->fence_lock);
++    vr->queued_fences = g_list_remove(vr->queued_fences, data);
++    qemu_mutex_unlock(&vr->fence_lock);
++    virtio_gpu_rutabaga_complete_fence(VIRTIO_GPU(vr), data->fence);
+     g_free(data);
+ }
+ 
+@@ -932,6 +951,10 @@
+     data = g_new0(struct rutabaga_aio_data, 1);
+     data->vr = vr;
+     data->fence = *fence;
++    /* Tracked so a save taken before the bottom half runs doesn't lose this completion. */
++    qemu_mutex_lock(&vr->fence_lock);
++    vr->queued_fences = g_list_append(vr->queued_fences, data);
++    qemu_mutex_unlock(&vr->fence_lock);
+     aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                             virtio_gpu_rutabaga_aio_cb,
+                             data);
+@@ -1087,6 +1110,7 @@
+     return;
+ #endif
+ 
++    qemu_mutex_init(&VIRTIO_GPU_RUTABAGA(gpudev)->fence_lock);
+     if (!virtio_gpu_rutabaga_init(gpudev, errp)) {
+         return;
+     }
+@@ -1096,6 +1120,10 @@
+         return;
+     }
+ 
++    VIRTIO_GPU_RUTABAGA(gpudev)->vmstate_entry =
++        qemu_add_vm_change_state_handler(virtio_gpu_rutabaga_vm_state_change,
++                                         VIRTIO_GPU_RUTABAGA(gpudev));
++
+     bdev->conf.flags |= (1 << VIRTIO_GPU_FLAG_RUTABAGA_ENABLED);
+     bdev->conf.flags |= (1 << VIRTIO_GPU_FLAG_BLOB_ENABLED);
+     bdev->conf.flags |= (1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED);
+@@ -1104,6 +1132,500 @@
+     virtio_gpu_device_realize(qdev, errp);
+ }
+ 
++/*
++ * Migration / snapshot support.
++ *
++ * The parent virtio-gpu vmstate only knows 2D resources (it dumps pixman images), so rutabaga
++ * gets its own: the virtio core, QEMU's resource list (guest backing addresses, scanout images),
++ * blob mappings in the hostmem BAR, commands still waiting for a fence, and the renderer state
++ * from rutabaga_snapshot(), which gfxstream writes as a directory tree that we embed here.
++ */
++#define RUTABAGA_MIG_MAGIC 0x52544247u /* "RTBG" */
++#define RUTABAGA_MIG_CHUNK (1 << 20)
++
++enum { MIG_TREE_END = 0, MIG_TREE_DIR = 1, MIG_TREE_FILE = 2 };
++
++static int rutabaga_put_tree(QEMUFile *f, const char *base, const char *rel)
++{
++    g_autofree char *dirpath = rel[0] ? g_build_filename(base, rel, NULL)
++                                      : g_strdup(base);
++    GDir *dir = g_dir_open(dirpath, 0, NULL);
++    const char *name;
++
++    if (!dir) {
++        return -errno;
++    }
++    while ((name = g_dir_read_name(dir))) {
++        g_autofree char *child_rel = rel[0] ? g_build_filename(rel, name, NULL)
++                                            : g_strdup(name);
++        g_autofree char *path = g_build_filename(base, child_rel, NULL);
++        size_t len = strlen(child_rel);
++
++        if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
++            qemu_put_byte(f, MIG_TREE_DIR);
++            qemu_put_be32(f, len);
++            qemu_put_buffer(f, (const uint8_t *)child_rel, len);
++            int ret = rutabaga_put_tree(f, base, child_rel);
++            if (ret) {
++                g_dir_close(dir);
++                return ret;
++            }
++            continue;
++        }
++
++        FILE *in = fopen(path, "rb");
++        if (!in) {
++            g_dir_close(dir);
++            return -errno;
++        }
++        fseeko(in, 0, SEEK_END);
++        uint64_t size = ftello(in);
++        fseeko(in, 0, SEEK_SET);
++        qemu_put_byte(f, MIG_TREE_FILE);
++        qemu_put_be32(f, len);
++        qemu_put_buffer(f, (const uint8_t *)child_rel, len);
++        qemu_put_be64(f, size);
++        g_autofree uint8_t *buf = g_malloc(RUTABAGA_MIG_CHUNK);
++        uint64_t left = size;
++        while (left) {
++            size_t n = fread(buf, 1, MIN(left, RUTABAGA_MIG_CHUNK), in);
++            if (!n) {
++                break;
++            }
++            qemu_put_buffer(f, buf, n);
++            left -= n;
++        }
++        fclose(in);
++        if (left) {
++            g_dir_close(dir);
++            return -EIO;
++        }
++    }
++    g_dir_close(dir);
++    return 0;
++}
++
++static int rutabaga_get_tree(QEMUFile *f, const char *base)
++{
++    g_autofree uint8_t *buf = g_malloc(RUTABAGA_MIG_CHUNK);
++
++    for (;;) {
++        int type = qemu_get_byte(f);
++        if (type == MIG_TREE_END) {
++            return 0;
++        }
++        uint32_t len = qemu_get_be32(f);
++        if (len == 0 || len > 4096) {
++            return -EINVAL;
++        }
++        g_autofree char *rel = g_malloc0(len + 1);
++        qemu_get_buffer(f, (uint8_t *)rel, len);
++        if (rel[0] == '/' || strstr(rel, "..")) {
++            return -EINVAL;
++        }
++        g_autofree char *path = g_build_filename(base, rel, NULL);
++
++        if (type == MIG_TREE_DIR) {
++            if (g_mkdir_with_parents(path, 0700)) {
++                return -errno;
++            }
++            continue;
++        }
++        if (type != MIG_TREE_FILE) {
++            return -EINVAL;
++        }
++        uint64_t left = qemu_get_be64(f);
++        FILE *out = fopen(path, "wb");
++        if (!out) {
++            return -errno;
++        }
++        while (left) {
++            size_t n = MIN(left, RUTABAGA_MIG_CHUNK);
++            if (qemu_get_buffer(f, buf, n) != n || fwrite(buf, 1, n, out) != n) {
++                fclose(out);
++                return -EIO;
++            }
++            left -= n;
++        }
++        if (fclose(out)) {
++            return -errno;
++        }
++    }
++}
++
++static void rutabaga_rm_tree(const char *path)
++{
++    GDir *dir = g_dir_open(path, 0, NULL);
++    const char *name;
++
++    if (dir) {
++        while ((name = g_dir_read_name(dir))) {
++            g_autofree char *child = g_build_filename(path, name, NULL);
++            if (g_file_test(child, G_FILE_TEST_IS_DIR)) {
++                rutabaga_rm_tree(child);
++            } else {
++                unlink(child);
++            }
++        }
++        g_dir_close(dir);
++    }
++    rmdir(path);
++}
++
++static int virtio_gpu_rutabaga_save(QEMUFile *f, void *opaque, size_t size,
++                                    const VMStateField *field, JSONWriter *vmdesc)
++{
++    VirtIOGPU *g = opaque;
++    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
++    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
++    VirtIODevice *vdev = VIRTIO_DEVICE(g);
++    struct virtio_gpu_simple_resource *res;
++    struct virtio_gpu_ctrl_command *cmd;
++    unsigned int i;
++    int ret;
++
++    if (!QTAILQ_EMPTY(&g->cmdq)) {
++        error_report("virtio-gpu-rutabaga: cannot save with queued commands");
++        return -EBUSY;
++    }
++
++    qemu_put_be32(f, RUTABAGA_MIG_MAGIC);
++
++    QTAILQ_FOREACH(res, &g->reslist, next) {
++        qemu_put_be32(f, res->resource_id);
++        qemu_put_be32(f, res->width);
++        qemu_put_be32(f, res->height);
++        qemu_put_be32(f, res->format);
++        qemu_put_be64(f, res->blob_size);
++        qemu_put_be32(f, res->scanout_bitmask);
++        qemu_put_byte(f, res->image != NULL);
++        if (res->iov_cnt && !res->addrs) {
++            error_report("virtio-gpu-rutabaga: resource %u has no guest addresses",
++                         res->resource_id);
++            return -EINVAL;
++        }
++        qemu_put_be32(f, res->iov_cnt);
++        for (i = 0; i < res->iov_cnt; i++) {
++            qemu_put_be64(f, res->addrs[i]);
++            qemu_put_be64(f, res->iov[i].iov_len);
++        }
++    }
++    qemu_put_be32(f, 0);
++
++    for (i = 0; i < MAX_SLOTS; i++) {
++        MemoryRegion *mr = &vr->memory_regions[i].mr;
++        if (!vr->memory_regions[i].used) {
++            continue;
++        }
++        qemu_put_be32(f, vr->memory_regions[i].resource_id);
++        qemu_put_be64(f, mr->addr);
++    }
++    qemu_put_be32(f, 0);
++
++    QTAILQ_FOREACH(cmd, &g->fenceq, next) {
++        qemu_put_byte(f, 1);
++        qemu_put_virtqueue_element(vdev, f, &cmd->elem);
++        qemu_put_buffer(f, (const uint8_t *)&cmd->cmd_hdr, sizeof(cmd->cmd_hdr));
++    }
++    qemu_put_byte(f, 0);
++
++    /* Completions already signaled by the renderer, waiting for the main loop. */
++    qemu_mutex_lock(&vr->fence_lock);
++    qemu_put_be32(f, g_list_length(vr->queued_fences));
++    for (GList *l = vr->queued_fences; l; l = l->next) {
++        struct rutabaga_aio_data *data = l->data;
++        qemu_put_buffer(f, (const uint8_t *)&data->fence, sizeof(data->fence));
++    }
++    qemu_mutex_unlock(&vr->fence_lock);
++
++    qemu_put_be32(f, vb->enable);
++    for (i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
++        qemu_put_be32(f, vr->scanout_resource[i]);
++    }
++
++    g_autoptr(GError) err = NULL;
++    g_autofree char *dir = g_dir_make_tmp("droid-gpu-save-XXXXXX", &err);
++    if (!dir) {
++        error_report("virtio-gpu-rutabaga: %s", err->message);
++        return -EIO;
++    }
++    ret = rutabaga_snapshot(vr->rutabaga, dir);
++    if (ret) {
++        error_report("virtio-gpu-rutabaga: rutabaga_snapshot failed (%d)", ret);
++        rutabaga_rm_tree(dir);
++        return ret < 0 ? ret : -EIO;
++    }
++    ret = rutabaga_put_tree(f, dir, "");
++    qemu_put_byte(f, MIG_TREE_END);
++    rutabaga_rm_tree(dir);
++    if (ret) {
++        error_report("virtio-gpu-rutabaga: failed to store renderer state (%d)", ret);
++    }
++    return ret;
++}
++
++static int virtio_gpu_rutabaga_load(QEMUFile *f, void *opaque, size_t size,
++                                    const VMStateField *field)
++{
++    VirtIOGPU *g = opaque;
++    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
++    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
++    VirtIODevice *vdev = VIRTIO_DEVICE(g);
++    struct virtio_gpu_simple_resource *res;
++    uint32_t *map_res = NULL;
++    uint64_t *map_off = NULL;
++    unsigned int nmaps = 0, i;
++    uint32_t resource_id;
++    int ret;
++
++    if (qemu_get_be32(f) != RUTABAGA_MIG_MAGIC) {
++        return -EINVAL;
++    }
++
++    while ((resource_id = qemu_get_be32(f)) != 0) {
++        if (virtio_gpu_find_resource(g, resource_id)) {
++            return -EINVAL;
++        }
++        res = g_new0(struct virtio_gpu_simple_resource, 1);
++        res->resource_id = resource_id;
++        res->width = qemu_get_be32(f);
++        res->height = qemu_get_be32(f);
++        res->format = qemu_get_be32(f);
++        res->blob_size = qemu_get_be64(f);
++        res->scanout_bitmask = qemu_get_be32(f);
++        bool has_image = qemu_get_byte(f);
++        res->iov_cnt = qemu_get_be32(f);
++        if (res->iov_cnt > 1024 * 1024) {
++            g_free(res);
++            return -EINVAL;
++        }
++        if (res->iov_cnt) {
++            res->addrs = g_new0(uint64_t, res->iov_cnt);
++            res->iov = g_new0(struct iovec, res->iov_cnt);
++        }
++        for (i = 0; i < res->iov_cnt; i++) {
++            res->addrs[i] = qemu_get_be64(f);
++            res->iov[i].iov_len = qemu_get_be64(f);
++        }
++        if (has_image) {
++            pixman_format_code_t pformat = virtio_gpu_get_pixman_format(res->format);
++            if (pformat) {
++                res->image = pixman_image_create_bits(pformat, res->width,
++                                                      res->height, NULL, 0);
++                if (res->image) {
++                    pixman_image_ref(res->image); /* as rutabaga_cmd_set_scanout() */
++                }
++            }
++        }
++        /* Guest RAM is already loaded, so the backing can be mapped now. */
++        for (i = 0; i < res->iov_cnt; i++) {
++            hwaddr len = res->iov[i].iov_len;
++            res->iov[i].iov_base =
++                dma_memory_map(vdev->dma_as, res->addrs[i], &len,
++                               DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
++            if (!res->iov[i].iov_base || len != res->iov[i].iov_len) {
++                error_report("virtio-gpu-rutabaga: cannot map backing of resource %u",
++                             resource_id);
++                return -EINVAL;
++            }
++        }
++        QTAILQ_INSERT_HEAD(&g->reslist, res, next);
++    }
++
++    while ((resource_id = qemu_get_be32(f)) != 0) {
++        map_res = g_renew(uint32_t, map_res, nmaps + 1);
++        map_off = g_renew(uint64_t, map_off, nmaps + 1);
++        map_res[nmaps] = resource_id;
++        map_off[nmaps] = qemu_get_be64(f);
++        nmaps++;
++    }
++
++    while (qemu_get_byte(f)) {
++        struct virtio_gpu_ctrl_command *cmd =
++            qemu_get_virtqueue_element(vdev, f, sizeof(*cmd));
++        if (!cmd) {
++            return -EINVAL;
++        }
++        virtio_gpu_ctrl_cmd_init(cmd, virtio_get_queue(vdev, 0));
++        qemu_get_buffer(f, (uint8_t *)&cmd->cmd_hdr, sizeof(cmd->cmd_hdr));
++        QTAILQ_INSERT_TAIL(&g->fenceq, cmd, next);
++    }
++
++    uint32_t nfences = qemu_get_be32(f);
++    if (nfences > 65536) {
++        return -EINVAL;
++    }
++    if (!vr->restored_fences) {
++        vr->restored_fences = g_array_new(false, true, sizeof(struct rutabaga_fence));
++    }
++    for (i = 0; i < nfences; i++) {
++        struct rutabaga_fence fence;
++        qemu_get_buffer(f, (uint8_t *)&fence, sizeof(fence));
++        g_array_append_val(vr->restored_fences, fence);
++    }
++
++    vb->enable = qemu_get_be32(f);
++    for (i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
++        vr->scanout_resource[i] = qemu_get_be32(f);
++    }
++
++    g_autoptr(GError) err = NULL;
++    g_autofree char *dir = g_dir_make_tmp("droid-gpu-load-XXXXXX", &err);
++    if (!dir) {
++        error_report("virtio-gpu-rutabaga: %s", err->message);
++        return -EIO;
++    }
++    ret = rutabaga_get_tree(f, dir);
++    if (!ret) {
++        ret = rutabaga_restore(vr->rutabaga, dir);
++        if (ret) {
++            error_report("virtio-gpu-rutabaga: rutabaga_restore failed (%d)", ret);
++        }
++    }
++    rutabaga_rm_tree(dir);
++    if (ret) {
++        return ret < 0 ? ret : -EIO;
++    }
++
++    /* The renderer recreated its resources; hand them their guest backing again. */
++    QTAILQ_FOREACH(res, &g->reslist, next) {
++        struct rutabaga_iovecs vecs = { .iovecs = res->iov, .num_iovecs = res->iov_cnt };
++        if (!res->iov_cnt) {
++            continue;
++        }
++        ret = rutabaga_resource_attach_backing(vr->rutabaga, res->resource_id, &vecs);
++        if (ret) {
++            error_report("virtio-gpu-rutabaga: re-attach of resource %u failed (%d)",
++                         res->resource_id, ret);
++            return -EIO;
++        }
++    }
++
++    /*
++     * Host-visible blobs go back into the hostmem BAR at the guest's offsets once the VM starts:
++     * creating RAM regions is not allowed inside the incoming-migration coroutine.
++     */
++    g_free(vr->pending_map_res);
++    g_free(vr->pending_map_off);
++    vr->pending_map_res = map_res;
++    vr->pending_map_off = map_off;
++    vr->pending_maps = nmaps;
++    return 0;
++}
++
++static void virtio_gpu_rutabaga_vm_state_change(void *opaque, bool running,
++                                                RunState state)
++{
++    VirtIOGPURutabaga *vr = opaque;
++    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(vr);
++    unsigned int i;
++
++    if (!running) {
++        return;
++    }
++    if (vr->restored_fences && vr->restored_fences->len) {
++        for (i = 0; i < vr->restored_fences->len; i++) {
++            virtio_gpu_rutabaga_complete_fence(
++                VIRTIO_GPU(vr), g_array_index(vr->restored_fences, struct rutabaga_fence, i));
++        }
++        g_array_set_size(vr->restored_fences, 0);
++    }
++    if (vr->refresh_pending) {
++        /* Show the last frame now instead of black until the guest flushes again. */
++        vr->refresh_pending = false;
++        for (i = 0; i < vb->conf.max_outputs && i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
++            struct virtio_gpu_simple_resource *res =
++                virtio_gpu_find_resource(VIRTIO_GPU(vr), vr->scanout_resource[i]);
++            struct rutabaga_transfer transfer = { 0 };
++            struct iovec iov;
++
++            if (!vr->scanout_resource[i] || !res || !res->image) {
++                continue;
++            }
++            transfer.w = res->width;
++            transfer.h = res->height;
++            transfer.d = 1;
++            iov.iov_base = pixman_image_get_data(res->image);
++            iov.iov_len = res->width * res->height * 4;
++            if (!rutabaga_resource_transfer_read(vr->rutabaga, 0, res->resource_id,
++                                                 &transfer, &iov)) {
++                dpy_gfx_update_full(vb->scanout[i].con);
++            }
++        }
++    }
++    if (!vr->pending_maps) {
++        return;
++    }
++    for (i = 0; i < vr->pending_maps && i < MAX_SLOTS; i++) {
++        struct rutabaga_mapping mapping = { 0 };
++        MemoryRegion *mr = &vr->memory_regions[i].mr;
++        int ret = rutabaga_resource_map(vr->rutabaga, vr->pending_map_res[i], &mapping);
++
++        if (ret) {
++            error_report("virtio-gpu-rutabaga: re-map of resource %u failed (%d)",
++                         vr->pending_map_res[i], ret);
++            continue;
++        }
++        memory_region_init_ram_ptr(mr, OBJECT(vr), "blob", mapping.size, mapping.ptr);
++        memory_region_add_subregion(&vb->hostmem, vr->pending_map_off[i], mr);
++        vr->memory_regions[i].resource_id = vr->pending_map_res[i];
++        vr->memory_regions[i].used = 1;
++    }
++    vr->pending_maps = 0;
++    g_clear_pointer(&vr->pending_map_res, g_free);
++    g_clear_pointer(&vr->pending_map_off, g_free);
++}
++
++static int virtio_gpu_rutabaga_post_load(void *opaque, int version_id)
++{
++    VirtIOGPU *g = opaque;
++    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
++    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
++    unsigned int i;
++
++    if (vr->headless) {
++        return 0;
++    }
++    for (i = 0; i < vb->conf.max_outputs && i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
++        struct virtio_gpu_scanout *scanout = &vb->scanout[i];
++        struct virtio_gpu_simple_resource *res;
++
++        if (!vr->scanout_resource[i]) {
++            continue;
++        }
++        res = virtio_gpu_find_resource(g, vr->scanout_resource[i]);
++        if (!res || !res->image) {
++            continue;
++        }
++        scanout->ds = qemu_create_displaysurface_pixman(res->image);
++        dpy_gfx_replace_surface(scanout->con, NULL);
++        dpy_gfx_replace_surface(scanout->con, scanout->ds);
++        res->scanout_bitmask = i;
++    }
++    vr->refresh_pending = true;
++    return 0;
++}
++
++static const VMStateDescription vmstate_virtio_gpu_rutabaga = {
++    .name = "virtio-gpu-rutabaga",
++    .minimum_version_id = 1,
++    .version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_VIRTIO_DEVICE,
++        {
++            .name = "virtio-gpu-rutabaga",
++            .info = &(const VMStateInfo) {
++                .name = "virtio-gpu-rutabaga",
++                .get = virtio_gpu_rutabaga_load,
++                .put = virtio_gpu_rutabaga_save,
++            },
++            .flags = VMS_SINGLE,
++        },
++        VMSTATE_END_OF_LIST()
++    },
++    .post_load = virtio_gpu_rutabaga_post_load,
++};
++
+ static const Property virtio_gpu_rutabaga_properties[] = {
+     DEFINE_PROP_BIT64("gfxstream-vulkan", VirtIOGPURutabaga, capset_mask,
+                       RUTABAGA_CAPSET_GFXSTREAM_VULKAN, false),
+@@ -1131,6 +1653,7 @@
+     vgc->update_cursor_data = virtio_gpu_rutabaga_update_cursor;
+     vgc->resource_destroy = virtio_gpu_rutabaga_resource_unref;
+     vdc->realize = virtio_gpu_rutabaga_realize;
++    dc->vmsd = &vmstate_virtio_gpu_rutabaga;
+     device_class_set_props(dc, virtio_gpu_rutabaga_properties);
+ }
+ 
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -331,6 +331,18 @@
+     bool headless;
+     uint32_t num_capsets;
+     struct rutabaga *rutabaga;
++    /* Resource last set on each scanout; needed to rebuild displays after a restore. */
++    uint32_t scanout_resource[VIRTIO_GPU_MAX_SCANOUTS];
++    /* Blob mappings to re-create when the VM starts after a restore. */
++    VMChangeStateEntry *vmstate_entry;
++    bool refresh_pending;   /* repaint scanouts from restored renderer state */
++    /* Fence completions signaled by the renderer but not yet handled on the main loop. */
++    QemuMutex fence_lock;
++    GList *queued_fences;   /* of struct rutabaga_aio_data * */
++    GArray *restored_fences; /* of struct rutabaga_fence: queued when the state was saved */
++    uint32_t pending_maps;
++    uint32_t *pending_map_res;
++    uint64_t *pending_map_off;
+ };
+ 
+ /*
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -24,6 +24,7 @@
+ #include "trace.h"
+ #include "qapi/error.h"
+ #include "hw/audio/virtio-snd.h"
++#include "migration/qemu-file-types.h"
+ 
+ #define VIRTIO_SOUND_VM_VERSION 1
+ #define VIRTIO_SOUND_JACK_DEFAULT 0
+@@ -59,16 +60,138 @@
+                                 | BIT(VIRTIO_SND_PCM_RATE_176400)
+                                 | BIT(VIRTIO_SND_PCM_RATE_192000)
+                                 | BIT(VIRTIO_SND_PCM_RATE_384000);
++
++static uint32_t virtio_snd_pcm_prepare(VirtIOSound *s, uint32_t stream_id);
++
++/*
++ * Migration: per stream, the negotiated parameters, whether it was prepared and running, and
++ * the I/O buffers the device still holds (their virtqueue elements plus any data already copied).
++ * Voices are reopened on load and restarted once the VM runs again.
++ */
++static size_t virtio_snd_buffer_capacity(VirtIOSoundPCMStream *stream,
++                                         VirtQueueElement *elem)
++{
++    size_t n;
++
++    if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
++        n = iov_size(elem->out_sg, elem->out_num);
++        return n > sizeof(virtio_snd_pcm_xfer) ? n - sizeof(virtio_snd_pcm_xfer) : 0;
++    }
++    n = iov_size(elem->in_sg, elem->in_num);
++    return n > sizeof(virtio_snd_pcm_status) ? n - sizeof(virtio_snd_pcm_status) : 0;
++}
++
++static int virtio_snd_save_streams(QEMUFile *f, void *opaque, size_t size,
++                                   const VMStateField *field, JSONWriter *vmdesc)
++{
++    VirtIOSound *s = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    VirtIOSoundPCMBuffer *buffer;
++    uint32_t i;
++
++    for (i = 0; i < s->snd_conf.streams; i++) {
++        VirtIOSoundPCMStream *stream = s->pcm->streams[i];
++
++        qemu_put_buffer(f, (const uint8_t *)&s->pcm->pcm_params[i],
++                        sizeof(s->pcm->pcm_params[i]));
++        qemu_put_byte(f, stream != NULL);
++        if (!stream) {
++            continue;
++        }
++        qemu_put_byte(f, stream->active);
++        WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++            QSIMPLEQ_FOREACH(buffer, &stream->queue, entry) {
++                size_t cap = virtio_snd_buffer_capacity(stream, buffer->elem);
++                qemu_put_byte(f, 1);
++                qemu_put_be32(f, virtio_get_queue_index(buffer->vq));
++                qemu_put_virtqueue_element(vdev, f, buffer->elem);
++                qemu_put_be64(f, buffer->size);
++                qemu_put_be64(f, buffer->offset);
++                qemu_put_byte(f, buffer->populated);
++                qemu_put_be64(f, cap);
++                qemu_put_buffer(f, buffer->data, cap);
++            }
++        }
++        qemu_put_byte(f, 0);
++    }
++    return 0;
++}
++
++static int virtio_snd_load_streams(QEMUFile *f, void *opaque, size_t size,
++                                   const VMStateField *field)
++{
++    VirtIOSound *s = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    uint32_t i;
++
++    for (i = 0; i < s->snd_conf.streams; i++) {
++        VirtIOSoundPCMStream *stream;
++
++        qemu_get_buffer(f, (uint8_t *)&s->pcm->pcm_params[i],
++                        sizeof(s->pcm->pcm_params[i]));
++        if (!qemu_get_byte(f)) {
++            continue;
++        }
++        bool active = qemu_get_byte(f);
++        if (virtio_snd_pcm_prepare(s, i) != cpu_to_le32(VIRTIO_SND_S_OK)) {
++            return -EINVAL;
++        }
++        stream = s->pcm->streams[i];
++        while (qemu_get_byte(f)) {
++            uint32_t vq_index = qemu_get_be32(f);
++            VirtQueueElement *elem;
++            VirtIOSoundPCMBuffer *buffer;
++            uint64_t cap;
+ 
++            if (vq_index >= VIRTIO_SND_VQ_MAX) {
++                return -EINVAL;
++            }
++            elem = qemu_get_virtqueue_element(vdev, f, sizeof(VirtQueueElement));
++            if (!elem) {
++                return -EINVAL;
++            }
++            uint64_t bsize = qemu_get_be64(f);
++            uint64_t offset = qemu_get_be64(f);
++            bool populated = qemu_get_byte(f);
++            cap = qemu_get_be64(f);
++            if (cap != virtio_snd_buffer_capacity(stream, elem)) {
++                g_free(elem);
++                return -EINVAL;
++            }
++            buffer = g_malloc0(sizeof(VirtIOSoundPCMBuffer) + cap);
++            buffer->elem = elem;
++            buffer->vq = s->queues[vq_index];
++            buffer->size = bsize;
++            buffer->offset = offset;
++            buffer->populated = populated;
++            qemu_get_buffer(f, buffer->data, cap);
++            QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
++        }
++        stream->active = active;
++    }
++    return 0;
++}
++
+ static const VMStateDescription vmstate_virtio_snd_device = {
+     .name = TYPE_VIRTIO_SND,
+     .version_id = VIRTIO_SOUND_VM_VERSION,
+     .minimum_version_id = VIRTIO_SOUND_VM_VERSION,
++    .fields = (const VMStateField[]) {
++        {
++            .name = "virtio-snd-streams",
++            .info = &(const VMStateInfo) {
++                .name = "virtio-snd-streams",
++                .get = virtio_snd_load_streams,
++                .put = virtio_snd_save_streams,
++            },
++            .flags = VMS_SINGLE,
++        },
++        VMSTATE_END_OF_LIST()
++    },
+ };
+ 
+ static const VMStateDescription vmstate_virtio_snd = {
+     .name = TYPE_VIRTIO_SND,
+-    .unmigratable = 1,
+     .minimum_version_id = VIRTIO_SOUND_VM_VERSION,
+     .version_id = VIRTIO_SOUND_VM_VERSION,
+     .fields = (const VMStateField[]) {
+@@ -1018,7 +1141,22 @@
+                                        RunState state)
+ {
+     if (running) {
++        VirtIOSound *s = opaque;
++        uint32_t i;
++
+         trace_virtio_snd_vm_state_running();
++        /* Restart voices of streams that were running when the VM state was loaded. */
++        for (i = 0; s->pcm && s->pcm->streams && i < s->snd_conf.streams; i++) {
++            VirtIOSoundPCMStream *stream = s->pcm->streams[i];
++            if (!stream || !stream->active) {
++                continue;
++            }
++            if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
++                AUD_set_active_out(stream->voice.out, true);
++            } else {
++                AUD_set_active_in(stream->voice.in, true);
++            }
++        }
+     } else {
+         trace_virtio_snd_vm_state_stopped();
+     }
+--- a/system/qemu.symbols
++++ b/system/qemu.symbols
+@@ -15,5 +15,7 @@
+   droid_reset;
+   droid_set_running;
+   droid_is_running;
++  droid_save_state;
++  droid_restore_status;
+   vsock_host_connect_fd;
+ };

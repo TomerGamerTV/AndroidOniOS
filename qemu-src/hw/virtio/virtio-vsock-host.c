@@ -24,7 +24,8 @@
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-access.h"
 #include "hw/virtio/virtio-pci.h"
-#include "migration/blocker.h"
+#include "migration/vmstate.h"
+#include "system/runstate.h"
 #include "standard-headers/linux/virtio_ids.h"
 #include "standard-headers/linux/virtio_vsock.h"
 #include "qom/object.h"
@@ -90,7 +91,8 @@ struct VirtIOVSockHost {
     QSIMPLEQ_HEAD(, VSockCtrl) ctrl;
     GPtrArray *listeners;
     QEMUBH *pump_bh;
-    Error *migration_blocker;
+    VMChangeStateEntry *vmstate_entry;
+    bool reset_pending;     /* loaded from a snapshot: guest still holds stale connections */
 };
 
 static VirtIOVSockHost *vsock_host_singleton;
@@ -340,6 +342,41 @@ static void vsock_pump(VirtIOVSockHost *s)
             }
             vsock_conn_update_handlers(c);
         }
+    }
+}
+
+/* Tell the guest every connection is gone (virtio spec 5.10.6.6.2, transport reset). */
+static bool vsock_send_transport_reset(VirtIOVSockHost *s)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    struct virtio_vsock_event ev = { .id = cpu_to_le32(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET) };
+    VirtQueueElement *elem = virtqueue_pop(s->event_vq, sizeof(VirtQueueElement));
+
+    if (!elem) {
+        return false;
+    }
+    if (iov_size(elem->in_sg, elem->in_num) < sizeof(ev)) {
+        virtqueue_detach_element(s->event_vq, elem, 0);
+        g_free(elem);
+        return false;
+    }
+    iov_from_buf(elem->in_sg, elem->in_num, 0, &ev, sizeof(ev));
+    virtqueue_push(s->event_vq, elem, sizeof(ev));
+    g_free(elem);
+    virtio_notify(vdev, s->event_vq);
+    return true;
+}
+
+static void vsock_vm_state_change(void *opaque, bool running, RunState state)
+{
+    VirtIOVSockHost *s = opaque;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+
+    if (running && s->reset_pending && (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+        if (vsock_send_transport_reset(s)) {
+            s->reset_pending = false;
+        }
+        qemu_bh_schedule(s->pump_bh);
     }
 }
 
@@ -648,8 +685,7 @@ static void vsock_realize(DeviceState *dev, Error **errp)
             }
         }
     }
-    error_setg(&s->migration_blocker, "virtio-vsock-host does not support migration");
-    migrate_add_blocker(&s->migration_blocker, NULL);
+    s->vmstate_entry = qemu_add_vm_change_state_handler(vsock_vm_state_change, s);
     vsock_host_singleton = s;
 }
 
@@ -670,7 +706,7 @@ static void vsock_unrealize(DeviceState *dev)
     }
     g_ptr_array_free(s->listeners, true);
     qemu_bh_delete(s->pump_bh);
-    migrate_del_blocker(&s->migration_blocker);
+    qemu_del_vm_change_state_handler(s->vmstate_entry);
     virtio_delete_queue(s->rx_vq);
     virtio_delete_queue(s->tx_vq);
     virtio_delete_queue(s->event_vq);
@@ -679,6 +715,37 @@ static void vsock_unrealize(DeviceState *dev)
         vsock_host_singleton = NULL;
     }
 }
+
+/*
+ * Migration: the virtio core state only. Host connections cannot survive (their fds belong to the
+ * old process), so after a load the guest gets a transport reset and every peer reconnects.
+ */
+static int vsock_post_load(void *opaque, int version_id)
+{
+    VirtIOVSockHost *s = opaque;
+    s->reset_pending = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_vsock_host_device = {
+    .name = "virtio-vsock-host-device-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = vsock_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_vsock_host = {
+    .name = "virtio-vsock-host",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_VIRTIO_DEVICE,
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const Property vsock_props[] = {
     DEFINE_PROP_UINT64("guest-cid", VirtIOVSockHost, guest_cid, 3),
@@ -692,6 +759,8 @@ static void vsock_class_init(ObjectClass *klass, void *data)
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
     device_class_set_props(dc, vsock_props);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    dc->vmsd = &vmstate_vsock_host;
+    vdc->vmsd = &vmstate_vsock_host_device;
     vdc->realize = vsock_realize;
     vdc->unrealize = vsock_unrealize;
     vdc->get_features = vsock_get_features;

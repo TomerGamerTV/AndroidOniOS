@@ -11,6 +11,7 @@ struct VMSettings {
     var density: Int
     var preferJIT: Bool
     var navButtons: Bool
+    var saveState: Bool
 
     static var current: VMSettings {
         let d = UserDefaults.standard
@@ -26,7 +27,8 @@ struct VMSettings {
             height: d.object(forKey: "height") as? Int ?? defH,
             density: d.object(forKey: "density") as? Int ?? 420,
             preferJIT: d.object(forKey: "preferJIT") as? Bool ?? true,
-            navButtons: d.object(forKey: "navButtons") as? Bool ?? true)
+            navButtons: d.object(forKey: "navButtons") as? Bool ?? true,
+            saveState: SaveState.enabled)
     }
 
     func save() {
@@ -38,6 +40,7 @@ struct VMSettings {
         d.set(density, forKey: "density")
         d.set(navButtons, forKey: "navButtons")
         d.set(preferJIT, forKey: "preferJIT")
+        d.set(saveState, forKey: "saveState")
     }
 }
 
@@ -49,6 +52,17 @@ final class VirtualMachine {
     private(set) var started = false
     private(set) var usingJIT = false
     var onExit: ((Int32) -> Void)?
+
+    /// Launched from a save state; true until the saved machine is loaded.
+    private(set) var restoring = false
+    /// Android is up (booted, or resumed from a save): a save state may be taken.
+    var ready = false
+    private(set) var saving = false
+    private var resumeAfterSave = false
+    private var fingerprint = ""
+    private var writableDisks: [URL] = []
+    /// Called on the main thread when a restore has loaded (true) or the VM was not restored.
+    var onRestored: (() -> Void)?
 
     var kernelLog: URL { Paths.logs.appendingPathComponent("kernel.log") }
     var logcatLog: URL { Paths.logs.appendingPathComponent("logcat.log") }
@@ -108,7 +122,10 @@ final class VirtualMachine {
         setenv("RUTABAGA_DISPLAY_WIDTH", String(settings.width), 1)
         setenv("RUTABAGA_DISPLAY_HEIGHT", String(settings.height), 1)
         setenv("MVK_CONFIG_LOG_LEVEL", "1", 1)
-        setenv("RUTABAGA_RENDERER_FEATURES", "VulkanVirtualQueue:enabled", 1)
+        // VulkanSnapshots makes gfxstream track what it needs to save and restore the GPU state.
+        let features = settings.saveState && qemu.save_state != nil
+            ? "VulkanVirtualQueue:enabled,VulkanSnapshots:enabled" : "VulkanVirtualQueue:enabled"
+        setenv("RUTABAGA_RENDERER_FEATURES", features, 1)
         setenv("TMPDIR", NSTemporaryDirectory(), 1)
 
         // Optional developer overrides: Library/Android/debug.json
@@ -176,6 +193,20 @@ final class VirtualMachine {
             "-device", "virtio-vsock-host-pci,guest-cid=77,forward=unix:\(Paths.adbSocket):5555,guest-forward=5000:unix:\(Paths.servicesSocket)",
         ]
         args += dbg?.extraArgs ?? []
+
+        // Resume from a save state when one matches this exact machine and its disks.
+        fingerprint = SaveState.fingerprint(args: args, features: features)
+        writableDisks = [store.userdata, store.metadata, store.cache,
+                         store.path("system.img"), store.path("vendor.img")]
+        if settings.saveState, qemu.save_state != nil, qemu.restore_status != nil,
+           SaveState.restorable(fingerprint: fingerprint, disks: writableDisks) {
+            restoring = true
+            FileManager.default.createFile(atPath: SaveState.attemptMarker.path, contents: nil)
+            args += ["-incoming", "file:" + SaveState.file.path]
+            Log.info("save state: restoring")
+        } else {
+            SaveState.discard()
+        }
         Log.info("qemu " + args.joined(separator: " "))
 
         display.attach(to: &qemu)
@@ -203,6 +234,71 @@ final class VirtualMachine {
         thread.stackSize = 16 << 20
         thread.qualityOfService = QualityOfService.userInteractive
         thread.start()
+        if restoring { waitForRestore() }
+    }
+
+    // MARK: - Save states
+
+    private func waitForRestore() {
+        let began = Date()
+        guard let status = qemu.restore_status else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            while status() != 0 { usleep(20_000) }
+            DispatchQueue.main.async {
+                Log.info(String(format: "save state: restored in %.1fs", Date().timeIntervalSince(began)))
+                // Loaded. The save stays valid until the VM runs again (resume() deletes it).
+                try? FileManager.default.removeItem(at: SaveState.attemptMarker)
+                self.restoring = false
+                self.ready = true
+                self.onRestored?()
+                if UIApplication.shared.applicationState != .background { self.resume() }
+            }
+        }
+    }
+
+    /// App going to the background: pause Android and, if enabled, save it so a later launch
+    /// can resume it after iOS ends the app.
+    func enterBackground() {
+        setRunning(false)
+        guard started, ready, !restoring, !saving, VMSettings.current.saveState,
+              let save = qemu.save_state else { return }
+        saving = true
+        resumeAfterSave = false
+        let began = Date()
+        var task = UIBackgroundTaskIdentifier.invalid
+        task = UIApplication.shared.beginBackgroundTask(withName: "save-android") {
+            // Out of background time: iOS suspends us mid-save; the partial file is ignored.
+            Log.info("save state: background time expired")
+            UIApplication.shared.endBackgroundTask(task)
+        }
+        let done = SaveDone { [weak self] status in
+            guard let self else { return }
+            self.saving = false
+            if status == 0 {
+                SaveState.commit(fingerprint: self.fingerprint, disks: self.writableDisks)
+                Log.info(String(format: "save state: saved in %.1fs", Date().timeIntervalSince(began)))
+            } else {
+                Log.info("save state: failed (\(status))")
+                SaveState.discard()
+            }
+            if self.resumeAfterSave { self.resume() }
+            UIApplication.shared.endBackgroundTask(task)
+        }
+        save(SaveState.partial.path, { opaque, status in
+            let done = Unmanaged<SaveDone>.fromOpaque(opaque!).takeRetainedValue()
+            DispatchQueue.main.async { done.fn(status) }
+        }, Unmanaged.passRetained(done).toOpaque())
+    }
+
+    /// App back in front: continue Android (dropping the save it can no longer match).
+    func enterForeground() { resume() }
+
+    private func resume() {
+        guard started, !restoring else { return }
+        if saving { resumeAfterSave = true; return }
+        if SaveState.exists { SaveState.discard() }
+        setRunning(true)
+        if ready { GuestSetup.syncClock() }
     }
 
     func touch(slot: Int, phase: Int32, x: Int, y: Int, width: Int, height: Int) {
@@ -225,4 +321,10 @@ final class VirtualMachine {
         UserDefaults.standard.set(s, forKey: "serial")
         return s
     }
+}
+
+/// Boxes a save-state completion for the C callback.
+private final class SaveDone {
+    let fn: (Int32) -> Void
+    init(_ fn: @escaping (Int32) -> Void) { self.fn = fn }
 }

@@ -18,6 +18,10 @@
 #include "ui/droid.h"
 #include "system/runstate.h"
 #include "system/cpus.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-migration.h"
+#include "qapi/qapi-commands-misc.h"
+#include "qemu/timer.h"
 
 typedef struct DroidDisplay {
     DisplayChangeListener dcl;
@@ -239,7 +243,15 @@ static void droid_run_bh(void *opaque)
 {
     bool run = (bool)(uintptr_t)opaque;
     if (run && !runstate_is_running()) {
-        vm_start();
+        if (runstate_check(RUN_STATE_INMIGRATE) || runstate_check(RUN_STATE_FINISH_MIGRATE)) {
+            return; /* loading or saving state; the app resumes once that is done */
+        }
+        /* Like the "cont" command: also takes the disks back after a completed save. */
+        Error *err = NULL;
+        qmp_cont(&err);
+        if (err) {
+            error_report_err(err);
+        }
     } else if (!run && runstate_is_running()) {
         vm_stop(RUN_STATE_PAUSED);
     }
@@ -256,4 +268,103 @@ void droid_set_running(bool running)
 bool droid_is_running(void)
 {
     return runstate_is_running();
+}
+
+/* ---- save state ---- */
+
+typedef struct DroidSave {
+    char *path;
+    droid_save_done_fn done;
+    void *opaque;
+    QEMUTimer *timer;
+} DroidSave;
+
+static void droid_save_finish(DroidSave *s, int status)
+{
+    if (s->timer) {
+        timer_free(s->timer);
+    }
+    s->done(s->opaque, status);
+    g_free(s->path);
+    g_free(s);
+}
+
+static void droid_save_poll(void *opaque)
+{
+    DroidSave *s = opaque;
+    MigrationInfo *info = qmp_query_migrate(NULL);
+    int status = 1;
+
+    if (info->has_status) {
+        switch (info->status) {
+        case MIGRATION_STATUS_COMPLETED:
+            status = 0;
+            break;
+        case MIGRATION_STATUS_FAILED:
+        case MIGRATION_STATUS_CANCELLED:
+            status = -EIO;
+            fprintf(stderr, "droid: save state failed: %s\n",
+                    info->error_desc ? info->error_desc : "unknown error");
+            break;
+        default:
+            break;
+        }
+    }
+    qapi_free_MigrationInfo(info);
+    if (status == 1) {
+        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 20);
+        return;
+    }
+    droid_save_finish(s, status);
+}
+
+static void droid_save_bh(void *opaque)
+{
+    DroidSave *s = opaque;
+    Error *err = NULL;
+
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_PAUSED);
+    }
+    /* The VM is stopped, so nothing is gained by rate limiting the write (default 128 MiB/s). */
+    MigrateSetParameters params = {
+        .has_max_bandwidth = true,
+        .max_bandwidth = 100ULL << 30,
+    };
+    qmp_migrate_set_parameters(&params, &err);
+    if (err) {
+        error_report_err(err);
+        err = NULL;
+    }
+    g_autofree char *uri = g_strdup_printf("file:%s", s->path);
+    qmp_migrate(uri, false, NULL, false, false, false, false, &err);
+    if (err) {
+        fprintf(stderr, "droid: save state: %s\n", error_get_pretty(err));
+        error_free(err);
+        droid_save_finish(s, -EIO);
+        return;
+    }
+    s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, droid_save_poll, s);
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 20);
+}
+
+void droid_save_state(const char *path, droid_save_done_fn done, void *opaque)
+{
+    DroidSave *s;
+
+    if (!qemu_get_aio_context()) {
+        done(opaque, -ENODEV);
+        return;
+    }
+    s = g_new0(DroidSave, 1);
+    s->path = g_strdup(path);
+    s->done = done;
+    s->opaque = opaque;
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), droid_save_bh, s);
+}
+
+int droid_restore_status(void)
+{
+    /* Still starting up or loading the saved state. */
+    return runstate_check(RUN_STATE_PRELAUNCH) || runstate_check(RUN_STATE_INMIGRATE) ? 1 : 0;
 }

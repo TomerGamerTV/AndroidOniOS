@@ -2,6 +2,20 @@ import Foundation
 
 /// Guest tweaks applied over ADB each time Android finishes booting.
 enum GuestSetup {
+    /// Android's clock stands still while the VM is paused or saved; set it to the real time.
+    /// (The time detector takes this like a network-provided time, so automatic time keeps working.)
+    static func syncClock() {
+        DispatchQueue.global(qos: .utility).async {
+            guard ADBClient.shared.connect(timeout: 60) else { return }
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            let cmd = "er=$(awk '{printf \"%d\", $1*1000}' /proc/uptime); "
+                + "cmd time_detector suggest_telephony_time --slot_index 0 "
+                + "--elapsed_realtime $er --unix_epoch_time \(now) >/dev/null 2>&1; date"
+            let out = (try? ADBClient.shared.shell(cmd)) ?? "(adb error)"
+            Log.info("guest clock: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+
     static func apply(_ settings: VMSettings) {
         DispatchQueue.global(qos: .utility).async {
             // iOS keeps the bottom-edge swipe for its own home gesture, so Android's on-screen

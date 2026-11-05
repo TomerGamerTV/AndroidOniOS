@@ -12,6 +12,8 @@ mkdir -p "$VM"
 ADBKEY_PUB="$(cat "$HOME/.android/adbkey.pub" 2>/dev/null || true)"
 cp "$ROOT/config/bootconfig.txt" "$VM/bootconfig.txt"
 [ "${GLES:-off}" = off ] && echo "androidboot.hardwareegl=angle" >> "$VM/bootconfig.txt"
+# HWUI=skiavk matches the iOS app (also needs RUTABAGA_RENDERER_FEATURES=VulkanVirtualQueue:enabled).
+[ -n "$HWUI" ] && sed -i '' "s/^androidboot.debug.hwui.renderer=.*/androidboot.debug.hwui.renderer=$HWUI/" "$VM/bootconfig.txt"
 [ -n "$ADBKEY_PUB" ] && echo "androidboot.qemu.adb.pubkey=$ADBKEY_PUB" >> "$VM/bootconfig.txt"
 python3 "$ROOT/tools/mkinitrd.py" "$IMG/ramdisk.img" "$VM/initrd" --file "$VM/bootconfig.txt"
 

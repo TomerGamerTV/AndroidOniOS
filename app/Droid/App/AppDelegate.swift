@@ -49,15 +49,16 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     func sceneDidBecomeActive(_ scene: UIScene) {
         // Keep the screen on while Android is in front, like a game would.
         UIApplication.shared.isIdleTimerDisabled = true
-        VirtualMachine.shared.setRunning(true)
+        VirtualMachine.shared.enterForeground()
         Inbox.shared.process()
         FileBridge.shared.syncNow()
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
-        // iOS suspends us shortly after this; pause vCPUs so the guest doesn't see a
-        // stalled CPU (RCU stall warnings) when we come back.
-        VirtualMachine.shared.setRunning(false)
         FileBridge.shared.syncNow()
+        // iOS suspends us shortly after this; pause vCPUs so the guest doesn't see a stalled
+        // CPU (RCU stall warnings) when we come back, and save Android's state in case iOS
+        // ends the app while it is in the background.
+        VirtualMachine.shared.enterBackground()
     }
 }

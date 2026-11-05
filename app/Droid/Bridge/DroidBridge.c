@@ -129,6 +129,8 @@ int droid_qemu_load(const char *path, DroidQEMU *out, char *errbuf, size_t errle
     LOAD(reset, "droid_reset");
     LOAD(set_running, "droid_set_running");
     LOAD(is_running, "droid_is_running");
+    *(void **)&out->save_state = dlsym(h, "droid_save_state");
+    *(void **)&out->restore_status = dlsym(h, "droid_restore_status");
     return 0;
 }
 

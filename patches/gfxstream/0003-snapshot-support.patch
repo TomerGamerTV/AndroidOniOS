@@ -1,0 +1,614 @@
+diff --git a/host/virtio_gpu_context_snapshot.pb.h b/host/virtio_gpu_context_snapshot.pb.h
+new file mode 100644
+index 0000000..4e66272
+--- /dev/null
++++ b/host/virtio_gpu_context_snapshot.pb.h
+@@ -0,0 +1,3 @@
++// Protobuf-free stand-in; see virtio_gpu_snapshot_shim.h.
++#pragma once
++#include "virtio_gpu_snapshot_shim.h"
+diff --git a/host/virtio_gpu_frontend.cpp b/host/virtio_gpu_frontend.cpp
+index f91f44a..1cc17ee 100644
+--- a/host/virtio_gpu_frontend.cpp
++++ b/host/virtio_gpu_frontend.cpp
+@@ -20,8 +20,10 @@
+ #include <filesystem>
+ // X11 defines status as a preprocessor define which messes up
+ // anyone with a `Status` type.
++#ifndef GFXSTREAM_SNAPSHOT_SHIM
+ #include <google/protobuf/io/zero_copy_stream_impl.h>
+ #include <google/protobuf/text_format.h>
++#endif
+ #endif  // ifdef GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT
+ 
+ #include <vulkan/vulkan.h>
+@@ -1050,6 +1052,13 @@ int VirtioGpuFrontend::snapshotFrontend(const char* directory) {
+ 
+     const std::filesystem::path snapshotDirectory = std::string(directory);
+     const std::filesystem::path snapshotPath = snapshotDirectory / kSnapshotBasenameFrontend;
++#ifdef GFXSTREAM_SNAPSHOT_SHIM
++    if (!gfxstream::host::snapshot::ShimSaveToFile(snapshot, snapshotPath.string().c_str())) {
++        GFXSTREAM_ERROR("Failed to save snapshot: failed to write %s",
++                        snapshotPath.string().c_str());
++        return -1;
++    }
++#else
+     int snapshotFd = open(snapshotPath.string().c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0660);
+     if (snapshotFd < 0) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to open %s",
+@@ -1062,6 +1071,7 @@ int VirtioGpuFrontend::snapshotFrontend(const char* directory) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to serialize to stream.");
+         return -1;
+     }
++#endif
+ 
+     return 0;
+ }
+@@ -1092,18 +1102,15 @@ int VirtioGpuFrontend::snapshot(const char* directory) {
+     int ret = snapshotRenderer(directory);
+     if (ret) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot renderer.");
+-        return ret;
+-    }
+-
+-    ret = snapshotFrontend(directory);
+-    if (ret) {
++    } else if ((ret = snapshotFrontend(directory))) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot frontend.");
+-        return ret;
++    } else if ((ret = snapshotAsg(directory))) {
++        GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot ASG device.");
+     }
+-
+-    ret = snapshotAsg(directory);
++    // The VM may keep running after a save (a "save state" rather than a migration away), so
++    // let the render threads paused above continue; stream_renderer_resume() doesn't yet.
++    mRenderer->resumeAll();
+     if (ret) {
+-        GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot ASG device.");
+         return ret;
+     }
+ 
+@@ -1134,6 +1141,13 @@ int VirtioGpuFrontend::restoreFrontend(const char* directory) {
+     const std::filesystem::path snapshotPath = snapshotDirectory / kSnapshotBasenameFrontend;
+ 
+     gfxstream::host::snapshot::VirtioGpuFrontendSnapshot snapshot;
++#ifdef GFXSTREAM_SNAPSHOT_SHIM
++    if (!gfxstream::host::snapshot::ShimLoadFromFile(&snapshot, snapshotPath.string().c_str())) {
++        GFXSTREAM_ERROR("Failed to restore snapshot: failed to read %s",
++                        snapshotPath.string().c_str());
++        return -1;
++    }
++#else
+     {
+         int snapshotFd = open(snapshotPath.string().c_str(), O_RDONLY);
+         if (snapshotFd < 0) {
+@@ -1148,6 +1162,7 @@ int VirtioGpuFrontend::restoreFrontend(const char* directory) {
+             return -1;
+         }
+     }
++#endif
+ 
+     mContexts.clear();
+     mResources.clear();
+diff --git a/host/virtio_gpu_frontend_snapshot.pb.h b/host/virtio_gpu_frontend_snapshot.pb.h
+new file mode 100644
+index 0000000..4e66272
+--- /dev/null
++++ b/host/virtio_gpu_frontend_snapshot.pb.h
+@@ -0,0 +1,3 @@
++// Protobuf-free stand-in; see virtio_gpu_snapshot_shim.h.
++#pragma once
++#include "virtio_gpu_snapshot_shim.h"
+diff --git a/host/virtio_gpu_resource_snapshot.pb.h b/host/virtio_gpu_resource_snapshot.pb.h
+new file mode 100644
+index 0000000..4e66272
+--- /dev/null
++++ b/host/virtio_gpu_resource_snapshot.pb.h
+@@ -0,0 +1,3 @@
++// Protobuf-free stand-in; see virtio_gpu_snapshot_shim.h.
++#pragma once
++#include "virtio_gpu_snapshot_shim.h"
+diff --git a/host/virtio_gpu_ring_blob_snapshot.pb.h b/host/virtio_gpu_ring_blob_snapshot.pb.h
+new file mode 100644
+index 0000000..4e66272
+--- /dev/null
++++ b/host/virtio_gpu_ring_blob_snapshot.pb.h
+@@ -0,0 +1,3 @@
++// Protobuf-free stand-in; see virtio_gpu_snapshot_shim.h.
++#pragma once
++#include "virtio_gpu_snapshot_shim.h"
+diff --git a/host/virtio_gpu_snapshot_shim.h b/host/virtio_gpu_snapshot_shim.h
+new file mode 100644
+index 0000000..b2f9121
+--- /dev/null
++++ b/host/virtio_gpu_snapshot_shim.h
+@@ -0,0 +1,414 @@
++// Protobuf-free stand-ins for the virtio-gpu frontend snapshot messages
++// (virtio_gpu_*_snapshot.proto). They expose the subset of the generated protobuf C++ API
++// that the frontend uses, and serialize to a compact private binary format, so snapshot support
++// builds without protobuf/abseil (which we would otherwise have to port to iOS).
++#pragma once
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <optional>
++#include <string>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++namespace gfxstream {
++namespace host {
++namespace snapshot {
++
++template <typename T>
++class Repeated : public std::vector<T> {
++   public:
++    template <typename It>
++    void Add(It begin, It end) {
++        this->insert(this->end(), begin, end);
++    }
++    void Add(T value) { this->push_back(std::move(value)); }
++};
++
++class ShimWriter {
++   public:
++    std::string out;
++    void raw(const void* p, size_t n) { out.append(static_cast<const char*>(p), n); }
++    void io(bool& v) { uint8_t b = v; raw(&b, 1); }
++    void io(uint32_t& v) { raw(&v, 4); }
++    void io(uint64_t& v) { raw(&v, 8); }
++    void io(std::string& s) {
++        uint64_t n = s.size();
++        io(n);
++        raw(s.data(), s.size());
++    }
++    template <typename E>
++    std::enable_if_t<std::is_enum_v<E>> io(E& e) {
++        uint32_t v = static_cast<uint32_t>(e);
++        io(v);
++    }
++    template <typename M>
++    auto io(M& m) -> decltype(m.Visit(*this), void()) { m.Visit(*this); }
++    template <typename T>
++    void io(std::optional<T>& o) {
++        bool has = o.has_value();
++        io(has);
++        if (has) io(*o);
++    }
++    template <typename T>
++    void io(Repeated<T>& r) {
++        uint64_t n = r.size();
++        io(n);
++        for (auto& e : r) io(e);
++    }
++    template <typename K, typename V>
++    void io(std::map<K, V>& m) {
++        uint64_t n = m.size();
++        io(n);
++        for (auto& [k, v] : m) {
++            K key = k;
++            io(key);
++            io(v);
++        }
++    }
++};
++
++class ShimReader {
++   public:
++    ShimReader(const std::string& s) : p(s.data()), end(s.data() + s.size()) {}
++    bool ok = true;
++    void raw(void* dst, size_t n) {
++        if (!ok || static_cast<size_t>(end - p) < n) { ok = false; return; }
++        std::memcpy(dst, p, n);
++        p += n;
++    }
++    void io(bool& v) { uint8_t b = 0; raw(&b, 1); v = b; }
++    void io(uint32_t& v) { raw(&v, 4); }
++    void io(uint64_t& v) { raw(&v, 8); }
++    void io(std::string& s) {
++        uint64_t n = 0;
++        io(n);
++        if (!ok || static_cast<uint64_t>(end - p) < n) { ok = false; return; }
++        s.assign(p, n);
++        p += n;
++    }
++    template <typename E>
++    std::enable_if_t<std::is_enum_v<E>> io(E& e) {
++        uint32_t v = 0;
++        io(v);
++        e = static_cast<E>(v);
++    }
++    template <typename M>
++    auto io(M& m) -> decltype(m.Visit(*this), void()) { m.Visit(*this); }
++    template <typename T>
++    void io(std::optional<T>& o) {
++        bool has = false;
++        io(has);
++        if (!ok) return;
++        if (has) { o.emplace(); io(*o); } else { o.reset(); }
++    }
++    template <typename T>
++    void io(Repeated<T>& r) {
++        uint64_t n = 0;
++        io(n);
++        r.clear();
++        for (uint64_t i = 0; ok && i < n; i++) { r.emplace_back(); io(r.back()); }
++    }
++    template <typename K, typename V>
++    void io(std::map<K, V>& m) {
++        uint64_t n = 0;
++        io(n);
++        m.clear();
++        for (uint64_t i = 0; ok && i < n; i++) {
++            K k{};
++            io(k);
++            io(m[k]);
++        }
++    }
++
++   private:
++    const char* p;
++    const char* end;
++};
++
++#define GFXSTREAM_SHIM_SCALAR(type, name)                                     \
++   private:                                                                   \
++    std::optional<type> name##_;                                              \
++                                                                              \
++   public:                                                                    \
++    type name() const { return name##_.value_or(type{}); }                    \
++    void set_##name(type v) { name##_ = v; }                                  \
++    bool has_##name() const { return name##_.has_value(); }
++
++#define GFXSTREAM_SHIM_MESSAGE(type, name)                                    \
++   private:                                                                   \
++    std::optional<type> name##_;                                              \
++                                                                              \
++   public:                                                                    \
++    const type& name() const {                                                \
++        static const type kDefault{};                                         \
++        return name##_ ? *name##_ : kDefault;                                 \
++    }                                                                         \
++    type* mutable_##name() {                                                  \
++        if (!name##_) name##_.emplace();                                      \
++        return &*name##_;                                                     \
++    }                                                                         \
++    bool has_##name() const { return name##_.has_value(); }
++
++#define GFXSTREAM_SHIM_REPEATED(type, name)                                   \
++   private:                                                                   \
++    Repeated<type> name##_;                                                   \
++                                                                              \
++   public:                                                                    \
++    const Repeated<type>& name() const { return name##_; }                    \
++    Repeated<type>* mutable_##name() { return &name##_; }
++
++#define GFXSTREAM_SHIM_MAP(ktype, vtype, name)                                \
++   private:                                                                   \
++    std::map<ktype, vtype> name##_;                                           \
++                                                                              \
++   public:                                                                    \
++    const std::map<ktype, vtype>& name() const { return name##_; }            \
++    std::map<ktype, vtype>* mutable_##name() { return &name##_; }
++
++#define GFXSTREAM_SHIM_SWAP(type) \
++    void Swap(type* other) { std::swap(*this, *other); }
++
++// virtio_gpu_context_snapshot.proto
++class VirtioGpuContextSnapshot {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, id)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, capset)
++    GFXSTREAM_SHIM_REPEATED(uint32_t, attached_resources)
++    GFXSTREAM_SHIM_MAP(uint32_t, uint32_t, resource_asgs)
++   private:
++    std::string name_;
++
++   public:
++    const std::string& name() const { return name_; }
++    void set_name(const std::string& v) { name_ = v; }
++    GFXSTREAM_SHIM_SWAP(VirtioGpuContextSnapshot)
++    template <typename V>
++    void Visit(V& v) {
++        v.io(id_);
++        v.io(name_);
++        v.io(capset_);
++        v.io(attached_resources_);
++        v.io(resource_asgs_);
++    }
++};
++
++// virtio_gpu_ring_blob_snapshot.proto
++class VirtioGpuRingBlobSnapshot {
++   public:
++    enum Type : uint32_t { TYPE_HOST_MEMORY = 0, TYPE_SHARED_MEMORY = 1 };
++    GFXSTREAM_SHIM_SCALAR(uint32_t, id)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, size)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, alignment)
++    GFXSTREAM_SHIM_SCALAR(Type, type)
++   private:
++    std::string memory_;
++
++   public:
++    const std::string& memory() const { return memory_; }
++    void set_memory(const void* data, size_t size) {
++        memory_.assign(static_cast<const char*>(data), size);
++    }
++    GFXSTREAM_SHIM_SWAP(VirtioGpuRingBlobSnapshot)
++    template <typename V>
++    void Visit(V& v) {
++        v.io(id_);
++        v.io(size_);
++        v.io(alignment_);
++        v.io(type_);
++        v.io(memory_);
++    }
++};
++
++// virtio_gpu_resource_snapshot.proto
++enum VirtioGpuResourceType : uint32_t {
++    UNKNOWN = 0,
++    PIPE = 1,
++    BUFFER = 2,
++    COLOR_BUFFER = 3,
++    BLOB = 4,
++};
++
++class VirtioGpuResourceCreateArgs {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, id)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, target)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, format)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, bind)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, width)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, height)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, depth)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, array_size)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, last_level)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, nr_samples)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, flags)
++   public:
++    template <typename V>
++    void Visit(V& v) {
++        v.io(id_); v.io(target_); v.io(format_); v.io(bind_); v.io(width_); v.io(height_);
++        v.io(depth_); v.io(array_size_); v.io(last_level_); v.io(nr_samples_); v.io(flags_);
++    }
++};
++
++class VirtioGpuResourceCreateBlobArgs {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, mem)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, flags)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, id)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, size)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(mem_); v.io(flags_); v.io(id_); v.io(size_); }
++};
++
++class VirtioGpuBlobExternalMemoryInfo {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, context_id)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, blob_id)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(context_id_); v.io(blob_id_); }
++};
++
++class VirtioGpuResourceSnapshot {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, id)
++    GFXSTREAM_SHIM_SCALAR(VirtioGpuResourceType, type)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuResourceCreateArgs, create_args)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuResourceCreateBlobArgs, create_blob_args)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuRingBlobSnapshot, ring_blob)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuBlobExternalMemoryInfo, external_memory_descriptor)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuBlobExternalMemoryInfo, external_memory_mapping)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, latest_attached_context)
++    GFXSTREAM_SHIM_REPEATED(uint32_t, attached_contexts)
++   public:
++    GFXSTREAM_SHIM_SWAP(VirtioGpuResourceSnapshot)
++    template <typename V>
++    void Visit(V& v) {
++        v.io(id_); v.io(type_); v.io(create_args_); v.io(create_blob_args_); v.io(ring_blob_);
++        v.io(external_memory_descriptor_); v.io(external_memory_mapping_);
++        v.io(latest_attached_context_); v.io(attached_contexts_);
++    }
++};
++
++// virtio_gpu_timelines_snapshot.proto
++class VirtioGpuGlobalRing {
++   public:
++    template <typename V>
++    void Visit(V&) {}
++};
++
++class VirtioGpuContextSpecificRing {
++    GFXSTREAM_SHIM_SCALAR(uint32_t, context_id)
++    GFXSTREAM_SHIM_SCALAR(uint32_t, ring_id)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(context_id_); v.io(ring_id_); }
++};
++
++class VirtioGpuRing {
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuGlobalRing, global)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuContextSpecificRing, context_specific)
++   public:
++    GFXSTREAM_SHIM_SWAP(VirtioGpuRing)
++    template <typename V>
++    void Visit(V& v) { v.io(global_); v.io(context_specific_); }
++};
++
++class VirtioGpuTimelineFence {
++    GFXSTREAM_SHIM_SCALAR(uint64_t, id)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(id_); }
++};
++
++class VirtioGpuTimelineTask {
++    GFXSTREAM_SHIM_SCALAR(uint64_t, id)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuRing, ring)
++    GFXSTREAM_SHIM_SCALAR(uint64_t, trace_id)
++    GFXSTREAM_SHIM_SCALAR(bool, completed)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(id_); v.io(ring_); v.io(trace_id_); v.io(completed_); }
++};
++
++class VirtioGpuTimelineItem {
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuTimelineFence, fence)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuTimelineTask, task)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(fence_); v.io(task_); }
++};
++
++class VirtioGpuTimeline {
++    GFXSTREAM_SHIM_SCALAR(uint64_t, trace_id)
++    GFXSTREAM_SHIM_REPEATED(VirtioGpuTimelineItem, items)
++   public:
++    GFXSTREAM_SHIM_SWAP(VirtioGpuTimeline)
++    template <typename V>
++    void Visit(V& v) { v.io(trace_id_); v.io(items_); }
++};
++
++class VirtioGpuTimelinesSnapshot {
++   public:
++    class RingWithTimeline {
++        GFXSTREAM_SHIM_MESSAGE(VirtioGpuRing, ring)
++        GFXSTREAM_SHIM_MESSAGE(VirtioGpuTimeline, timeline)
++       public:
++        template <typename V>
++        void Visit(V& v) { v.io(ring_); v.io(timeline_); }
++    };
++    GFXSTREAM_SHIM_SCALAR(uint64_t, next_id)
++    GFXSTREAM_SHIM_REPEATED(RingWithTimeline, timelines)
++   public:
++    RingWithTimeline* add_timelines() {
++        timelines_.emplace_back();
++        return &timelines_.back();
++    }
++    GFXSTREAM_SHIM_SWAP(VirtioGpuTimelinesSnapshot)
++    template <typename V>
++    void Visit(V& v) { v.io(next_id_); v.io(timelines_); }
++};
++
++// virtio_gpu_frontend_snapshot.proto
++class VirtioGpuFrontendSnapshot {
++    GFXSTREAM_SHIM_MAP(uint32_t, VirtioGpuContextSnapshot, contexts)
++    GFXSTREAM_SHIM_MAP(uint32_t, VirtioGpuResourceSnapshot, resources)
++    GFXSTREAM_SHIM_MESSAGE(VirtioGpuTimelinesSnapshot, timelines)
++   public:
++    template <typename V>
++    void Visit(V& v) { v.io(contexts_); v.io(resources_); v.io(timelines_); }
++};
++
++static constexpr uint64_t kShimMagic = 0x4746585348494d31ull;  // "GFXSHIM1"
++
++template <typename M>
++bool ShimSaveToFile(const M& msg, const char* path) {
++    ShimWriter w;
++    uint64_t magic = kShimMagic;
++    w.io(magic);
++    const_cast<M&>(msg).Visit(w);
++    FILE* f = fopen(path, "wb");
++    if (!f) return false;
++    bool ok = fwrite(w.out.data(), 1, w.out.size(), f) == w.out.size();
++    return fclose(f) == 0 && ok;
++}
++
++template <typename M>
++bool ShimLoadFromFile(M* msg, const char* path) {
++    FILE* f = fopen(path, "rb");
++    if (!f) return false;
++    std::string data;
++    char buf[65536];
++    size_t n;
++    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
++    fclose(f);
++    ShimReader r(data);
++    uint64_t magic = 0;
++    r.io(magic);
++    if (!r.ok || magic != kShimMagic) return false;
++    msg->Visit(r);
++    return r.ok;
++}
++
++}  // namespace snapshot
++}  // namespace host
++}  // namespace gfxstream
+diff --git a/host/virtio_gpu_timelines_snapshot.pb.h b/host/virtio_gpu_timelines_snapshot.pb.h
+new file mode 100644
+index 0000000..4e66272
+--- /dev/null
++++ b/host/virtio_gpu_timelines_snapshot.pb.h
+@@ -0,0 +1,3 @@
++// Protobuf-free stand-in; see virtio_gpu_snapshot_shim.h.
++#pragma once
++#include "virtio_gpu_snapshot_shim.h"
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index e6036f5..21d6f58 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -1122,6 +1122,8 @@ class VkDecoderGlobalState::Impl {
+                 // allocated at save time); used to prune replayed sets that the
+                 // snapshot does not know about.
+                 std::unordered_set<uint64_t> savedBoxedSets;
++                // Per entry of boxedSetsToRestore: 1 if the set must be allocated again.
++                std::vector<uint32_t> setsNeedingAlloc;
+ 
+                 // Temporary structures for the pointers in VkWriteDescriptorSet.
+                 // Use unique_ptr so that the pointers don't change when vector resizes.
+@@ -1148,13 +1150,22 @@ class VkDecoderGlobalState::Impl {
+                     VkDescriptorSetLayout unboxedLayout =
+                         try_unbox_VkDescriptorSetLayout(boxedLayout);
+                     BoxedHandleInfo* setHandleInfo = sBoxedHandleManager.get(boxedSet);
+-                    bool setValid = (setHandleInfo != nullptr && setHandleInfo->underlying != 0 &&
++                    // With batched updates the guest allocates sets lazily through
++                    // vkQueueCommitDescriptorSetUpdatesGOOGLE, which replay does not
++                    // re-run: the pre-minted boxed set exists but has no underlying set.
++                    // Allocate it again here, or the guest's next use of it is fatal.
++                    const bool needsAlloc =
++                        !needToUnboxDescriptorSet && setHandleInfo != nullptr &&
++                        setHandleInfo->underlying == 0 && unboxedLayout != VK_NULL_HANDLE;
++                    bool setValid = (setHandleInfo != nullptr &&
++                                     (setHandleInfo->underlying != 0 || needsAlloc) &&
+                                      (boxedLayout == VK_NULL_HANDLE ||
+                                       unboxedLayout != VK_NULL_HANDLE));
+                     if (setValid) {
+                         boxedSetsToRestore.push_back(boxedSet);
+                         writeStartingIndices.push_back(writeDescriptorSets.size());
+                         layouts.push_back(unboxedLayout);
++                        setsNeedingAlloc.push_back(needsAlloc ? 1 : 0);
+                     }
+                     uint64_t validWriteCount = stream->getBe64();
+                     for (uint64_t write = 0; write < validWriteCount; write++) {
+@@ -1264,9 +1275,9 @@ class VkDecoderGlobalState::Impl {
+                     }
+                 }
+                 std::vector<uint32_t> whichPool(boxedSetsToRestore.size(), 0);
+-                // no need to allocate descriptors as this is not batched
+-                // all the descriptors are already allocated
+-                std::vector<uint32_t> pendingAlloc(boxedSetsToRestore.size(), false);
++                // Sets recreated by replay are already allocated; batched-mode sets that
++                // were allocated lazily are allocated by the commit below.
++                std::vector<uint32_t> pendingAlloc = setsNeedingAlloc;
+ 
+                 const auto& device = poolInfo.device;
+                 const auto& deviceInfo = gfxstream::base::find(mDeviceInfo, device);
+diff --git a/meson.build b/meson.build
+index e1c52cb..e346099 100644
+--- a/meson.build
++++ b/meson.build
+@@ -54,6 +54,10 @@ gfxstream_host_args = [
+   '-Wno-implicit-fallthrough',
+ ]
+ 
++# Snapshot/restore of the virtio-gpu frontend, serialized without protobuf
++# (host/virtio_gpu_snapshot_shim.h).
++gfxstream_host_args += ['-DGFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT', '-DGFXSTREAM_SNAPSHOT_SHIM']
++
+ if host_machine.system() == 'qnx'
+   gfxstream_host_args += '-D_QNX_SOURCE'
+   qnx_target = get_option('qnx_target')

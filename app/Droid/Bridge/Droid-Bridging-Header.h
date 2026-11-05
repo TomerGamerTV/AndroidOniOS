@@ -35,6 +35,9 @@ typedef struct DroidQEMU {
     void (*reset)(void);
     void (*set_running)(bool running);
     bool (*is_running)(void);
+    /* Save states (optional: NULL with an older QEMU framework). */
+    void (*save_state)(const char *path, void (*done)(void *opaque, int status), void *opaque);
+    int (*restore_status)(void);
     /* Display callbacks to register right after qemu_init (QEMU's main loop must exist). */
     void *display_opaque;
     droid_surface_fn display_surface;

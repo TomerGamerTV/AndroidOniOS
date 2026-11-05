@@ -100,6 +100,7 @@ final class MainViewController: UIViewController {
         Inbox.shared.onMessage = { [weak self] msg in self?.state.flash(msg) }
         NotificationCenter.default.addObserver(forName: .androidBootCompleted, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
+            VirtualMachine.shared.ready = true
             self.state.bootFraction = 1
             GuestSetup.apply(VMSettings.current)
             Log.info("boot completed; memory headroom \(os_proc_available_memory() >> 20) MiB, thermal state \(ProcessInfo.processInfo.thermalState.rawValue)")
@@ -142,6 +143,7 @@ final class MainViewController: UIViewController {
             state.detail = "Checking Android system image…"
             try await store.prepare()
             if UserDefaults.standard.bool(forKey: "pendingFactoryReset") {
+                SaveState.discard()
                 try store.resetUserData()
                 UserDefaults.standard.set(false, forKey: "pendingFactoryReset")
             }
@@ -231,9 +233,22 @@ final class MainViewController: UIViewController {
         }
         VirtualMachine.shared.onExit = { [weak self] code in
             self?.state.phase = .stopped
-            self?.state.detail = "Android stopped (\(code))."
+            self?.state.detail = VirtualMachine.shared.restoring
+                ? "Android could not resume from its saved state. Open the app again to start it normally."
+                : "Android stopped (\(code))."
         }
-        bootProgress.start(kernelLog: VirtualMachine.shared.kernelLog)
+        if VirtualMachine.shared.restoring {
+            // Resuming from a save state: no boot to follow.
+            state.detail = "Resuming Android"
+            VirtualMachine.shared.onRestored = { [weak self] in
+                guard let self else { return }
+                self.bootProgress.finish()
+                self.state.bootFraction = 1
+                self.state.phase = .running
+            }
+        } else {
+            bootProgress.start(kernelLog: VirtualMachine.shared.kernelLog)
+        }
         DispatchQueue.global(qos: .utility).async {
             if ADBClient.shared.connect() {
                 DispatchQueue.main.async {
@@ -246,7 +261,7 @@ final class MainViewController: UIViewController {
 
     private func requestJIT() {
         let pid = getpid()
-        let id = Bundle.main.bundleIdentifier ?? "com.tomer.androidonios"
+        let id = Bundle.main.bundleIdentifier ?? "com.tomergamertv.oni"
         UserDefaults.standard.set(true, forKey: "preferJIT")
         if let url = URL(string: "stikdebug://enable-jit?bundle-id=\(id)&pid=\(pid)&script-name=universal.js"),
            UIApplication.shared.canOpenURL(url) {
