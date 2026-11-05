@@ -30,13 +30,18 @@ final class FileBridge {
     private func localFiles() -> [String: Meta] {
         var out: [String: Meta] = [:]
         let root = Paths.sharedStorage
+        // Enumerated URLs may come back as /private/var/... while the root is /var/...;
+        // resolve both the same way before taking the relative path.
+        let rootPath = root.resolvingSymlinksInPath().path
         for folder in FileBridge.folders {
             let dir = root.appendingPathComponent(folder)
             guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles]) else { continue }
             for case let u as URL in e {
                 guard let v = try? u.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]), v.isRegularFile == true else { continue }
                 if u.pathExtension == "part" { continue }
-                let rel = String(u.path.dropFirst(root.path.count + 1))
+                let path = u.resolvingSymlinksInPath().path
+                guard path.hasPrefix(rootPath + "/") else { continue }
+                let rel = String(path.dropFirst(rootPath.count + 1))
                 out[rel] = Meta(mtime: Int64(v.contentModificationDate?.timeIntervalSince1970 ?? 0), size: UInt64(v.fileSize ?? 0))
             }
         }

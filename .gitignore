@@ -1,7 +1,38 @@
+# Build output, toolchains, downloaded sources and system images (tens of GB)
 build/
+DerivedData/
+/app/AndroidOniOS.xcodeproj/
+
+# Android images and archives (downloaded by the user, never redistributed)
+*.zip
+*.img
+*.qcow2
+*.tar.xz
+*.tar.gz
+
+# Device secrets: RemotePairing files hold private keys
+*pairing*.plist
+*.mobiledevicepairing
+adbkey
+adbkey.pub
+
+# Local debug configs and captures
+debug.json
+*.trace
+*.ppm
+*.wav
+*.log
+
+# Xcode and editors
 *.xcuserstate
 xcuserdata/
-DerivedData/
-.DS_Store
 *.ipa
-/app/AndroidOniOS.xcodeproj/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/

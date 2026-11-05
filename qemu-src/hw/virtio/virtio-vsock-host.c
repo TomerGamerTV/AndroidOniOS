@@ -543,10 +543,12 @@ static bool vsock_add_forward(VirtIOVSockHost *s, const char *spec, Error **errp
     int fd = -1;
     char *unix_path = NULL;
 
-    if (g_str_has_prefix(head, "tcp:")) {
-        int port = atoi(head + 4);
+    if (g_str_has_prefix(head, "tcp:") || g_str_has_prefix(head, "tcpany:")) {
+        /* tcp: binds loopback; tcpany: binds all interfaces (debugging only) */
+        bool any = g_str_has_prefix(head, "tcpany:");
+        int port = atoi(head + (any ? 7 : 4));
         struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port),
-                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+                                  .sin_addr.s_addr = htonl(any ? INADDR_ANY : INADDR_LOOPBACK) };
         int one = 1;
         fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));

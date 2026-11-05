@@ -7,8 +7,8 @@ final class BootProgress {
     struct Milestone { let match: String; let fraction: Double; let label: String }
 
     private static let kernelMilestones: [Milestone] = [
-        .init(match: "Booting Linux", fraction: 0.03, label: "Starting kernel"),
-        .init(match: "Run /init", fraction: 0.07, label: "Starting init"),
+        .init(match: "virtio-pci", fraction: 0.03, label: "Starting kernel"),
+        .init(match: "init: Loaded kernel module", fraction: 0.07, label: "Starting init"),
         .init(match: "init: Switching root", fraction: 0.11, label: "Mounting system"),
         .init(match: "init second stage started", fraction: 0.15, label: "Starting system services"),
         .init(match: "processing action (post-fs-data)", fraction: 0.20, label: "Unlocking storage"),

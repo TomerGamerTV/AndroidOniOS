@@ -12,5 +12,8 @@ final class Modem {
         if droid_modem_start(Paths.modemSocket, log) != 0 {
             Log.info("modem: failed to start (\(errno))")
         }
+        for name in ["bt", "uwb", "nfc"] where droid_sink_start(Paths.radioSocket(name)) != 0 {
+            Log.info("radio port \(name): failed to start (\(errno))")
+        }
     }
 }

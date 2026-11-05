@@ -47,17 +47,27 @@ static void droid_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *surface
     }
     /* QEMU's "Display output is not active" placeholder is not guest output. */
     if (!surface || (surface->flags & QEMU_PLACEHOLDER_FLAG)) {
-        droid_dpy.on_surface(droid_dpy.opaque, NULL, 0, 0, 0);
+        droid_dpy.on_surface(droid_dpy.opaque, NULL, 0, 0, 0, true);
         return;
+    }
+    /* virtio-gpu scanouts use whatever format the guest picked (gfxstream: RGBA). */
+    pixman_format_code_t fmt = surface_format(surface);
+    bool bgra = !(fmt == PIXMAN_x8b8g8r8 || fmt == PIXMAN_a8b8g8r8);
+    static pixman_format_code_t last_fmt;
+    if (fmt != last_fmt) {
+        last_fmt = fmt;
+        fprintf(stderr, "droid: surface %dx%d pixman format 0x%x (%s)\n", surface_width(surface),
+                surface_height(surface), fmt, bgra ? "BGRA" : "RGBA");
     }
     droid_dpy.on_surface(droid_dpy.opaque, surface_data(surface),
                          surface_width(surface), surface_height(surface),
-                         surface_stride(surface));
+                         surface_stride(surface), bgra);
 }
 
 static bool droid_check_format(DisplayChangeListener *dcl, pixman_format_code_t format)
 {
-    return format == PIXMAN_x8r8g8b8 || format == PIXMAN_a8r8g8b8;
+    return format == PIXMAN_x8r8g8b8 || format == PIXMAN_a8r8g8b8 ||
+           format == PIXMAN_x8b8g8r8 || format == PIXMAN_a8b8g8r8;
 }
 
 static void droid_refresh(DisplayChangeListener *dcl)
@@ -97,6 +107,9 @@ static void droid_attach_bh(void *opaque)
 
 void droid_display_attach(void *opaque, droid_surface_fn on_surface, droid_update_fn on_update)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     DroidAttach *a = g_new0(DroidAttach, 1);
     a->opaque = opaque;
     a->on_surface = on_surface;
@@ -156,6 +169,9 @@ static void droid_touch_bh(void *opaque)
 
 void droid_touch(int slot, int phase, int x, int y, int width, int height)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     DroidTouch *t = g_new0(DroidTouch, 1);
     t->slot = slot;
     t->phase = phase;
@@ -182,6 +198,9 @@ static void droid_key_bh(void *opaque)
 
 void droid_key(int qcode, bool down)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     DroidKey *k = g_new0(DroidKey, 1);
     k->qcode = qcode;
     k->down = down;
@@ -197,6 +216,9 @@ static void droid_powerdown_bh(void *opaque)
 
 void droid_powerdown(void)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(), droid_powerdown_bh, NULL);
 }
 
@@ -207,6 +229,9 @@ static void droid_reset_bh(void *opaque)
 
 void droid_reset(void)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(), droid_reset_bh, NULL);
 }
 
@@ -222,6 +247,9 @@ static void droid_run_bh(void *opaque)
 
 void droid_set_running(bool running)
 {
+    if (!qemu_get_aio_context()) {
+        return; /* QEMU not initialized yet */
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(), droid_run_bh, (void *)(uintptr_t)running);
 }
 

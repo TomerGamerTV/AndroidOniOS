@@ -1,0 +1,106 @@
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -673,12 +673,24 @@
+ 
+ static void break_prepare_jit_region(mach_vm_address_t addr, size_t len)
+ {
++    struct timespec t0, t1;
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++    fprintf(stderr, "jit26: preparing %zu MiB at 0x%llx\n", len >> 20,
++            (unsigned long long)addr);
+     jit26_prepare_region((void *)addr, len);
+     /* All executable memory is allocated up front; release the debugger. */
+     jit26_detach();
++    clock_gettime(CLOCK_MONOTONIC, &t1);
++    fprintf(stderr, "jit26: prepared in %.1fs\n",
++            (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+ }
+ #endif
+ 
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++#define JIT_LOW_HINT  0x200000000ULL   /* 8 GiB */
++#define JIT_LOW_LIMIT 0x1000000000ULL  /* 64 GiB */
++#endif
++
+ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error **errp)
+ {
+     kern_return_t ret;
+@@ -693,6 +705,50 @@
+     }
+ #endif
+ 
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++    /*
++     * With extended-virtual-addressing large mappings may land very high
++     * (e.g. 0x7000000000); on TXM devices JIT code executed from there hangs
++     * the vCPU. Keep both aliases in the low address range.
++     */
++    {
++        /*
++         * The host app reserves low address space at launch (PROT_NONE) and
++         * passes it as DROID_JIT_RESERVE=0xADDR:0xSIZE; map both aliases into it.
++         */
++        unsigned long long ra = 0, rs = 0;
++        const char *res = getenv("DROID_JIT_RESERVE");
++        bool reserved = res && sscanf(res, "0x%llx:0x%llx", &ra, &rs) == 2 &&
++                        rs >= 2 * (unsigned long long)size;
++        void *rw = mmap(reserved ? (void *)ra : (void *)JIT_LOW_HINT, size,
++                        orig_prot, MAP_PRIVATE | MAP_ANONYMOUS |
++                        (reserved ? MAP_FIXED : 0), -1, 0);
++        if (rw == MAP_FAILED) {
++            error_setg_errno(errp, errno,
++                             "allocate %zu bytes for jit buffer", size);
++            return -1;
++        }
++        region.start_aligned = rw;
++        region.total_size = size;
++        buf_rw = (mach_vm_address_t)rw;
++        /* Prefer the RX alias right after the RW one, else search from the hint. */
++        buf_rx = buf_rw + size;
++        ret = mach_vm_remap(mach_task_self(), &buf_rx, size, 0,
++                            VM_FLAGS_FIXED | (reserved ? VM_FLAGS_OVERWRITE : 0),
++                            mach_task_self(), buf_rw, false, &cur_prot,
++                            &max_prot, VM_INHERIT_NONE);
++    }
++    if (ret != KERN_SUCCESS) {
++        buf_rx = JIT_LOW_HINT;
++        ret = mach_vm_remap(mach_task_self(), &buf_rx, size, 0,
++                            VM_FLAGS_ANYWHERE, mach_task_self(), buf_rw, false,
++                            &cur_prot, &max_prot, VM_INHERIT_NONE);
++    }
++    if (ret == KERN_SUCCESS && (buf_rw >= JIT_LOW_LIMIT || buf_rx >= JIT_LOW_LIMIT)) {
++        fprintf(stderr, "jit26: warning: jit buffer mapped high (rw 0x%llx rx 0x%llx)\n",
++                (unsigned long long)buf_rw, (unsigned long long)buf_rx);
++    }
++#else
+     if (!alloc_code_gen_buffer_anon(size, orig_prot,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, errp)) {
+         return -1;
+@@ -711,6 +767,7 @@
+                         &cur_prot,
+                         &max_prot,
+                         VM_INHERIT_NONE);
++#endif
+     if (ret != KERN_SUCCESS) {
+         /* TODO: Convert "ret" to a human readable error message. */
+         error_setg(errp, "vm_remap for jit splitwx failed");
+@@ -730,6 +787,8 @@
+         if (is_debugger_attached()) {
+             /* let debugger modify the page permission */
+             break_prepare_jit_region(buf_rx, size);
++        } else {
++            fprintf(stderr, "jit26: no debugger attached, JIT region not prepared\n");
+         }
+ 
+         /* finally mark the read-write portion as RW */
+@@ -779,7 +838,9 @@
+         if (splitwx > 0) {
+             return -1;
+         }
+-        error_free_or_abort(errp);
++        /* Report why split-wx failed instead of hiding it behind the fallback. */
++        warn_report_err(*errp);
++        *errp = NULL;
+     }
+ 
+     /*

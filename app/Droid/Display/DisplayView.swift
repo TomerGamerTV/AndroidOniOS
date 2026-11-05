@@ -2,7 +2,7 @@ import Metal
 import QuartzCore
 import UIKit
 
-/// Shows the guest framebuffer (BGRA, delivered by QEMU's main loop) with Metal and
+/// Shows the guest framebuffer (32bpp BGRA or RGBA, delivered by QEMU's main loop) with Metal and
 /// forwards multitouch and hardware-keyboard input to the virtual device.
 final class DisplayView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
@@ -20,6 +20,7 @@ final class DisplayView: UIView {
     private var front = -1
     private var writeIndex = 0
     private var fbWidth = 0, fbHeight = 0, fbStride = 0
+    private var fbFormat = MTLPixelFormat.bgra8Unorm
     private var srcPixels: UnsafeMutableRawPointer?
     private var dirty = false
     private var displayLink: CADisplayLink?
@@ -85,9 +86,10 @@ final class DisplayView: UIView {
     /// Fills in the display callbacks; the bridge registers them after qemu_init.
     func attach(to qemu: inout DroidQEMU) {
         qemu.display_opaque = Unmanaged.passUnretained(self).toOpaque()
-        qemu.display_surface = { opaque, pixels, w, h, stride in
+        qemu.display_surface = { opaque, pixels, w, h, stride, bgra in
             let view = Unmanaged<DisplayView>.fromOpaque(opaque!).takeUnretainedValue()
-            view.surfaceChanged(pixels: pixels, width: Int(w), height: Int(h), stride: Int(stride))
+            view.surfaceChanged(pixels: pixels, width: Int(w), height: Int(h), stride: Int(stride),
+                                format: bgra ? .bgra8Unorm : .rgba8Unorm)
         }
         qemu.display_update = { opaque, x, y, w, h in
             let view = Unmanaged<DisplayView>.fromOpaque(opaque!).takeUnretainedValue()
@@ -95,16 +97,17 @@ final class DisplayView: UIView {
         }
     }
 
-    private func surfaceChanged(pixels: UnsafeMutableRawPointer?, width: Int, height: Int, stride: Int) {
+    private func surfaceChanged(pixels: UnsafeMutableRawPointer?, width: Int, height: Int, stride: Int,
+                                format: MTLPixelFormat) {
         lock.lock()
         defer { lock.unlock() }
         srcPixels = pixels
         guard pixels != nil, width > 0, height > 0 else { front = -1; return }
-        if width != fbWidth || height != fbHeight || stride != fbStride || buffers.isEmpty {
-            fbWidth = width; fbHeight = height; fbStride = stride
+        if width != fbWidth || height != fbHeight || stride != fbStride || format != fbFormat || buffers.isEmpty {
+            fbWidth = width; fbHeight = height; fbStride = stride; fbFormat = format
             let alignedStride = (width * 4 + 255) & ~255
             buffers = (0..<2).map { _ in device.makeBuffer(length: alignedStride * height, options: .storageModeShared)! }
-            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
             td.usage = .shaderRead
             td.storageMode = .shared
             textures = buffers.map { $0.makeTexture(descriptor: td, offset: 0, bytesPerRow: alignedStride)! }
@@ -211,7 +214,15 @@ final class DisplayView: UIView {
         }
     }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 0) }
+    private var loggedTouches = 0
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if loggedTouches < 3, let t = touches.first {
+            loggedTouches += 1
+            let (x, y) = guestPoint(t)
+            Log.info("touch began at guest \(x),\(y) (VM started: \(VirtualMachine.shared.started))")
+        }
+        send(touches, phase: 0)
+    }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 1) }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 2) }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 2) }

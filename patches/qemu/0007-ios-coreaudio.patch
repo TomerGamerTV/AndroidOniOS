@@ -1,0 +1,42 @@
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -21,6 +21,12 @@
+  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  * THE SOFTWARE.
+  */
++
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++/* iOS has no CoreAudio HAL device API; use a RemoteIO audio unit instead. */
++#include "coreaudio-ios.inc"
++#else
+ 
+ #include "qemu/osdep.h"
+ #include <CoreAudio/CoreAudio.h>
+@@ -685,3 +691,5 @@
+     audio_driver_register(&coreaudio_audio_driver);
+ }
+ type_init(register_audio_coreaudio);
++
++#endif /* !TARGET_OS_IPHONE */
+--- a/meson.build
++++ b/meson.build
+@@ -1790,7 +1790,7 @@
+ 
+ coreaudio = not_found
+ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
+-  coreaudio = dependency('appleframeworks', modules: 'CoreAudio',
++  coreaudio = dependency('appleframeworks', modules: ['CoreAudio', 'AudioToolbox'],
+                          required: get_option('coreaudio'))
+ endif
+ 
+--- a/configure
++++ b/configure
+@@ -1856,6 +1856,7 @@
+   test -n "$objcc" && echo "objc_args = [$(meson_quote $OBJCFLAGS $EXTRA_OBJCFLAGS)]" >> $cross
+   echo "c_link_args = [$(meson_quote $CFLAGS $LDFLAGS $EXTRA_CFLAGS $EXTRA_LDFLAGS)]" >> $cross
+   echo "cpp_link_args = [$(meson_quote $CXXFLAGS $LDFLAGS $EXTRA_CXXFLAGS $EXTRA_LDFLAGS)]" >> $cross
++  test -n "$objcc" && echo "objc_link_args = [$(meson_quote $OBJCFLAGS $LDFLAGS $EXTRA_OBJCFLAGS $EXTRA_LDFLAGS)]" >> $cross
+ 
+   # Only enable by default for git builds and on select OSes
+   echo "# environment defaults, can still be overridden on " >> $cross

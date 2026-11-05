@@ -19,8 +19,10 @@ extern "C" {
 
 #define DROID_EXPORT __attribute__((visibility("default")))
 
-/* New framebuffer: pixels are 32bpp BGRA (little-endian x8r8g8b8). pixels may be NULL (no scanout). */
-typedef void (*droid_surface_fn)(void *opaque, void *pixels, int width, int height, int stride);
+/* New framebuffer: 32bpp pixels, B,G,R,A byte order when bgra is true (x8r8g8b8), R,G,B,A
+ * otherwise (x8b8g8r8). pixels may be NULL (no scanout). */
+typedef void (*droid_surface_fn)(void *opaque, void *pixels, int width, int height, int stride,
+                                 bool bgra);
 /* Region of the current framebuffer changed. */
 typedef void (*droid_update_fn)(void *opaque, int x, int y, int w, int h);
 

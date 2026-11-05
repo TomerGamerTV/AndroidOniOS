@@ -1,0 +1,40 @@
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -718,8 +718,13 @@
+          */
+         unsigned long long ra = 0, rs = 0;
+         const char *res = getenv("DROID_JIT_RESERVE");
+-        bool reserved = res && sscanf(res, "0x%llx:0x%llx", &ra, &rs) == 2 &&
+-                        rs >= 2 * (unsigned long long)size;
++        bool have_res = res && sscanf(res, "0x%llx:0x%llx", &ra, &rs) == 2;
++        bool reserved = have_res && rs >= 2 * (unsigned long long)size;
++        /*
++         * Only the executable alias has to be low. When the reservation fits one
++         * copy, put the RW alias anywhere and the RX alias at the reservation.
++         */
++        bool rx_only = have_res && !reserved && rs >= size;
+         void *rw = mmap(reserved ? (void *)ra : (void *)JIT_LOW_HINT, size,
+                         orig_prot, MAP_PRIVATE | MAP_ANONYMOUS |
+                         (reserved ? MAP_FIXED : 0), -1, 0);
+@@ -732,7 +737,8 @@
+         region.total_size = size;
+         buf_rw = (mach_vm_address_t)rw;
+         /* Prefer the RX alias right after the RW one, else search from the hint. */
+-        buf_rx = buf_rw + size;
++        buf_rx = rx_only ? ra : buf_rw + size;
++        reserved = reserved || rx_only;
+         ret = mach_vm_remap(mach_task_self(), &buf_rx, size, 0,
+                             VM_FLAGS_FIXED | (reserved ? VM_FLAGS_OVERWRITE : 0),
+                             mach_task_self(), buf_rw, false, &cur_prot,
+@@ -744,8 +750,9 @@
+                             VM_FLAGS_ANYWHERE, mach_task_self(), buf_rw, false,
+                             &cur_prot, &max_prot, VM_INHERIT_NONE);
+     }
+-    if (ret == KERN_SUCCESS && (buf_rw >= JIT_LOW_LIMIT || buf_rx >= JIT_LOW_LIMIT)) {
+-        fprintf(stderr, "jit26: warning: jit buffer mapped high (rw 0x%llx rx 0x%llx)\n",
++    if (ret == KERN_SUCCESS) {
++        fprintf(stderr, "jit26: %s jit buffer (rw 0x%llx rx 0x%llx)\n",
++                buf_rx >= JIT_LOW_LIMIT ? "warning: high" : "low",
+                 (unsigned long long)buf_rw, (unsigned long long)buf_rx);
+     }
+ #else

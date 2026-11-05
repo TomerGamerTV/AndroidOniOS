@@ -211,6 +211,7 @@ struct SettingsView: View {
                     Stepper("Screen width: \(s.width) px", value: $s.width, in: 540...1440, step: 36)
                     Stepper("Density: \(s.density) dpi", value: $s.density, in: 240...560, step: 20)
                     Toggle("Use JIT when available", isOn: $s.preferJIT)
+                    Toggle("Android navigation buttons", isOn: $s.navButtons)
                 }
                 Section("Status") {
                     LabeledContent("Acceleration", value: state.jitEnabled ? "JIT (TCG)" : "Interpreter (TCTI)")

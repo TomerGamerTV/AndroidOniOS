@@ -1,3 +1,5 @@
+import Combine
+import os
 import SwiftUI
 import UIKit
 
@@ -27,6 +29,7 @@ final class MainViewController: UIViewController {
     private let state = AppState()
     private var overlay: UIHostingController<OverlayView>!
     private let bootProgress = BootProgress()
+    private var cancellables = Set<AnyCancellable>()
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -60,6 +63,15 @@ final class MainViewController: UIViewController {
             overlay.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         overlay.didMove(toParent: self)
+        // The SwiftUI overlay covers the whole screen; once Android is visible it must not
+        // swallow touches meant for the guest (sheets are presented separately and still work).
+        state.$phase.combineLatest(state.$guestVisible)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] phase, visible in
+                let passThrough = phase == .running || (phase == .booting && visible)
+                self?.overlay.view.isUserInteractionEnabled = !passThrough
+            }
+            .store(in: &cancellables)
 
         // Three-finger long press opens the device controls.
         let lp = UILongPressGestureRecognizer(target: self, action: #selector(showMenu(_:)))
@@ -89,6 +101,11 @@ final class MainViewController: UIViewController {
         NotificationCenter.default.addObserver(forName: .androidBootCompleted, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             self.state.bootFraction = 1
+            GuestSetup.apply(VMSettings.current)
+            Log.info("boot completed; memory headroom \(os_proc_available_memory() >> 20) MiB, thermal state \(ProcessInfo.processInfo.thermalState.rawValue)")
+            Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in
+                Log.info("memory headroom \(os_proc_available_memory() >> 20) MiB, thermal state \(ProcessInfo.processInfo.thermalState.rawValue)")
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.state.phase = .running }
         }
         Task { await boot() }
@@ -148,11 +165,55 @@ final class MainViewController: UIViewController {
     }
 
     private func start() {
+        let settings = VMSettings.current
+        DebugShell.shared.startIfEnabled()
+        Log.info("jit reservation: \(ProcessInfo.processInfo.environment["DROID_JIT_RESERVE"] ?? "none")")
+        if let diag = ProcessInfo.processInfo.environment["DROID_JIT_RESERVE_DIAG"] {
+            Log.info("jit reservation map: \(diag)")
+        }
+        // If the last JIT start never got past QEMU init (it exits the process), use the
+        // interpreter this time so the app can't get stuck in a crash loop.
+        let jitMarker = Paths.android.appendingPathComponent("jit-attempt")
+        let lastJITFailed = FileManager.default.fileExists(atPath: jitMarker.path)
+        if lastJITFailed {
+            try? FileManager.default.removeItem(at: jitMarker)
+            Log.info("previous JIT start failed; using the interpreter this launch")
+        }
+        // Try to get JIT from the bundled StikJIT helper before QEMU starts (needs a pairing
+        // file and LocalDevVPN). Without it we fall back to the slower interpreter.
+        if settings.preferJIT && !lastJITFailed && !droid_bridge_jit_available() && JITEnabler.shared.pairingFileURL != nil {
+            state.phase = .booting
+            state.detail = "Enabling JIT acceleration"
+            // Bring up the bundled loopback tunnel StikJIT needs to reach 10.7.0.1, then ask the
+            // helper to attach. QEMU starts once the debugger is attached, or when the helper fails.
+            let failed = DispatchSemaphore(value: 0)
+            LoopbackVPN.shared.start { vpnOK, vpnMsg in
+                Log.info("loopback vpn: ok=\(vpnOK) \(vpnMsg)")
+                JITEnabler.shared.start { [weak self] ok, msg in
+                    if !ok {
+                        failed.signal()
+                        DispatchQueue.main.async { self?.state.flash("JIT: \(msg.split(separator: "\n").first ?? "")") }
+                    }
+                    LoopbackVPN.shared.stop()
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let attached = JITEnabler.shared.waitForAttach(timeout: 45, cancel: failed)
+                    DispatchQueue.main.async {
+                        if !attached { self.state.flash("JIT unavailable — using the interpreter") }
+                        self.launchVM(settings)
+                    }
+                }
+            }
+            return
+        }
+        launchVM(settings)
+    }
+
+    private func launchVM(_ settings: VMSettings) {
         state.phase = .booting
         state.progress = nil
         state.bootFraction = 0
         state.detail = "Starting Android"
-        let settings = VMSettings.current
         GuestServices.shared.density = settings.density
         GuestServices.shared.start()
         Modem.shared.start()
@@ -163,6 +224,11 @@ final class MainViewController: UIViewController {
             return
         }
         state.jitEnabled = VirtualMachine.shared.usingJIT
+        if VirtualMachine.shared.usingJIT {
+            let marker = Paths.android.appendingPathComponent("jit-attempt")
+            FileManager.default.createFile(atPath: marker.path, contents: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { try? FileManager.default.removeItem(at: marker) }
+        }
         VirtualMachine.shared.onExit = { [weak self] code in
             self?.state.phase = .stopped
             self?.state.detail = "Android stopped (\(code))."

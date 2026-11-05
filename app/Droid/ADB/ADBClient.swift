@@ -180,6 +180,12 @@ final class ADBClient {
         state.unlock()
         for s in all { s.cond.lock(); s.closed = true; s.cond.broadcast(); s.cond.unlock() }
         Log.info("adb disconnected")
+        // adbd restarts during boot (e.g. when boot completes); reconnect while the VM is up.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+            if VirtualMachine.shared.started, self.connect() {
+                DispatchQueue.main.async { Inbox.shared.process() }
+            }
+        }
     }
 
     fileprivate func forget(_ s: Stream) {

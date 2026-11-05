@@ -64,6 +64,7 @@ final class ImageStore: NSObject {
     func prepare() async throws {
         if isReady {
             try ensureUserImages()
+            removeImportedArchive()
             return
         }
         let zip = try await obtainArchive()
@@ -76,7 +77,19 @@ final class ImageStore: NSObject {
         if zip.path.hasPrefix(Paths.android.path) {
             try? FileManager.default.removeItem(at: zip)
         }
+        removeImportedArchive()
         report(.ready)
+    }
+
+    /// Once the image is installed, the system-image zip copied into Documents is no longer
+    /// needed; delete it so it doesn't keep using ~2 GB of storage.
+    private func removeImportedArchive() {
+        let docs = (try? FileManager.default.contentsOfDirectory(at: Paths.documents, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        for u in docs where u.pathExtension.lowercased() == "zip" &&
+            (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize).map({ UInt64($0) }) == manifest.size {
+            Log.info("removing installed archive \(u.lastPathComponent)")
+            try? FileManager.default.removeItem(at: u)
+        }
     }
 
     /// Prefers an archive the user copied into Documents (Finder/Files), else downloads it.

@@ -20,7 +20,7 @@ int droid_bridge_accept(int fd);
 int droid_bridge_set_nonblock(int fd, bool nonblock);
 
 /* ---- QEMU library (loaded with dlopen) ---- */
-typedef void (*droid_surface_fn)(void *opaque, void *pixels, int width, int height, int stride);
+typedef void (*droid_surface_fn)(void *opaque, void *pixels, int width, int height, int stride, bool bgra);
 typedef void (*droid_update_fn)(void *opaque, int x, int y, int w, int h);
 
 typedef struct DroidQEMU {
@@ -48,5 +48,6 @@ int droid_qemu_run(DroidQEMU *q, int argc, const char *const *argv);
 
 /* ---- modem simulator (modem.c) ---- */
 int droid_modem_start(const char *socket_path, const char *log_path);
+int droid_sink_start(const char *socket_path);
 
 #endif

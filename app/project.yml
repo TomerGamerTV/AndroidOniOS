@@ -24,6 +24,7 @@ targets:
     type: application
     platform: iOS
     sources:
+      - path: Shared
       - path: Droid
         excludes:
           - "Info.plist"
@@ -35,6 +36,7 @@ targets:
         INFOPLIST_FILE: Droid/Info.plist
         CODE_SIGN_ENTITLEMENTS: Droid/Droid.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: Droid/Bridge/Droid-Bridging-Header.h
+        EX_ENABLE_EXTENSION_POINT_GENERATION: YES
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         FRAMEWORK_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/../build/frameworks"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -55,12 +57,65 @@ targets:
         link: false
         codeSign: true
       - target: DroidShare
+      - target: DroidJIT
+      - target: DroidTunnel
+      - sdk: NetworkExtension.framework
       - sdk: Metal.framework
       - sdk: QuartzCore.framework
       - sdk: CoreMotion.framework
       - sdk: CoreLocation.framework
       - sdk: Security.framework
       - sdk: AVFoundation.framework
+
+  DroidJIT:
+    type: extensionkit-extension
+    platform: iOS
+    sources:
+      - path: DroidJIT
+        excludes:
+          - "Info.plist"
+          - "DroidJIT.entitlements"
+      - path: Shared
+      - path: ../build/src/StikJIT/Sources
+        group: StikJIT
+      - path: ../build/src/StikJIT/Scripts
+        group: StikJIT
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.jit
+        PRODUCT_NAME: DroidJIT
+        INFOPLIST_FILE: DroidJIT/Info.plist
+        CODE_SIGN_ENTITLEMENTS: DroidJIT/DroidJIT.entitlements
+        SWIFT_INCLUDE_PATHS: "$(PROJECT_DIR)/../build/src/StikJIT/idevice $(PROJECT_DIR)/../build/src/StikJIT/iokit"
+        HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../build/src/StikJIT/idevice $(PROJECT_DIR)/../build/src/StikJIT/iokit"
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/../build/src/StikJIT/idevice"
+        OTHER_LDFLAGS: "$(inherited) -lidevice_ffi"
+        DEAD_CODE_STRIPPING: YES
+    dependencies:
+      - sdk: JavaScriptCore.framework
+      - sdk: Network.framework
+      - sdk: Security.framework
+      - sdk: CFNetwork.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: IOKit.framework
+
+  DroidTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DroidTunnel
+        excludes:
+          - "Info.plist"
+          - "DroidTunnel.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomer.androidonios.tunnel
+        PRODUCT_NAME: DroidTunnel
+        INFOPLIST_FILE: DroidTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: DroidTunnel/DroidTunnel.entitlements
+    dependencies:
+      - sdk: NetworkExtension.framework
 
   DroidShare:
     type: app-extension

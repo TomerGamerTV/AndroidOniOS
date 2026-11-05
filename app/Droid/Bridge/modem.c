@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -300,10 +301,61 @@ int droid_modem_start(const char *socket_path, const char *log_path) {
     return 0;
 }
 
+/*
+ * Silent endpoint for serial ports whose real peer (the emulator's simulated Bluetooth,
+ * UWB and NFC radios) doesn't exist here. Accepts the connection and discards data, so
+ * the guest sees a connected port that never answers instead of EOF.
+ */
+static void *sink_conn(void *arg) {
+    int c = (int)(intptr_t)arg;
+    char buf[4096];
+    while (read(c, buf, sizeof(buf)) > 0) {}
+    close(c);
+    return NULL;
+}
+
+static void *sink_accept(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        pthread_t t;
+        pthread_create(&t, NULL, sink_conn, (void *)(intptr_t)c);
+        pthread_detach(t);
+    }
+    return NULL;
+}
+
+int droid_sink_start(const char *socket_path) {
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    if (strlen(socket_path) >= sizeof(sa.sun_path)) return -1;
+    strcpy(sa.sun_path, socket_path);
+    unlink(socket_path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(fd, 2) < 0) {
+        close(fd);
+        return -1;
+    }
+    pthread_t t;
+    pthread_create(&t, NULL, sink_accept, (void *)(intptr_t)fd);
+    pthread_detach(t);
+    return 0;
+}
+
 #ifdef MODEM_MAIN
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <socket> [log]\n", argv[0]); return 1; }
     if (droid_modem_start(argv[1], argc > 2 ? argv[2] : NULL) != 0) { perror("modem"); return 1; }
+    /* Extra args after the log path: silent radio sockets (bluetooth/uwb/nfc). */
+    for (int i = 3; i < argc; i++) {
+        if (droid_sink_start(argv[i]) != 0) { perror("sink"); return 1; }
+    }
     for (;;) pause();
 }
 #endif

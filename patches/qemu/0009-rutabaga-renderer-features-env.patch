@@ -1,0 +1,11 @@
+--- a/hw/display/virtio-gpu-rutabaga.c
++++ b/hw/display/virtio-gpu-rutabaga.c
+@@ -994,6 +994,8 @@
+     builder.debug_cb = virtio_gpu_rutabaga_debug_cb;
+     builder.capset_mask = vr->capset_mask;
+     builder.user_data = (uint64_t)g;
++    /* gfxstream feature overrides, e.g. "VulkanVirtualQueue:enabled" (comma separated). */
++    builder.renderer_features = getenv("RUTABAGA_RENDERER_FEATURES");
+ 
+     /*
+      * If the user doesn't specify the wayland socket path, we try to infer

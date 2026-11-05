@@ -53,12 +53,12 @@ macos-tcti)
     LDFLAGS="$LDFLAGS -framework ParavirtualizedGraphics"
     ;;
 ios-jit)
-    EXTRA=(--cross-prefix="" --enable-shared-lib --disable-hvf --disable-cocoa --disable-coreaudio
+    EXTRA=(--cross-prefix="" --enable-shared-lib --disable-hvf --disable-cocoa --enable-coreaudio
         --disable-slirp-smbd --enable-ucontext --with-coroutine=libucontext --disable-vnc
         --extra-ldflags=-Wl,-no_deduplicate)
     ;;
 ios-tcti)
-    EXTRA=(--cross-prefix="" --enable-shared-lib --disable-hvf --disable-cocoa --disable-coreaudio
+    EXTRA=(--cross-prefix="" --enable-shared-lib --disable-hvf --disable-cocoa --enable-coreaudio
         --disable-slirp-smbd --enable-ucontext --with-coroutine=libucontext --disable-vnc
         --enable-tcg-threaded-interpreter --extra-cflags=-Wno-unused-command-line-argument
         --extra-ldflags=-Wl,-no_deduplicate --extra-ldflags=-Wl,-random_uuid --extra-ldflags=-Wl,-no_compact_unwind)

@@ -1,0 +1,25 @@
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -11,6 +11,9 @@
+  *
+  */
+ #include "qemu/osdep.h"
++#ifdef __APPLE__
++#include <pthread/qos.h>
++#endif
+ #include "qemu/thread.h"
+ #include "qemu/atomic.h"
+ #include "qemu/notify.h"
+@@ -519,6 +522,12 @@
+ # endif
+     }
+     QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);
++#ifdef __APPLE__
++    /* vCPU threads at user-interactive QoS so iOS/macOS keep them on P-cores. */
++    if (qemu_thread_args->name && strncmp(qemu_thread_args->name, "CPU ", 4) == 0) {
++        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    }
++#endif
+     g_free(qemu_thread_args->name);
+     g_free(qemu_thread_args);
+ 

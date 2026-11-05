@@ -33,6 +33,7 @@ enum Paths {
     static var adbSocket: String { sockets.appendingPathComponent("adb").path }
     static var servicesSocket: String { sockets.appendingPathComponent("svc").path }
     static var modemSocket: String { sockets.appendingPathComponent("modem").path }
+    static func radioSocket(_ name: String) -> String { sockets.appendingPathComponent(name).path }
 
     @discardableResult
     static func ensure(_ url: URL) -> URL {

@@ -31,7 +31,7 @@ export RUTABAGA_DISPLAY_WIDTH="${WIDTH:-1080}" RUTABAGA_DISPLAY_HEIGHT="${HEIGHT
 pkill -f "droidsvc.py $VM/svc.sock" 2>/dev/null || true
 python3 "$ROOT/tools/droidsvc.py" "$VM/svc.sock" > "$VM/droidsvc.log" 2>&1 &
 pkill -f "modemsim $VM/modem.sock" 2>/dev/null || true
-rm -f "$VM/modem.log"; "$ROOT/build/tools/bin/modemsim" "$VM/modem.sock" "$VM/modem.log" &
+rm -f "$VM/modem.log"; "$ROOT/build/tools/bin/modemsim" "$VM/modem.sock" "$VM/modem.log" "$VM/bt.sock" "$VM/uwb.sock" "$VM/nfc.sock" &
 sleep 0.5
 ACCEL="${ACCEL:-hvf}"
 CPU="host"; [ "$ACCEL" != hvf ] && CPU="${TCGCPU:-max,sve=off,pauth-impdef=on}"
@@ -39,8 +39,8 @@ exec "$VM/qemu" \
   -machine virt,highmem=on -accel "$ACCEL" -cpu "$CPU" -smp "${SMP:-4}" -m "${MEM:-3072}" \
   -nodefaults -no-user-config \
   -kernel "$IMG/kernel-ranchu" -initrd "$VM/initrd" \
-  -append "8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0 ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig" \
-  -serial "file:$VM/kernel.log" \
+  -append "8250.nr_uarts=1 no_timer_check console=hvc0 ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig" \
+  -serial null \
   -drive if=none,id=vendor,file="$IMG/vendor.img",format=raw,read-only=on -device virtio-blk-device,drive=vendor \
   -drive if=none,id=metadata,file="$VM/metadata.img",format=raw,cache=unsafe -device virtio-blk-device,drive=metadata \
   -drive if=none,id=userdata,file="$VM/userdata.img",format=raw,cache=unsafe,discard=unmap -device virtio-blk-device,drive=userdata \
@@ -48,12 +48,16 @@ exec "$VM/qemu" \
   -drive if=none,id=system,file="$VM/system.img",format=raw,read-only=on -device virtio-blk-device,drive=system \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
   -device virtio-rng-device \
-  -chardev null,id=hvc0 -chardev "file,id=hvc1,path=$VM/logcat.log" \
+  -chardev "file,id=hvc0,path=$VM/kernel.log" -chardev "file,id=hvc1,path=$VM/logcat.log" \
   -chardev "socket,id=modem,path=$VM/modem.sock,reconnect-ms=1000" \
   -device virtio-serial-pci,ioeventfd=off -device virtconsole,chardev=hvc0 -device virtconsole,chardev=hvc1 \
   -device virtserialport,chardev=modem,name=modem \
+  -chardev "socket,id=btport,path=$VM/bt.sock,reconnect-ms=1000" -device virtserialport,chardev=btport,name=bluetooth \
+  -chardev "socket,id=uwbport,path=$VM/uwb.sock,reconnect-ms=1000" -device virtserialport,chardev=uwbport,name=uwb \
+  -chardev "socket,id=nfcport,path=$VM/nfc.sock,reconnect-ms=1000" -device virtserialport,chardev=nfcport,name=nfc \
   -device virtio-gpu-rutabaga-pci,gfxstream-vulkan=on,x-gfxstream-gles=${GLES:-off},x-gfxstream-composer=on,cross-domain=off,hostmem=1G,xres=${WIDTH:-1080},yres=${HEIGHT:-2400} \
   -device virtio-multitouch-pci -device virtio-keyboard-pci \
+  -audiodev "${AUDIODEV:-coreaudio},id=snd0" -device virtio-sound-pci,audiodev=snd0,streams=1 \
   -device "virtio-vsock-host-pci,guest-cid=77,forward=tcp:6520:5555,guest-forward=5000:unix:$VM/svc.sock" \
   -monitor "unix:$VM/monitor.sock,server,nowait" \
   -qmp "unix:$VM/qmp.sock,server,nowait" \

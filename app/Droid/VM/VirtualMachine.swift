@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import UIKit
 
@@ -9,6 +10,7 @@ struct VMSettings {
     var height: Int
     var density: Int
     var preferJIT: Bool
+    var navButtons: Bool
 
     static var current: VMSettings {
         let d = UserDefaults.standard
@@ -23,7 +25,8 @@ struct VMSettings {
             width: d.object(forKey: "width") as? Int ?? defW,
             height: d.object(forKey: "height") as? Int ?? defH,
             density: d.object(forKey: "density") as? Int ?? 420,
-            preferJIT: d.object(forKey: "preferJIT") as? Bool ?? true)
+            preferJIT: d.object(forKey: "preferJIT") as? Bool ?? true,
+            navButtons: d.object(forKey: "navButtons") as? Bool ?? true)
     }
 
     func save() {
@@ -33,6 +36,7 @@ struct VMSettings {
         d.set(width, forKey: "width")
         d.set(height, forKey: "height")
         d.set(density, forKey: "density")
+        d.set(navButtons, forKey: "navButtons")
         d.set(preferJIT, forKey: "preferJIT")
     }
 }
@@ -71,7 +75,9 @@ final class VirtualMachine {
             ("androidboot.qemu", "1"),
             ("androidboot.serialno", serialNumber()),
             ("androidboot.dalvik.vm.heapsize", settings.memoryMB >= 3072 ? "512m" : "384m"),
-            ("androidboot.debug.hwui.renderer", "skiagl"),
+            // App UI renders with Skia on Vulkan (gfxstream), skipping the in-guest ANGLE
+            // GL-on-Vulkan layer; needs gfxstream's VulkanVirtualQueue (HWUI wants 2 queues).
+            ("androidboot.debug.hwui.renderer", "skiavk"),
             ("androidboot.logcat", "*:I"),
             ("androidboot.hardwareegl", "angle"),
             ("androidboot.hardware.gltransport", "virtio-gpu-asg"),
@@ -81,7 +87,7 @@ final class VirtualMachine {
             ("androidboot.hardware.gralloc", "minigbm"),
             ("androidboot.opengles.version", "196609"),
             ("androidboot.qemu.vsync", "60"),
-            ("androidboot.qemu.virtiowifi", "0"),
+            ("androidboot.qemu.virtiowifi", "1"),
             ("androidboot.qemu.settings.system.screen_off_timeout", "2147483647"),
             ("androidboot.qemu.hwcodec.avcdec", "2"),
             ("androidboot.qemu.hwcodec.hevcdec", "2"),
@@ -102,26 +108,37 @@ final class VirtualMachine {
         setenv("RUTABAGA_DISPLAY_WIDTH", String(settings.width), 1)
         setenv("RUTABAGA_DISPLAY_HEIGHT", String(settings.height), 1)
         setenv("MVK_CONFIG_LOG_LEVEL", "1", 1)
+        setenv("RUTABAGA_RENDERER_FEATURES", "VulkanVirtualQueue:enabled", 1)
         setenv("TMPDIR", NSTemporaryDirectory(), 1)
 
         // Optional developer overrides: Library/Android/debug.json
         struct Debug: Decodable { var accel: String?; var smp: Int?; var cpu: String?; var extraArgs: [String]?; var env: [String: String]?; var jit: Bool? }
         let dbg = (try? Data(contentsOf: Paths.android.appendingPathComponent("debug.json"))).flatMap { try? JSONDecoder().decode(Debug.self, from: $0) }
         for (k, v) in dbg?.env ?? [:] { setenv(k, v, 1) }
-        let accel = dbg?.accel ?? (usingJIT ? "tcg,thread=multi,tb-size=1024" : "tcg,thread=multi,tb-size=512")
+        // JIT code cache: Android's translated working set is several hundred MiB, and every
+        // time the cache fills QEMU throws all of it away. Size it to the low address range
+        // reserved at launch (only the RX alias must be low; code run from high addresses hangs).
+        let reserveMB = ProcessInfo.processInfo.environment["DROID_JIT_RESERVE"]
+            .flatMap { $0.split(separator: ":").last }
+            .flatMap { UInt64($0.dropFirst(2), radix: 16) }
+            .map { Int($0 >> 20) } ?? 512
+        let jitTB = min(1024, max(128, reserveMB))
+        let accel = dbg?.accel ?? (usingJIT ? "tcg,thread=multi,split-wx=on,tb-size=\(jitTB)" : "tcg,thread=multi,tb-size=512")
         var args: [String] = [
             "qemu-system-aarch64",
             "-machine", "virt,highmem=on",
             "-accel", accel,
-            "-cpu", dbg?.cpu ?? "max,sve=off,pauth-impdef=on",
+            "-cpu", dbg?.cpu ?? "max,sve=off,pauth=off",
             "-smp", String(dbg?.smp ?? settings.cpus),
             "-m", String(settings.memoryMB),
             "-nodefaults", "-no-user-config",
             "-display", "none",
             "-kernel", store.path("kernel-ranchu").path,
             "-initrd", store.initrd.path,
-            "-append", "8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0 ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0",
-            "-serial", "file:\(kernelLog.path)",
+            // Kernel console on virtio-console (hvc0): whole lines per virtqueue kick instead of
+            // one trapped MMIO write per character on the PL011 UART, which is costly under TCG.
+            "-append", "8250.nr_uarts=1 no_timer_check console=hvc0 ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0",
+            "-serial", "null",
             // Disk order matches the emulator (vendor, metadata, userdata, cache, system) so
             // virtio-mmio slots and /dev/block/vdX names line up with the image's fstab.
             "-drive", "if=none,id=vendor,file=\(store.path("vendor.img").path),format=raw,read-only=on",
@@ -137,22 +154,39 @@ final class VirtualMachine {
             "-netdev", "user,id=net0,dns=10.0.2.3",
             "-device", "virtio-net-device,netdev=net0",
             "-device", "virtio-rng-device",
-            "-chardev", "null,id=hvc0",
+            "-chardev", "file,id=hvc0,path=\(kernelLog.path)",
             "-chardev", "file,id=hvc1,path=\(logcatLog.path)",
             "-chardev", "socket,id=modem,path=\(Paths.modemSocket),reconnect-ms=1000",
             "-device", "virtio-serial-pci,ioeventfd=off",
             "-device", "virtconsole,chardev=hvc0",
             "-device", "virtconsole,chardev=hvc1",
             "-device", "virtserialport,chardev=modem,name=modem",
+            // The image's Bluetooth/UWB/NFC HALs expect the emulator's virtual radio ports.
+            // Without them their services retry forever; a null/file backend reads as EOF and makes
+            // the HALs crash. Connect them to silent sockets (modem.c) so they start and idle.
+            "-chardev", "socket,id=btport,path=\(Paths.radioSocket("bt")),reconnect-ms=1000", "-device", "virtserialport,chardev=btport,name=bluetooth",
+            "-chardev", "socket,id=uwbport,path=\(Paths.radioSocket("uwb")),reconnect-ms=1000", "-device", "virtserialport,chardev=uwbport,name=uwb",
+            "-chardev", "socket,id=nfcport,path=\(Paths.radioSocket("nfc")),reconnect-ms=1000", "-device", "virtserialport,chardev=nfcport,name=nfc",
             "-device", "virtio-gpu-rutabaga-pci,gfxstream-vulkan=on,x-gfxstream-gles=off,x-gfxstream-composer=on,cross-domain=off,hostmem=1G,xres=\(settings.width),yres=\(settings.height)",
             "-device", "virtio-multitouch-pci",
             "-device", "virtio-keyboard-pci",
+            // Sound: virtio-snd output stream played through a RemoteIO audio unit.
+            "-audiodev", "coreaudio,id=snd0",
+            "-device", "virtio-sound-pci,audiodev=snd0,streams=1",
             "-device", "virtio-vsock-host-pci,guest-cid=77,forward=unix:\(Paths.adbSocket):5555,guest-forward=5000:unix:\(Paths.servicesSocket)",
         ]
         args += dbg?.extraArgs ?? []
         Log.info("qemu " + args.joined(separator: " "))
 
         display.attach(to: &qemu)
+        // Android's sound plays through a RemoteIO unit inside QEMU; mix with other apps' audio.
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setActive(true)
+        // QEMU reports errors on stderr, which iOS discards; keep them in logs/qemu.log.
+        if freopen(Paths.logs.appendingPathComponent("qemu.log").path, "w", stderr) != nil {
+            setvbuf(stderr, nil, _IOLBF, 0)
+        }
         started = true
         let q = qemu
         let thread = Thread {
