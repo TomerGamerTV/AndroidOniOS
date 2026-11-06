@@ -287,6 +287,18 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
         s->o->ops = &netlink_ops;
         return g;
     }
+    if (domain == 15) {                                   // AF_KEY: opened and closed to force an RCU sync; nothing more
+        int sp[2];
+        if (socketpair_big(SOCK_DGRAM, sp)) return -errno;
+        fcntl(sp[1], F_SETFD, FD_CLOEXEC);
+        int g = sock_create(c->proc, L_SOCK_DGRAM | (type & ~0xf), sp[0], type);
+        if (g < 0) { close(sp[1]); return g; }
+        Sock *s = sock_of(c->proc, g, NULL);
+        s->state = S_CONN;
+        s->send_fd = sp[1];
+        s->netlink = true;                                // answers like a kernel socket: requests are acknowledged
+        return g;
+    }
     if (domain == 40) {                                   // AF_VSOCK: exists (libqemupipe probes it), connects to nothing
         int sp[2];
         if (socketpair_big(SOCK_STREAM, sp)) return -errno;
@@ -685,7 +697,27 @@ static int64_t do_name(GuestCtx *c, int gfd, uint64_t addr, uint64_t lenp, bool 
 // ---- IP sockets: host sockets, with Linux <-> BSD translation of addresses, options and flags ----
 #define L_AF_INET 2
 #define L_AF_INET6 10
-static const FdOps inet_ops = { "inet", NULL, NULL, NULL, NULL, NULL };
+// Network-interface ioctls (struct ifreq: char name[16], then a 24-byte union). The host has no
+// Linux interfaces to configure, so settings are accepted and queries describe a quiet link.
+static int64_t inet_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
+    (void)o;
+    uint8_t *ifr = arg ? (uint8_t *)(uintptr_t)(c->base + UNTAG(arg)) : NULL;
+    uint32_t r = (uint32_t)req;
+    if (r < 0x8900 || r > 0x89ff) return -ENOTTY;
+    if (!ifr) return -EFAULT;
+    int32_t v;
+    switch (r) {
+    case 0x8913: { int16_t f = 0x1 | 0x40 | 0x1000; memcpy(ifr + 16, &f, 2); return 0; }   // SIOCGIFFLAGS: UP|RUNNING|MULTICAST
+    case 0x8921: v = 1500; memcpy(ifr + 16, &v, 4); return 0;                              // SIOCGIFMTU
+    case 0x8933: v = !strncmp((char *)ifr, "lo", 2) ? 1 : 2; memcpy(ifr + 16, &v, 4); return 0;   // SIOCGIFINDEX
+    case 0x8927: memset(ifr + 16, 0, 16); ifr[16] = 1; ifr[18] = 0x02; return 0;          // SIOCGIFHWADDR: ARPHRD_ETHER, local MAC
+    case 0x8915: case 0x891b: case 0x8919: memset(ifr + 16, 0, 16); { uint16_t f = 2; memcpy(ifr + 16, &f, 2); } return 0;   // addr, netmask, broadaddr
+    default:
+        if ((r & 0xff) >= 0x10 && (r & 1) == 0) return 0;                                  // SIOCS*: accepted
+        return -EINVAL;
+    }
+}
+static const FdOps inet_ops = { "inet", NULL, NULL, inet_ioctl, NULL, NULL };
 typedef struct { int domain, type; } InetSock;
 
 static InetSock *inet_of(Proc *p, int gfd, int *host) {
