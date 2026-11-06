@@ -70,7 +70,7 @@ static int64_t gp_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool n
             const char *name = (const char *)g->in;
             if (strncmp(name, "pipe:", 5)) { pthread_mutex_unlock(&o->lock); return -EINVAL; }
             name += 5;
-            if (strcmp(name, "qemud:sensors")) {           // services we don't have: connect fails
+            if (strcmp(name, "qemud:sensors") && strcmp(name, "qemud:gps")) {   // others: connect fails (gps: no fixes ever arrive)
                 LOGV("onirun: goldfish pipe: no service %s\n", name);
                 g->inlen = 0;
                 pthread_mutex_unlock(&o->lock);

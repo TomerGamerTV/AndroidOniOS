@@ -72,6 +72,10 @@ service authsecret /apex/com.android.hardware.authsecret/bin/hw/android.hardware
 service contexthub /apex/com.android.hardware.contexthub/bin/hw/android.hardware.contexthub-service.example
 service statsd /apex/com.android.os.statsd/bin/statsd
   socket statsdw
+service gnss /vendor/bin/hw/android.hardware.gnss-service.ranchu
+service media.c2 /vendor/bin/hw/android.hardware.media.c2-service-goldfish
+start gnss
+start media.c2
 start authsecret
 start contexthub
 start statsd
