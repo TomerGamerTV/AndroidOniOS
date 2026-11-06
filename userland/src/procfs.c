@@ -161,6 +161,38 @@ static const char *proc_target(Proc *p, const char *path, Proc **out) {
     return NULL;
 }
 
+
+// /proc/mounts and mountinfo: the fixed filesystems, then one loop mount per APEX so apexd's
+// "populate from mounts" finds them (/oni/apex-mounts.txt: name version apex-path, from mkrootfs).
+static int mounts_text(bool info, char **out) {
+    size_t cap = 65536, n = 0;
+    char *b = malloc(cap);
+    n += (size_t)snprintf(b + n, cap - n, info
+        ? "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n3 1 0:3 / /sys rw - sysfs sysfs rw\n6 3 0:6 / /sys/fs/selinux rw - selinuxfs selinuxfs rw\n4 1 0:4 / /dev rw - tmpfs tmpfs rw\n5 1 0:5 / /data rw - ext4 /dev/block/dm-0 rw\n7 1 0:7 / /apex rw - tmpfs tmpfs rw\n"
+        : "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\nselinuxfs /sys/fs/selinux selinuxfs rw 0 0\ntmpfs /dev tmpfs rw 0 0\n/dev/block/dm-0 /data ext4 rw 0 0\ntmpfs /apex tmpfs rw 0 0\n");
+    char hp[1200];
+    snprintf(hp, sizeof hp, "%s/oni/apex-mounts.txt", g_rootfs);
+    FILE *f = fopen(hp, "r");
+    if (f) {
+        char line[1024], name[256], apath[600];
+        long long ver;
+        int id = 8, loop = 0;
+        while (fgets(line, sizeof line, f) && n + 600 < cap) {
+            if (sscanf(line, "%255s %lld %599s", name, &ver, apath) != 3) continue;
+            if (info)
+                n += (size_t)snprintf(b + n, cap - n, "%d 7 7:%d / /apex/%s@%lld ro,nodev,noatime - ext4 /dev/block/loop%d ro\n%d 7 7:%d / /apex/%s ro,nodev,noatime - ext4 /dev/block/loop%d ro\n",
+                                      id, loop, name, ver, loop, id + 1, loop, name, loop);
+            else
+                n += (size_t)snprintf(b + n, cap - n, "/dev/block/loop%d /apex/%s@%lld ext4 ro,dirsync,nodev,noatime 0 0\n/dev/block/loop%d /apex/%s ext4 ro,dirsync,nodev,noatime 0 0\n",
+                                      loop, name, ver, loop, name);
+            id += 2; loop++;
+        }
+        fclose(f);
+    }
+    *out = b;
+    return (int)n;
+}
+
 static int proc_open(Proc *p, const char *path, int lflags) {
     char buf[4096];
     int n = -1;
@@ -233,10 +265,11 @@ static int proc_open(Proc *p, const char *path, int lflags) {
             free(m);
             return r;
         } else if (!strcmp(rest, "/mountinfo") || !strcmp(rest, "/mounts")) {
-            if (!strcmp(rest, "/mounts"))
-                n = snprintf(buf, sizeof buf, "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\nselinuxfs /sys/fs/selinux selinuxfs rw 0 0\ntmpfs /dev tmpfs rw 0 0\n/dev/block/dm-0 /data ext4 rw 0 0\n");
-            else
-                n = snprintf(buf, sizeof buf, "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n3 1 0:3 / /sys rw - sysfs sysfs rw\n6 3 0:6 / /sys/fs/selinux rw - selinuxfs selinuxfs rw\n4 1 0:4 / /dev rw - tmpfs tmpfs rw\n5 1 0:5 / /data rw - ext4 /dev/block/dm-0 rw\n");
+            char *m;
+            int len = mounts_text(!strcmp(rest, "/mountinfo"), &m);
+            int r = serve_text(p, m, (size_t)len, path, lflags);
+            free(m);
+            return r;
         } else return -ENOENT;
     }
     if (n < 0) return -ENOENT;

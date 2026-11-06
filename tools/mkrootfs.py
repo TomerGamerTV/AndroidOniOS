@@ -20,7 +20,7 @@ import argparse, os, shutil, struct, subprocess, sys, zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-EXT4PULL = os.path.join(HERE, 'ext4pull.py')
+EXT4PULL = os.path.join(HERE, 'ext4pull.py')   # ext4 payloads; erofspull.py handles EROFS ones
 
 
 def run(*args):
@@ -80,7 +80,7 @@ def main():
         symlink(target, os.path.join(R, name))
 
     # 2. APEXes: /system/apex/*.apex and /vendor/apex/*.apex, each payload at /apex/<name>
-    entries = []
+    entries, mounts = [], []
     for src, part in (('system/apex', 'SYSTEM'), ('vendor/apex', 'VENDOR'), ('system_ext/apex', 'SYSTEM_EXT'), ('product/apex', 'PRODUCT')):
         d = os.path.join(R, src)
         if not os.path.isdir(d):
@@ -93,11 +93,31 @@ def main():
             dest = os.path.join(R, 'apex', name)
             if not os.path.isdir(dest):
                 print('extracting apex', name)
-                run(EXT4PULL, path, 'pull', '/', dest)
+                try:
+                    run(EXT4PULL, path, 'pull', '/', dest)
+                except SystemExit:
+                    try:
+                        run(os.path.join(HERE, 'erofspull.py'), path, 'pull', '/', dest)    # EROFS payload
+                    except SystemExit as e:
+                        print('  skipped:', str(e).split(': ')[-1])
+                        shutil.rmtree(dest, ignore_errors=True)
+                        continue
+            mounts.append((name, ver, f'/{src}/{f}'))
             entries.append(f'  <apex-info moduleName="{name}" modulePath="/{src}/{f}" preinstalledModulePath="/{src}/{f}" '
                            f'versionCode="{ver}" versionName="" isFactory="true" isActive="true" provideSharedApexLibs="false" partition="{part}"/>')
     with open(os.path.join(R, 'apex/apex-info-list.xml'), 'w') as f:
         f.write('<?xml version="1.0" encoding="utf-8"?>\n<apex-info-list>\n' + '\n'.join(entries) + '\n</apex-info-list>\n')
+    # apexd learns what is active from /proc/mounts (one loop device per APEX, onirun generates the
+    # lines from /oni/apex-mounts.txt) and the loop device's sysfs backing_file.
+    os.makedirs(os.path.join(R, 'oni'), exist_ok=True)
+    with open(os.path.join(R, 'oni/apex-mounts.txt'), 'w') as f:
+        for i, (name, ver, path) in enumerate(mounts):
+            f.write(f'{name} {ver} {path}\n')
+            d = os.path.join(R, f'sys/block/loop{i}/loop'); os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, 'backing_file'), 'w').write(path + '\n')
+            os.makedirs(os.path.join(R, 'dev/block'), exist_ok=True)
+            open(os.path.join(R, f'dev/block/loop{i}'), 'a').close()
+            symlink(name, os.path.join(R, f'apex/{name}@{ver}'))
 
     # 2b. Pre-compiled boot image and odex files: built for a collector that needs userfaultfd, so
     # ART can't use them; left in place they only make its stack dumper abort.
