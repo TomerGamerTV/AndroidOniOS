@@ -109,10 +109,19 @@ def main():
 
     # 1. Partitions, laid out like Android: /system, /system_ext, /product, /vendor, /odm
     for part, dest in (('system', 'system'), ('system_ext', 'system_ext'), ('product', 'product'), ('vendor', 'vendor')):
+        src = '/system' if part == 'system' else '/'
         if not os.path.isdir(os.path.join(R, dest)):
             print('extracting', part)
-            src = '/system' if part == 'system' else '/'
             run(EXT4PULL, a.image, '-p', part, 'pull', src, os.path.join(R, dest))
+        else:
+            # A rootfs built up by hand may lack whole directories (it once lacked /system/fonts, so
+            # no typeface loaded and FontManagerService never finished starting): fill them in.
+            for line in run(EXT4PULL, a.image, '-p', part, 'ls', src).splitlines():
+                f = line.split()
+                if len(f) >= 3 and f[0].startswith('d') and f[2] not in ('lost+found', 'lib') and \
+                        not os.path.lexists(os.path.join(R, dest, f[2])):
+                    print('extracting', part, f[2])
+                    run(EXT4PULL, a.image, '-p', part, 'pull', src.rstrip('/') + '/' + f[2], os.path.join(R, dest, f[2]))
     os.makedirs(os.path.join(R, 'odm'), exist_ok=True)
     symlink('/system_ext', os.path.join(R, 'system/system_ext'))
     symlink('/product', os.path.join(R, 'system/product'))
@@ -184,7 +193,7 @@ def main():
     data/misc/credstore data/misc/appcompat data/misc/apns data/misc/emergencynumberdb data/misc/sdksandbox
     data/misc/threadnetwork data/misc/uprobestats data/misc/aconfig_flags data/misc/connectivityblobdb
     data/misc/odsign data/misc/virtualizationservice data/misc/oem_lock data/misc/bootstat data/misc/keychain
-    data/misc/ota data/misc/adbd data/misc/system_server data/misc/securitylog data/misc/surfaceflinger data/misc/gpu dev/dri dev/socket dev/__properties__
+    data/fonts/files data/fonts/config data/misc/ota data/misc/adbd data/misc/system_server data/misc/securitylog data/misc/surfaceflinger data/misc/gpu dev/dri dev/socket dev/__properties__
     metadata/aconfig/flags metadata/aconfig/maps metadata/aconfig/boot
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:

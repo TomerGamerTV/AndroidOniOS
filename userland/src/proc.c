@@ -1010,6 +1010,23 @@ void sys_main(const char *path, char **argv, char **envp, const char **sockets) 
         int s;
         if (sigwait(&set, &s) != 0) continue;
         if (s == SIGINFO) { proc_dump_all(); continue; }
+        if (s == SIGUSR2) {
+            // Debugging aid: SIGUSR2 to onirun sends SIGQUIT to the guest pid in /oni/sigquit (ART then
+            // dumps every thread's Java stack). Without that file SIGUSR2 is forwarded like the rest.
+            char qp[1200];
+            snprintf(qp, sizeof qp, "%s/oni/sigquit", g_rootfs);
+            FILE *qf = fopen(qp, "r");
+            int qpid = 0;
+            if (qf) { if (fscanf(qf, "%d", &qpid) != 1) qpid = 0; fclose(qf); }
+            if (qpid > 0) {
+                pthread_mutex_lock(&g_lock);
+                Proc *t = proc_find(qpid);
+                if (t) post_signal_locked(t, NULL, 3);
+                pthread_mutex_unlock(&g_lock);
+                fprintf(stderr, "onirun: SIGQUIT -> guest pid %d%s\n", qpid, t ? "" : " (no such process)");
+                continue;
+            }
+        }
         if (s != SIGCHLD) proc_forward_host_signal(lx_sig(s));
     }
 }
