@@ -381,6 +381,7 @@ void props_init(void) {
     }
     // Properties that describe this environment rather than the Android image they came from.
     props_set("sys.use_memfd", "1");
+    props_set("bpf.progs_loaded", "1");       // no bpfloader; HALs that wait for it may go on
     props_set("init.svc.zygote", "stopped");
     props_set("sys.boot_completed", "0");
 }

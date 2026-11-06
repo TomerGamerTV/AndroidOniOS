@@ -288,8 +288,8 @@ static int64_t do_socketpair(GuestCtx *c, int domain, int type, uint64_t sv) {
     Sock *a = sock_of(c->proc, g0, NULL), *b = sock_of(c->proc, g1, NULL);
     a->state = b->state = S_CONN;
     a->peer_pid = b->peer_pid = c->proc->pid;
-    a->peer_uid = b->peer_uid = c->proc->uid;
-    a->peer_gid = b->peer_gid = c->proc->gid;
+    a->peer_uid = b->peer_uid = c->proc->euid;
+    a->peer_gid = b->peer_gid = c->proc->egid;
     int32_t *out = gptr(sv);
     out[0] = g0;
     out[1] = g1;
@@ -351,7 +351,7 @@ static int64_t deliver(Name *n, int fd, int pid) {
     if (l->qn == l->qcap) { l->qcap = l->qcap ? l->qcap * 2 : 8; l->q = realloc(l->q, (size_t)l->qcap * sizeof(Pending)); }
     Proc *cp;
     LOCKED(cp = proc_find(pid));
-    l->q[l->qn++] = (Pending){ fd, pid, cp ? cp->uid : 0, cp ? cp->gid : 0 };
+    l->q[l->qn++] = (Pending){ fd, pid, cp ? cp->euid : 0, cp ? cp->egid : 0 };
     obj_set_ready(o, true);
     pthread_mutex_unlock(&o->lock);
     return 0;
@@ -385,7 +385,7 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     if (socketpair(AF_UNIX, host_type(s->type), 0, sp)) { pthread_mutex_unlock(&names_lock); return -errno; }
     fcntl(sp[1], F_SETFD, FD_CLOEXEC);
     s->peer_pid = n->s ? n->s->pid : 0;
-    if (n->s) { Proc *lp; LOCKED(lp = proc_find(n->s->pid)); if (lp) { s->peer_uid = lp->uid; s->peer_gid = lp->gid; } }
+    if (n->s) { Proc *lp; LOCKED(lp = proc_find(n->s->pid)); if (lp) { s->peer_uid = lp->euid; s->peer_gid = lp->egid; } }
     int64_t r = deliver(n, sp[1], c->proc->pid);
     pthread_mutex_unlock(&names_lock);
     if (r) { close(sp[0]); return r; }

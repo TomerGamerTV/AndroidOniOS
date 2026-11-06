@@ -73,6 +73,8 @@ extern uint64_t onx_tsd_off;   // byte offset of our context slot in the Darwin 
 struct TrSpace;
 void tr_init(void);
 struct TrSpace *tr_space_new(uint8_t *base);
+void tr_invalidate(struct TrSpace *s, uint64_t start, uint64_t len);        // code in the range changed
+void tr_invalidate_later(struct TrSpace *s, uint64_t start, uint64_t len);  // ... applied at the next ISB
 void tr_space_free(struct TrSpace *s);
 __attribute__((noreturn)) void tr_run(GuestCtx *ctx);
 void tr_leave(void);                       // the calling thread stops being a guest thread

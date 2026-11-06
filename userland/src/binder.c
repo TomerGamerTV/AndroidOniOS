@@ -169,6 +169,11 @@ static void work_push(WorkList *l, BWork *w) {
     if (l->tail) l->tail->next = w; else l->head = w;
     l->tail = w;
 }
+static void work_push_front(WorkList *l, BWork *w) {
+    w->next = l->head;
+    l->head = w;
+    if (!l->tail) l->tail = w;
+}
 static BWork *work_pop(WorkList *l) {
     BWork *w = l->head;
     if (w) { l->head = w->next; if (!l->head) l->tail = NULL; }
@@ -387,7 +392,15 @@ static void thread_free(BProc *p, BThread *t) {
             queue_thread(x->from, w);
             x->from->stack = x->from_parent;
         }
+        if (x->from == t) x->from = NULL;      // a reply for us now has nowhere to go (like the driver)
         x = parent;
+    }
+    t->stack = NULL;
+    // Transactions we sent that are still queued elsewhere must not point at us either.
+    for (BProc *q = all_bprocs; q; q = q->next_all) {
+        for (BWork *w = q->todo.head; w; w = w->next) if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t && w->t->from == t) w->t->from = NULL;
+        for (BThread *o = q->threads; o; o = o->next)
+            for (BWork *w = o->todo.head; w; w = w->next) if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t && w->t->from == t) w->t->from = NULL;
     }
     for (BWork *w; (w = work_pop(&t->todo));) free(w);
     if (t->wake_rd >= 0) close(t->wake_rd);
@@ -763,7 +776,7 @@ static void put_tdata(BTrans *t, BProc *p, TData *tr) {
     tr->code = t->code;
     tr->flags = t->flags;
     tr->sender_pid = t->sender_pid;
-    tr->sender_euid = t->from_proc ? t->from_proc->proc->uid : 0;
+    tr->sender_euid = t->from_proc ? t->from_proc->proc->euid : 0;
     tr->data_size = t->data_size;
     tr->offsets_size = t->offsets_size;
     tr->buffer = p->buf_gaddr + t->buf->off;
@@ -808,7 +821,7 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             BTrans *t = w->t;
             uint32_t cmd = w->kind == W_REPLY ? BR_REPLY : t->has_secctx ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION;
             uint64_t need = 4 + IOC_SIZE(cmd);
-            if (pos + need > size) { th->todo.head = w; if (!th->todo.tail) th->todo.tail = w; w->next = NULL; goto out; }   // leave it for the next read (re-queued at the head)
+            if (pos + need > size) { work_push_front(&th->todo, w); goto out; }   // leave it for the next read
             if (w->kind == W_TRANSACTION && t->need_reply) {
                 t->to_thread = th;
                 t->to_parent = th->stack;
@@ -985,6 +998,16 @@ static void binder_release(FdObj *o) {
     }
     for (BBuf *b = p->bufs; b;) { BBuf *n = b->next; free(b->objs); free(b); b = n; }
     if (p->buf_host) munmap(p->buf_host, p->buf_size);
+    // Nothing anywhere may still name this process.
+    for (BProc *q = all_bprocs; q; q = q->next_all) {
+        for (BWork *w = q->todo.head; w; w = w->next)
+            if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t) { if (w->t->from_proc == p) w->t->from_proc = NULL; if (w->t->to_proc == p) w->t->to_proc = NULL; }
+        for (BThread *o = q->threads; o; o = o->next) {
+            for (BWork *w = o->todo.head; w; w = w->next)
+                if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t) { if (w->t->from_proc == p) w->t->from_proc = NULL; if (w->t->to_proc == p) w->t->to_proc = NULL; }
+            for (BTrans *x = o->stack; x; x = x->to_thread == o ? x->to_parent : x->from_parent) { if (x->from_proc == p) x->from_proc = NULL; if (x->to_proc == p) x->to_proc = NULL; }
+        }
+    }
     pthread_mutex_unlock(&blk);
     free(p);
 }

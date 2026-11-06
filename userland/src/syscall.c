@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/xattr.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -687,13 +688,14 @@ void sys_dispatch(GuestCtx *c) {
             m = mm_map(p->mm, a0, a1, (int)(a2 & 7), fl, mfd, a5, known ? path2 : NULL);
             if (m >= 0 && o && o->ops->mapped) o->ops->mapped(o, c, (uint64_t)m, a1, (int)(a2 & 7), a5);
         }
+        if (m >= 0 && (a3 & 0x10)) tr_invalidate(c->space, (uint64_t)m, PG_UP(a1));   // MAP_FIXED replaced code?
         r = m < 0 ? ERR(-m) : (uint64_t)m;
         break;
     }
-    case 215: e = mm_unmap(p->mm, a0, a1); r = e ? ERR(-e) : 0; break;
+    case 215: e = mm_unmap(p->mm, a0, a1); if (!e) tr_invalidate(c->space, a0, PG_UP(a1)); r = e ? ERR(-e) : 0; break;
     case 226: e = mm_protect(p->mm, a0, a1, (int)(a2 & 7)); r = e ? ERR(-e) : 0; break;
     case 233: r = a2 == 4 ? (uint64_t)mm_dontneed(p->mm, a0, a1) : 0; break;
-    case 216: { int64_t m = mm_remap(p->mm, a0, a1, a2, (int)a3, a4); r = m < 0 ? ERR(-m) : (uint64_t)m; break; }
+    case 216: { int64_t m = mm_remap(p->mm, a0, a1, a2, (int)a3, a4); if (m >= 0 && (uint64_t)m != a0) tr_invalidate(c->space, a0, PG_UP(a1)); r = m < 0 ? ERR(-m) : (uint64_t)m; break; }
     case 214: r = 0; break;   // brk: no heap break, bionic uses mmap
     case 96: c->clear_child_tid = a0; r = c->tid; break;
     case 99: r = 0; break;    // set_robust_list
@@ -804,16 +806,20 @@ void sys_dispatch(GuestCtx *c) {
     case 172: r = (uint64_t)p->pid; break;
     case 173: r = (uint64_t)p->ppid; break;
     case 178: r = c->tid; break;
-    case 174: case 175: r = p->uid; break;                     // getuid, geteuid
-    case 176: case 177: r = p->gid; break;                     // getgid, getegid
-    case 146: p->uid = (uint32_t)a0; r = 0; break;             // setuid
-    case 144: p->gid = (uint32_t)a0; r = 0; break;             // setgid
-    case 145: if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; if ((int32_t)a1 != -1) p->uid = (uint32_t)a1; r = 0; break;   // setreuid
-    case 143: if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; if ((int32_t)a1 != -1) p->gid = (uint32_t)a1; r = 0; break;   // setregid
-    case 147: if ((int32_t)a1 != -1) p->uid = (uint32_t)a1; else if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; r = 0; break;   // setresuid
-    case 149: if ((int32_t)a1 != -1) p->gid = (uint32_t)a1; else if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; r = 0; break;   // setresgid
-    case 148: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = p->uid; r = 0; break; }   // getresuid
-    case 150: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = p->gid; r = 0; break; }   // getresgid
+    // Credentials: every guest process may change its ids (there is no capability check); real and
+    // effective ids are tracked separately, the saved set follows the effective one.
+    case 174: r = p->uid; break;                               // getuid
+    case 175: r = p->euid; break;                              // geteuid
+    case 176: r = p->gid; break;                               // getgid
+    case 177: r = p->egid; break;                              // getegid
+    case 146: p->uid = p->euid = (uint32_t)a0; r = 0; break;   // setuid
+    case 144: p->gid = p->egid = (uint32_t)a0; r = 0; break;   // setgid
+    case 145: if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; if ((int32_t)a1 != -1) p->euid = (uint32_t)a1; r = 0; break;   // setreuid
+    case 143: if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; if ((int32_t)a1 != -1) p->egid = (uint32_t)a1; r = 0; break;   // setregid
+    case 147: if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; if ((int32_t)a1 != -1) p->euid = (uint32_t)a1; r = 0; break;   // setresuid
+    case 149: if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; if ((int32_t)a1 != -1) p->egid = (uint32_t)a1; r = 0; break;   // setresgid
+    case 148: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; uint32_t v[3] = { p->uid, p->euid, p->euid }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = v[i]; r = 0; break; }   // getresuid
+    case 150: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; uint32_t v[3] = { p->gid, p->egid, p->egid }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = v[i]; r = 0; break; }   // getresgid
     case 151: case 152: r = 0; break;                          // setfsuid, setfsgid
     case 159: {                                                // setgroups
         if (a0 > 32) { r = ERR(22); break; }
@@ -1024,21 +1030,41 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 102: case 103: if (nr == 103 && a2) memset(gptr(a2), 0, 32); if (nr == 102) memset(gptr(a1), 0, 32); r = 0; break;   // getitimer/setitimer: accepted, never fire
-    case 5: case 6: case 7: r = 0; break;                              // setxattr, lsetxattr, fsetxattr: accepted (SELinux labels)
+    // Extended attributes live on the host files (APFS keeps any name), so SELinux labels that
+    // restorecon writes read back. An unlabeled file reports a generic data label.
+    case 5: case 6: case 7: {                                           // setxattr, lsetxattr, fsetxattr
+        const char *name = gstr(a1);
+        if (!name) { r = ERR(14); break; }
+        int rc;
+        if (nr == 7) { h = HFD(a0); rc = fsetxattr(h, name, gptr(a2), a3, 0, 0); }
+        else { if ((e = host_path(p, gstr(a0), path, sizeof path, nr == 5))) { r = ERR(-e); break; } rc = setxattr(path, name, gptr(a2), a3, 0, nr == 6 ? XATTR_NOFOLLOW : 0); }
+        r = rc < 0 ? ERR(lx_errno(errno)) : 0;
+        break;
+    }
     case 8: case 9: case 10: {                                          // getxattr, lgetxattr, fgetxattr
-        const char *name = gstr(nr == 10 ? a1 : a1);
-        if (name && !strcmp(name, "security.selinux")) {
-            const char *ctx = "u:object_r:system_data_file:s0";
-            size_t n = strlen(ctx) + 1;
-            if (a3 == 0) { r = n; break; }
-            if (a3 < n) { r = ERR(34); break; }
-            memcpy(gptr(a2), ctx, n);
-            r = n;
-        } else r = ERR(61);                                             // ENODATA
+        const char *name = gstr(a1);
+        if (!name) { r = ERR(14); break; }
+        ssize_t n;
+        char tmp[4096];
+        if (nr == 10) { h = HFD(a0); n = fgetxattr(h, name, tmp, sizeof tmp, 0, 0); }
+        else { if ((e = host_path(p, gstr(a0), path, sizeof path, nr == 8))) { r = ERR(-e); break; } n = getxattr(path, name, tmp, sizeof tmp, 0, nr == 9 ? XATTR_NOFOLLOW : 0); }
+        if (n < 0 && errno == ENOATTR && !strcmp(name, "security.selinux")) { strcpy(tmp, "u:object_r:system_data_file:s0"); n = (ssize_t)strlen(tmp) + 1; }
+        if (n < 0) { r = ERR(errno == ENOATTR ? 61 : lx_errno(errno)); break; }
+        if (a3 == 0) { r = (uint64_t)n; break; }
+        if (a3 < (uint64_t)n) { r = ERR(34); break; }
+        memcpy(gptr(a2), tmp, (size_t)n);
+        r = (uint64_t)n;
         break;
     }
     case 11: case 12: case 13: r = 0; break;                            // listxattr family: none
-    case 14: case 15: case 16: r = 0; break;                            // removexattr family
+    case 14: case 15: case 16: {                                        // removexattr, lremovexattr, fremovexattr
+        const char *name = gstr(a1);
+        if (!name) { r = ERR(14); break; }
+        if (nr == 16) { h = HFD(a0); fremovexattr(h, name, 0); }
+        else if (!host_path(p, gstr(a0), path, sizeof path, nr == 14)) removexattr(path, name, nr == 15 ? XATTR_NOFOLLOW : 0);
+        r = 0;
+        break;
+    }
     case 283: r = proc_membarrier(c, (int)a0); break;   // membarrier
     case 293: case 435: case 291: case 282: case 280: case 117: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd, bpf, ptrace
     case 232: {               // mincore: one byte per page; the guest's page size is the host's (AT_PAGESZ)
@@ -1090,6 +1116,12 @@ int sys_emulate(GuestCtx *c, uint64_t pc, uint32_t insn) {
         return 0;
     }
     if ((insn & 0xfff00000) == 0xd5100000) return 0;   // msr: ignore
+    if ((insn & 0xffffffe0) == 0xd50b7520) {           // ic ivau, Xt
+        uint64_t a = (insn & 31) == 31 ? 0 : c->x[insn & 31];
+        tr_invalidate_later(c->space, a & ~63ull, 64);
+        return 0;
+    }
+    if (insn == 0xd5033fdf) { tr_invalidate(c->space, 0, 0); return 0; }   // isb: apply pending invalidations
     return -1;
 }
 

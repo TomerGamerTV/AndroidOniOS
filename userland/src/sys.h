@@ -142,7 +142,8 @@ enum { P_RUNNING, P_EXITING, P_ZOMBIE };
 
 typedef struct Proc {
     int pid, ppid, pgid, sid;
-    uint32_t uid, gid;        // real/effective ids (setresuid moves them; no separate saved set)
+    uint32_t uid, gid;        // real ids (getuid); zygote preloads with euid 9999 and ruid 0
+    uint32_t euid, egid;      // effective ids: credentials seen by binder, sockets and files
     uint32_t groups[32];
     int ngroups;
     int nepoll;               // epoll fds open, so close() knows whether to scan them

@@ -180,7 +180,7 @@ static Proc *proc_alloc_locked(void) {
     Proc *p = calloc(1, sizeof *p);
     for (int i = 0; i < MAX_FDS; i++) p->fd[i].host = -1;
     p->pid = p->pgid = p->sid = g_next_id++;
-    p->uid = p->gid = 0;      // init's children start as root; they drop privileges themselves
+    p->uid = p->gid = p->euid = p->egid = 0;      // init's children start as root; they drop privileges themselves
     strcpy(p->cwd, "/");
     p->umask = 022;
     p->exit_signal = 17;
@@ -725,6 +725,8 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->umask = p->umask;
     q->uid = p->uid;
     q->gid = p->gid;
+    q->euid = p->euid;
+    q->egid = p->egid;
     memcpy(q->groups, p->groups, sizeof q->groups);
     q->ngroups = p->ngroups;
     q->nepoll = p->nepoll;
@@ -1015,7 +1017,7 @@ void proc_dump_all(void) {
     pthread_mutex_lock(&g_lock);
     fprintf(stderr, "onirun: --- guest threads ---\n");
     for (Proc *p = g_procs; p; p = p->next) {
-        fprintf(stderr, "[%d] %s uid %u state %d threads %d\n", p->pid, p->exe, p->uid, p->state, p->nthreads);
+        fprintf(stderr, "[%d] %s uid %u/%u state %d threads %d\n", p->pid, p->exe, p->uid, p->euid, p->state, p->nthreads);
         for (GuestCtx *t = p->threads; t; t = t->next_thread) {
             char where[1200] = "?", lr[1200] = "?";
             if (p->mm) { mm_symbolize(p->mm, t->pc, where, sizeof where); mm_symbolize(p->mm, t->x[30], lr, sizeof lr); }

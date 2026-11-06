@@ -250,7 +250,7 @@ static int proc_open(Proc *p, const char *path, int lflags) {
         else if (!strcmp(rest, "/status")) {
             const char *b = strrchr(t->exe, '/');
             n = snprintf(buf, sizeof buf, "Name:\t%.15s\nUmask:\t%04o\nState:\tR (running)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\nTracerPid:\t0\nUid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\nThreads:\t%d\n",
-                         b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, t->uid, t->uid, t->uid, t->uid, t->gid, t->gid, t->gid, t->gid, t->nthreads);
+                         b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, t->uid, t->euid, t->euid, t->euid, t->gid, t->egid, t->egid, t->egid, t->nthreads);
         } else if (!strcmp(rest, "/stat")) {
             // ... num_threads itrealvalue starttime vsize rss rsslim startcode endcode startstack ...
             n = snprintf(buf, sizeof buf, "%d (%.15s) R %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 %d 0 0 %llu 0 18446744073709551615 0 0 %llu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
@@ -328,7 +328,27 @@ static int se_open(Proc *p, const FdOps *ops, const char *path, int lflags) {
 static int64_t sink_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock) { (void)o; (void)c; (void)buf; (void)nonblock; return (int64_t)n; }
 static const FdOps sink_ops = { "sink", NULL, sink_write, NULL, NULL, NULL };
 
+// /proc/pressure/{memory,cpu,io}: PSI stats that never show pressure. Readers get the stall
+// lines; writers register triggers (lmkd), which never fire, so the fd never becomes ready.
+static int64_t psi_read(FdObj *o, GuestCtx *c, void *buf, size_t n, bool nonblock) {
+    (void)c; (void)nonblock;
+    if (o->data) return 0;
+    o->data = (void *)1;
+    const char *t = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+    size_t k = strlen(t);
+    if (k > n) k = n;
+    memcpy(buf, t, k);
+    return (int64_t)k;
+}
+static const FdOps psi_ops = { "psi", psi_read, sink_write, NULL, NULL, NULL };
+
 int procfs_open(Proc *p, const char *path, int lflags) {
+    if (!strcmp(path, "/proc/pressure/memory") || !strcmp(path, "/proc/pressure/cpu") || !strcmp(path, "/proc/pressure/io")) {
+        FdObj *o = obj_new(&psi_ops, NULL, true);
+        if (!o) return -ENFILE;
+        fd_set_path(o->rd, path);
+        return fd_install_obj(p, o->rd, o, lflags & 02000000);
+    }
     if (!strncmp(path, "/proc", 5) && (path[5] == 0 || path[5] == '/')) {
         int d = proc_dir(p, path, lflags);
         if (d != 1) return d;

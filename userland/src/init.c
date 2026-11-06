@@ -62,7 +62,7 @@ static void svc_launch_locked(Svc *s) {
     s->pid = p->pid;
     s->started_ns = (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC);
     set_state(s, "running");
-    LOGV("onirun: init: started %s as pid %d\n", s->name, s->pid);
+    fprintf(stderr, "onirun: init: [%7.2f] started %s as pid %d\n", s->started_ns / 1e9, s->name, s->pid);
 }
 
 static bool svc_alive(Svc *s) {
@@ -74,6 +74,7 @@ static bool svc_alive(Svc *s) {
 
 int init_control(const char *what, const char *arg) {   // ctl.<what>=<arg>; 0 or -1
     pthread_mutex_lock(&init_lock);
+    fprintf(stderr, "onirun: init: [%7.2f] ctl.%s=%s\n", clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9, what, arg);
     const char *target = arg;
     if (!strncmp(what, "interface_", 10)) {
         target = NULL;

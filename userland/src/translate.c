@@ -55,6 +55,7 @@ typedef struct Block {
     int ninsn;
     Borrow *borrows;
     int nborrows;
+    bool dead;                // retired by tr_invalidate; its code now jumps to a re-lookup stub
     struct Block *next;
 } Block;
 static uint16_t cur_imap[MAX_BLOCK_INSNS + 1];
@@ -74,6 +75,7 @@ typedef struct TrSpace {
     EmuRec *emus;
     int *chunks, nchunks;
     uint32_t *ptr, *end, *tramp, *tramp_spilled;   // current chunk
+    uint64_t inv_lo, inv_hi;  // guest range with pending invalidations (IC IVAU lines), applied at ISB
     struct TrSpace *next;
 } TrSpace;
 static TrSpace *spaces;
@@ -83,7 +85,7 @@ static inline unsigned hidx(uint64_t pc) { return (unsigned)((pc >> 2) * 0x9E377
 
 static Block *lookup(TrSpace *s, uint64_t pc) {
     for (Block *b = s->htab[hidx(pc)]; b; b = b->next)
-        if (b->pc == pc) return b;
+        if (b->pc == pc && !b->dead) return b;
     return NULL;
 }
 
@@ -507,9 +509,16 @@ static int rewrite_sys(uint32_t insn, uint64_t pc, Ops *o) {
             opf(o, 0, false);
             return SYS_REWRITE;
         }
-        // IC IVAU: guest code is translated, not run in place. Other DC ops (CVAU, CIVAC...): the
-        // host keeps its caches coherent itself, and Darwin traps them at EL0.
+        if (crm == 5 && op2 == 1) {                   // IC IVAU: the line's translations go stale
+            emit_emulate(pc, insn);
+            return SYS_EXIT;
+        }
+        // DC ops (CVAU, CIVAC...): the host keeps its caches coherent itself, and Darwin traps them at EL0.
         return SYS_DONE;
+    }
+    if (insn == 0xd5033fdf) {                         // ISB: the point where new code must be visible
+        emit_emulate(pc, insn);
+        return SYS_EXIT;
     }
     // PACIA1716 and friends work on x16/x17, which aren't the guest's in translated code.
     if (insn == 0xd503211f || insn == 0xd503215f || insn == 0xd503219f || insn == 0xd50321df) return SYS_DONE;
@@ -665,9 +674,63 @@ static Block *translate(TrSpace *s, uint64_t pc, uint64_t limit) {
     return b;
 }
 
+// Guest code in [start, start + len) changed. Blocks that contain any of it are retired: their first
+// words become a far jump to an exit stub that asks the dispatcher for the current translation, so
+// chained branches and inline-table hits into them keep working (and get re-chained). tr_lock held.
+static void retire_blocks(TrSpace *s, uint64_t start, uint64_t len) {
+    bool writing = false;
+    for (unsigned i = 0; i < (1u << HBITS); i++)
+        for (Block *b = s->htab[i]; b; b = b->next) {
+            if (b->dead || b->pc >= start + len || b->pc + (uint64_t)b->ninsn * 4 <= start) continue;
+            if (!writing) { ts = s; jit_write(true); writing = true; }
+            b->dead = true;
+            if (!s->ptr || (size_t)(s->end - s->ptr) < BLOCK_RESERVE) space_grow(s);
+            ExitRec *r = calloc(1, sizeof *r);
+            r->target = b->pc;
+            r->patch = b->host;
+            r->next = s->exits;
+            s->exits = r;
+            uint32_t *stub = s->ptr;
+            emit_exit((uint64_t)(uintptr_t)r, EXIT_DIRECT);
+            sys_icache_invalidate(stub, (size_t)(s->ptr - stub) * 4);
+            // ldr x17, [pc, #8]; br x17; .quad stub  -- every block is at least one exit stub long
+            b->host[2] = (uint32_t)(uintptr_t)stub;
+            b->host[3] = (uint32_t)((uintptr_t)stub >> 32);
+            b->host[1] = 0xd61f0220;
+            __atomic_store_n(&b->host[0], 0x58000051u, __ATOMIC_RELEASE);
+            sys_icache_invalidate(b->host, 16);
+            IbEntry *e = (IbEntry *)(uintptr_t)(s->base - IB_SIZE) + ((b->pc >> 2) & ((1u << IB_BITS) - 1));
+            if (e->host == b->host) { uint64_t one = 1, zero = 0; __asm__ volatile("stp %0, %1, [%2]" :: "r"(one), "r"(zero), "r"(e) : "memory"); }
+        }
+    if (writing) jit_write(false);
+}
+
+static void flush_pending_locked(TrSpace *s) {
+    if (s->inv_hi > s->inv_lo) { retire_blocks(s, s->inv_lo, s->inv_hi - s->inv_lo); s->inv_lo = s->inv_hi = 0; }
+}
+
+// IC IVAU: remember the line; a flush sequence ends with ISB, which applies the batch.
+void tr_invalidate_later(TrSpace *s, uint64_t start, uint64_t len) {
+    if (!s) return;
+    pthread_mutex_lock(&tr_lock);
+    if (s->inv_hi <= s->inv_lo) { s->inv_lo = start; s->inv_hi = start + len; }
+    else { if (start < s->inv_lo) s->inv_lo = start; if (start + len > s->inv_hi) s->inv_hi = start + len; }
+    pthread_mutex_unlock(&tr_lock);
+}
+
+// munmap, MAP_FIXED over code, mremap, ISB: apply now.
+void tr_invalidate(TrSpace *s, uint64_t start, uint64_t len) {
+    if (!s) return;
+    pthread_mutex_lock(&tr_lock);
+    flush_pending_locked(s);
+    if (len) retire_blocks(s, start, len);
+    pthread_mutex_unlock(&tr_lock);
+}
+
 // Returns the host code for guest pc, translating it if needed, or NULL if pc isn't executable.
 static uint32_t *get_block(GuestCtx *c, uint64_t pc) {
     TrSpace *s = c->space;
+    flush_pending_locked(s);
     Block *b = lookup(s, pc);
     if (b) return b->host;
     uint64_t limit = (pc & 3) ? 0 : sys_code_end(c, pc);

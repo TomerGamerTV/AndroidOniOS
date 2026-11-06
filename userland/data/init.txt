@@ -12,8 +12,18 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-s
   socket zygote
   socket usap_pool_primary
 
+service idmap2d /system/bin/idmap2d
+service lmkd /system/bin/lmkd
+  socket lmkd
+service tombstoned /system/bin/tombstoned
+  socket tombstoned_crash
+  socket tombstoned_intercept
+  socket tombstoned_java_trace
+
 start servicemanager
 start hwservicemanager
+start lmkd
+start tombstoned
 start keystore2
 start installd
 start zygote
@@ -28,6 +38,7 @@ service hidl-allocator /system/bin/hw/android.hidl.allocator@1.0-service
 service power /apex/com.android.hardware.power/bin/hw/android.hardware.power-service.example
 service power.stats /apex/com.android.hardware.power/bin/hw/android.hardware.power.stats-service.example
 service thermal /apex/com.android.hardware.thermal/bin/hw/android.hardware.thermal-service.example
+service sensors /vendor/bin/hw/android.hardware.sensors-service.multihal
 start keymint
 start lights
 start health
@@ -36,6 +47,7 @@ start suspend
 start power
 start power.stats
 start thermal
+start sensors
 service gatekeeper /apex/com.android.hardware.gatekeeper/bin/hw/android.hardware.gatekeeper-service.nonsecure
 service vibrator /apex/com.android.hardware.vibrator/bin/hw/android.hardware.vibrator-service.example
 start vibrator
