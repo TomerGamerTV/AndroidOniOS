@@ -1,0 +1,40 @@
+# onirun's service table (init-lite). Installed as /oni/init.txt in the rootfs.
+#   service NAME /path/program args...   socket NAME   oneshot   interface IFACE NAME   start NAME   env K=V
+service servicemanager /system/bin/servicemanager
+service hwservicemanager /system/bin/hwservicemanager
+service logd /system/bin/logd
+service keystore2 /system/bin/keystore2 /data/misc/keystore
+service apexd /system/bin/apexd
+  oneshot
+interface aidl/apexservice apexd
+service installd /system/bin/installd
+service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-system-server --socket-name=zygote
+  socket zygote
+  socket usap_pool_primary
+
+start servicemanager
+start hwservicemanager
+start keystore2
+start installd
+start zygote
+
+# HALs the emulator image provides in software
+service keymint /vendor/bin/hw/android.hardware.security.keymint-service
+service lights /vendor/bin/hw/android.hardware.lights-service.example
+service health /vendor/bin/hw/android.hardware.health-service.example
+service usb /vendor/bin/hw/android.hardware.usb-service.example
+service suspend /system/bin/hw/android.system.suspend-service
+service hidl-allocator /system/bin/hw/android.hidl.allocator@1.0-service
+service power /apex/com.android.hardware.power/bin/hw/android.hardware.power-service.example
+service power.stats /apex/com.android.hardware.power/bin/hw/android.hardware.power.stats-service.example
+service thermal /apex/com.android.hardware.thermal/bin/hw/android.hardware.thermal-service.example
+start keymint
+start lights
+start health
+start usb
+start suspend
+start power
+start power.stats
+start thermal
+service vibrator /apex/com.android.hardware.vibrator/bin/hw/android.hardware.vibrator-service.example
+start vibrator

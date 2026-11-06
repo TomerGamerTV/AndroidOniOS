@@ -867,10 +867,15 @@ static void *housekeeping(void *arg) {
     return NULL;
 }
 
-Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets) {
+static Proc *spawn(const char *path, char **argv, char **envp, const char **sockets, bool initial);
+Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets) { return spawn(path, argv, envp, sockets, true); }
+Proc *proc_spawn(const char *path, char **argv, char **envp, const char **sockets) { return spawn(path, argv, envp, sockets, false); }
+void proc_kill_locked(Proc *p, int sig) { post_signal_locked(p, NULL, sig); }
+
+static Proc *spawn(const char *path, char **argv, char **envp, const char **sockets, bool initial) {
     pthread_mutex_lock(&g_lock);
     Proc *p = proc_alloc_locked();
-    p->initial = true;
+    p->initial = initial;
     p->ppid = 1;
     pthread_mutex_unlock(&g_lock);
     // Signals ignored when onirun started (nohup, background jobs) stay ignored, as across exec.
@@ -903,7 +908,16 @@ Proc *proc_start(const char *path, char **argv, char **envp, const char **socket
     envp = env2;
     ExecImage img;
     int e = load_exec(p, p->mm, path, argv, envp, &img);
-    if (e) die("onirun: cannot load %s (errno %d)", path, -e);
+    if (e) {
+        if (initial) die("onirun: cannot load %s (errno %d)", path, -e);
+        fprintf(stderr, "onirun: cannot load %s (errno %d)\n", path, -e);
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < MAX_FDS; i++) if (p->fd[i].host >= 0) host_close_locked(p->fd[i].host);
+        proc_free_locked(p);
+        pthread_mutex_unlock(&g_lock);
+        mm_put(p->mm);
+        return NULL;
+    }
     snprintf(p->exe, sizeof p->exe, "%s", path);
     set_cmdline(p, argv);
     p->stack_start = img.sp;
@@ -947,7 +961,12 @@ void sys_main(const char *path, char **argv, char **envp, const char **sockets) 
     pthread_create(&hk, NULL, housekeeping, NULL);
     sock_init();
     props_init();
-    proc_start(path, argv, envp, sockets);
+    if (path) proc_start(path, argv, envp, sockets);
+    else {
+        char table[1200];
+        snprintf(table, sizeof table, "%s/oni/init.txt", g_rootfs);
+        if (!init_start(table, envp)) die("onirun: cannot read %s", table);
+    }
     for (;;) {
         int s;
         if (sigwait(&set, &s) != 0) continue;

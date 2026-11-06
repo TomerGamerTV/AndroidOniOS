@@ -94,6 +94,7 @@ int64_t vfs_ioctl(GuestCtx *c, int host, uint64_t req, uint64_t arg);
 int64_t vfs_eventfd(GuestCtx *c, uint64_t count, int lflags);
 int64_t vfs_memfd(GuestCtx *c, const char *name, int lflags);
 int64_t vfs_inotify_init(GuestCtx *c, int lflags);
+int64_t vfs_memfd_seals(int host, int cmd, uint64_t arg);
 int64_t vfs_timerfd_create(GuestCtx *c, int clockid, int lflags);
 int64_t vfs_timerfd_settime(GuestCtx *c, int gfd, int lflags, uint64_t newv, uint64_t oldv);
 int64_t vfs_timerfd_gettime(GuestCtx *c, int gfd, uint64_t curv);
@@ -114,6 +115,10 @@ int  sock_listen_for(struct Proc *p, const char *name);    // init-style socket 
 
 // ---- /proc and /sys (procfs.c) ----
 int  procfs_open(struct Proc *p, const char *guest_path, int lflags);   // guest fd, -errno, or 1 = not ours
+
+// ---- init-lite (init.c) ----
+bool init_start(const char *table_host_path, char **envp);
+int  init_control(const char *what, const char *arg);      // ctl.<what>=<arg>
 
 // ---- system properties (props.c) ----
 void props_init(void);
@@ -188,6 +193,8 @@ uint64_t proc_getpgid(GuestCtx *c, int64_t pid);
 uint64_t proc_setsid(GuestCtx *c);
 void proc_backtrace(GuestCtx *c);
 Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets);
+Proc *proc_spawn(const char *path, char **argv, char **envp, const char **sockets);   // like init starting a service; NULL on failure
+void proc_kill_locked(Proc *p, int sig);
 const char *proc_secontext(Proc *p);                 // SELinux context we claim for p
 Proc *proc_find(int pid);                            // g_lock held
 Proc *proc_list(void);                               // g_lock held

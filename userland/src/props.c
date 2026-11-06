@@ -250,7 +250,10 @@ static int prop_set_locked(const char *name, const char *value) {
     if (vl >= PROP_VALUE_MAX && strncmp(name, "ro.", 3)) return PROP_ERROR_INVALID_VALUE;
     if (vl >= PROP_VALUE_MAX) return PROP_ERROR_INVALID_VALUE;   // long ro. values aren't supported here
     if (!strncmp(name, "ctl.", 4)) {
-        LOGV("onirun: property control message %s=%s ignored\n", name, value);
+        LOGV("onirun: control message %s=%s\n", name, value);
+        pthread_mutex_unlock(&props_lock);              // init sets init.svc.* properties itself
+        init_control(name + 4, value);
+        pthread_mutex_lock(&props_lock);
         return PROP_SUCCESS;
     }
     Ctx *c = ctx_get(ctx_for(name));

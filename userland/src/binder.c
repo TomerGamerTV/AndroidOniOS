@@ -535,8 +535,8 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
             if (o + 40 > tr.data_size) goto failed_objs;
             memcpy(&flags, fp + 4, 4); memcpy(&sbuf, fp + 8, 8); memcpy(&len, fp + 16, 8);
             memcpy(&parent, fp + 24, 8); memcpy(&parent_off, fp + 32, 8);
-            if (len & 7 || sg_off + len > sg_end) goto failed_objs;
-            if (len && !mm_readable(p->proc->mm, sbuf, len)) goto failed_objs;
+            if (len > sg_end - sg_off) { LOGV("onirun: binder: sg buffer %llu doesn't fit\n", (unsigned long long)len); goto failed_objs; }
+            if (len && !mm_readable(p->proc->mm, UNTAG(sbuf), len)) { LOGV("onirun: binder: sg buffer unreadable\n"); goto failed_objs; }
             memcpy(dst + sg_off, (const void *)(uintptr_t)(c->base + UNTAG(sbuf)), len);
             uint64_t nb = dst_g + sg_off;
             memcpy(fp + 8, &nb, 8);
@@ -546,10 +546,10 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
                 uint32_t pt;
                 uint64_t pbuf, plen;
                 memcpy(&pt, pfp, 4); memcpy(&pbuf, pfp + 8, 8); memcpy(&plen, pfp + 16, 8);
-                if (pt != T_PTR || parent_off + 8 > plen) goto failed_objs;
+                if (pt != T_PTR || parent_off + 8 > plen) { LOGV("onirun: binder: bad sg parent\n"); goto failed_objs; }
                 memcpy(dst + (pbuf - dst_g) + parent_off, &nb, 8);
             }
-            sg_off += len;
+            sg_off += (len + 7) & ~7ull;                 // the driver keeps each buffer 8-aligned
             break;
         }
         case T_FDA: {                          // fd array inside a parent buffer
@@ -561,7 +561,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
             uint32_t pt;
             uint64_t pbuf, plen;
             memcpy(&pt, pfp, 4); memcpy(&pbuf, pfp + 8, 8); memcpy(&plen, pfp + 16, 8);
-            if (pt != T_PTR || parent_off + num * 4 > plen) goto failed_objs;
+            if (pt != T_PTR || parent_off + num * 4 > plen) { LOGV("onirun: binder: bad fd array parent\n"); goto failed_objs; }
             uint8_t *fds = dst + (pbuf - dst_g) + parent_off;
             for (uint64_t k = 0; k < num; k++) {
                 int32_t gfd;
@@ -578,6 +578,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
             break;
         }
         default:
+            LOGV("onirun: binder: unknown object type %08x at offset %llu\n", type, (unsigned long long)o);
             goto failed_objs;
         }
     }
@@ -611,6 +612,9 @@ failed_objs:
 failed_buf:
     buf_free(target_proc, b);
 failed:
+    LOGV("onirun: binder: transaction from pid %d failed (%s, code %u, data %llu, offsets %llu, sg %llu, ctx %s)\n", p->pid,
+         reply ? "reply" : "call", tr.code, (unsigned long long)tr.data_size, (unsigned long long)tr.offsets_size,
+         (unsigned long long)buffers_size, p->ctx->name);
     free(t);
     if (reply) {
         // The waiting caller gets the failure; we still owe ourselves a completion.

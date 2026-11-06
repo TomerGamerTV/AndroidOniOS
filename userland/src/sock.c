@@ -123,15 +123,57 @@ static void sock_release(FdObj *o) {
     free(s->q);
     free(s);
 }
+static int64_t netlink_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock);
 static const FdOps sock_ops = { "socket", NULL, NULL, NULL, NULL, sock_release };
+static const FdOps netlink_ops = { "socket", NULL, netlink_write, NULL, NULL, sock_release };
 
+static const FdOps netlink_ops;
 static Sock *sock_of(Proc *p, int gfd, int *host) {
     int h = fd_host(p, gfd);
     if (h < 0) return NULL;
     FdObj *o = fd_obj(h);
-    if (!o || o->ops != &sock_ops) return NULL;
+    if (!o || (o->ops != &sock_ops && o->ops != &netlink_ops)) return NULL;
     if (host) *host = h;
     return o->data;
+}
+
+// There is no kernel behind our netlink sockets, so every request gets an answer right away:
+// dumps are empty (NLMSG_DONE), GET requests fail with ENODEV, everything else is acknowledged.
+// Without this, request/response code (libnetlink users, ifaddrs, ...) would block forever.
+static void netlink_answer(Sock *s, const uint8_t *msg, size_t n) {
+    while (n >= 16) {
+        uint32_t len, seq, pid;
+        uint16_t type, flags;
+        memcpy(&len, msg, 4); memcpy(&type, msg + 4, 2); memcpy(&flags, msg + 6, 2); memcpy(&seq, msg + 8, 4); memcpy(&pid, msg + 12, 4);
+        if (len < 16 || len > n) break;
+        uint8_t reply[36] = {0};
+        uint32_t rlen;
+        if (flags & 0x300) {                             // NLM_F_DUMP: an empty list
+            rlen = 20;
+            uint16_t t = 3;                              // NLMSG_DONE
+            memcpy(reply + 4, &t, 2);
+            int32_t zero = 0;
+            memcpy(reply + 16, &zero, 4);
+        } else {
+            rlen = 36;                                   // NLMSG_ERROR + the request header
+            uint16_t t = 2;
+            memcpy(reply + 4, &t, 2);
+            int32_t err = (type % 4 == 2 && type >= 16) ? -19 : 0;   // RTM_GET*: ENODEV; others: ACK
+            memcpy(reply + 16, &err, 4);
+            memcpy(reply + 20, msg, 16);
+        }
+        memcpy(reply, &rlen, 4);
+        memcpy(reply + 8, &seq, 4);
+        memcpy(reply + 12, &pid, 4);
+        if (s->send_fd >= 0) write(s->send_fd, reply, rlen);
+        msg += (len + 3) & ~3u;
+        n -= (len + 3) & ~3u;
+    }
+}
+static int64_t netlink_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock) {
+    (void)c; (void)nonblock;
+    netlink_answer(o->data, buf, n);
+    return (int64_t)n;
 }
 
 static int host_type(int ltype) { return ltype == L_SOCK_STREAM ? SOCK_STREAM : SOCK_DGRAM; }
@@ -224,6 +266,7 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
         s->state = S_CONN;
         s->send_fd = sp[1];
         s->netlink = true;
+        s->o->ops = &netlink_ops;
         return g;
     }
     if (domain != L_AF_UNIX) return -EAFNOSUPPORT;
@@ -399,6 +442,7 @@ static int64_t do_sendto(GuestCtx *c, int gfd, uint64_t buf, uint64_t len, uint6
         close(d);
         return send_result(c, r, lflags);
     }
+    if (s->netlink) { netlink_answer(s, gptr(buf), len); return (int64_t)len; }
     return send_result(c, send(h, gptr(buf), len, host_msg_flags(lflags)), lflags);
 }
 
@@ -471,6 +515,16 @@ static int64_t do_sendmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
         ssize_t r = sendmsg(d, &hm, host_msg_flags(lflags));
         close(d);
         return send_result(c, r, lflags);
+    }
+    if (s->netlink) {
+        size_t total = 0;
+        for (uint64_t i = 0; i < m.iovlen; i++) total += iov[i].iov_len;
+        uint8_t *flat = malloc(total + 1);
+        size_t off = 0;
+        for (uint64_t i = 0; i < m.iovlen; i++) { memcpy(flat + off, iov[i].iov_base, iov[i].iov_len); off += iov[i].iov_len; }
+        netlink_answer(s, flat, total);
+        free(flat);
+        return (int64_t)total;
     }
     return send_result(c, sendmsg(h, &hm, host_msg_flags(lflags)), lflags);
 }

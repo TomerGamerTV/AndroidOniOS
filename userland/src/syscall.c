@@ -219,6 +219,15 @@ static uint64_t lx_fl(int f) {
 }
 
 // ---- structs ----
+// Device numbers for the nodes we emulate (libcutils compares /dev/ashmem's with the fd's).
+static uint64_t lx_makedev(unsigned ma, unsigned mi) { return ((uint64_t)(ma & 0xfff) << 8) | (mi & 0xff) | ((uint64_t)(mi & ~0xffu) << 12); }
+static uint64_t dev_rdev(const char *kind) {
+    if (!strncmp(kind, "ashmem", 6)) return lx_makedev(10, 259);
+    if (!strcmp(kind, "binder")) return lx_makedev(0, 0x1a);
+    if (!strcmp(kind, "kmsg")) return lx_makedev(1, 11);
+    return lx_makedev(1, 3);
+}
+
 // Android files belong to root except the shell user's own directories; bionic checks the owner of
 // files it maps (property areas), so the answer matters.
 static bool shell_owned(const char *gpath) {
@@ -235,7 +244,8 @@ static bool is_devnode(const char *gpath) {
 static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
     uint32_t owner = shell_owned(gpath) ? 2000 : 0;
     uint32_t mode = st->st_mode;
-    if (is_devnode(gpath) && S_ISREG(st->st_mode)) mode = S_IFCHR | 0666;   // placeholder files stand in for device nodes
+    uint64_t rdev = (uint64_t)st->st_rdev;
+    if (is_devnode(gpath) && S_ISREG(st->st_mode)) { mode = S_IFCHR | 0666; rdev = dev_rdev(gpath + 5); }   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};
     *(uint64_t *)(b + 0) = (uint64_t)st->st_dev;
     *(uint64_t *)(b + 8) = st->st_ino;
@@ -243,7 +253,7 @@ static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
     *(uint32_t *)(b + 20) = st->st_nlink;
     *(uint32_t *)(b + 24) = owner;
     *(uint32_t *)(b + 28) = owner;
-    *(uint64_t *)(b + 32) = (uint64_t)st->st_rdev;
+    *(uint64_t *)(b + 32) = (uint64_t)rdev;
     *(int64_t *)(b + 48) = st->st_size;
     *(int32_t *)(b + 56) = st->st_blksize;
     *(int64_t *)(b + 64) = st->st_blocks;
@@ -394,7 +404,7 @@ static void obj_stat_mode(int host, struct stat *st) {
     if (!o) return;
     const char *k = o->ops->name;
     if (!strcmp(k, "socket")) st->st_mode = S_IFSOCK | 0777;
-    else if (!strcmp(k, "binder") || !strcmp(k, "ashmem") || !strcmp(k, "kmsg")) st->st_mode = S_IFCHR | 0666;
+    else if (!strcmp(k, "binder") || !strcmp(k, "ashmem") || !strcmp(k, "kmsg")) { st->st_mode = S_IFCHR | 0666; st->st_rdev = (dev_t)dev_rdev(k); }
     else if (!strcmp(k, "procdir")) {}
     else st->st_mode = S_IFREG | 0600;                           // anon inodes (eventfd, epoll, timerfd...)
 }
@@ -610,7 +620,7 @@ void sys_dispatch(GuestCtx *c) {
         case 5: *(int16_t *)gptr(a2) = 2; r = 0; break;   // F_GETLK: unlocked
         case 6: case 7: r = 0; break;                     // F_SETLK(W): no other locker here
         case 1031: case 1032: r = 65536; break;           // F_SETPIPE_SZ / F_GETPIPE_SZ
-        case 1033: case 1034: r = 0; break;               // seals
+        case 1033: case 1034: r = OBJRET(vfs_memfd_seals(h, (int)a1, a2)); break;   // F_ADD_SEALS / F_GET_SEALS
         default: r = ERR(22);
         }
         break;

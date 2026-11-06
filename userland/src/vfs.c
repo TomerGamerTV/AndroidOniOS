@@ -272,13 +272,30 @@ int64_t vfs_timerfd_gettime(GuestCtx *c, int gfd, uint64_t curv) {
 // ---- memfd and ashmem ----
 typedef struct { char name[256]; uint32_t prot_mask; } Ashmem;
 
+// memfd: an unlinked host file plus the seal state (F_ADD_SEALS / F_GET_SEALS), which libcutils
+// uses to tell memfds from ashmem.
+static const FdOps memfd_ops = { "memfd", NULL, NULL, NULL, NULL, NULL };
 int64_t vfs_memfd(GuestCtx *c, const char *name, int lflags) {
     int fd = host_tmpfile();
     if (fd < 0) return -errno;
     char path[300];
     snprintf(path, sizeof path, "/memfd:%s", name);
     fd_set_path(fd, path);
-    return fd_install(c->proc, fd, 0, lflags & 1);  // MFD_CLOEXEC
+    FdObj *o = obj_new(&memfd_ops, NULL, false);
+    o->mmap_fd = dup(fd);
+    o->data = (void *)(uintptr_t)((lflags & 2) ? 0 : 1);   // without MFD_ALLOW_SEALING, F_SEAL_SEAL is set
+    return fd_install_obj(c->proc, fd, o, lflags & 1);      // MFD_CLOEXEC
+}
+
+// F_ADD_SEALS (1033) / F_GET_SEALS (1034). Returns VFS_PASS for fds that aren't memfds.
+int64_t vfs_memfd_seals(int host, int cmd, uint64_t arg) {
+    FdObj *o = fd_obj(host);
+    if (!o || o->ops != &memfd_ops) return -EINVAL;
+    uint64_t seals = (uintptr_t)o->data;
+    if (cmd == 1034) return (int64_t)seals;
+    if (seals & 1) return -EPERM;                           // F_SEAL_SEAL
+    o->data = (void *)(uintptr_t)(seals | (arg & 0x1f));
+    return 0;
 }
 
 static int64_t ashmem_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {

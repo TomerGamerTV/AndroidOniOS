@@ -1,6 +1,6 @@
 # onirun: macOS (Apple silicon) prototype of the user-mode Android runtime.
 OUT := ../build/userland
-SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/cpu.S
+SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/init.c src/cpu.S
 CFLAGS := -O2 -g -Wall -Wno-unused-function -std=gnu11 -fblocks
 
 $(OUT)/onirun: $(SRC) src/onx.h src/sys.h

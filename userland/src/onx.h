@@ -79,7 +79,7 @@ extern __thread GuestCtx *tr_cur;
 
 // syscall.c / proc.c
 void sys_init(const char *rootfs);
-__attribute__((noreturn)) void sys_main(const char *path, char **argv, char **envp, const char **sockets);
+__attribute__((noreturn)) void sys_main(const char *path, char **argv, char **envp, const char **sockets);   // path NULL: init mode
 void sys_dispatch(GuestCtx *c);
 void sys_deliver_signals(GuestCtx *c);          // may not return (thread leaves)
 void sys_abandoned(GuestCtx *c);                // a thread pulled out of translated code
