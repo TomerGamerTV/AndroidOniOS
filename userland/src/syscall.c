@@ -1001,6 +1001,39 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 53: case 52: case 54: case 55: case 88: case 452: r = 0; break;   // chmod/chown/utimens/fchmodat2: accept
+    case 72: {               // pselect6(n, readfds, writefds, exceptfds, timeout, sigmask): via poll
+        int n = (int)a0;
+        if (n < 0 || n > 1024) { r = ERR(22); break; }
+        uint64_t *sets[3] = { gptr(a1), gptr(a2), gptr(a3) };
+        struct pollfd hp[1024];
+        int map[1024], np = 0;
+        for (int fd = 0; fd < n; fd++) {
+            short ev = 0;
+            for (int k = 0; k < 3; k++) if (sets[k] && (sets[k][fd / 64] >> (fd % 64) & 1)) ev |= k == 0 ? POLLIN : k == 1 ? POLLOUT : POLLPRI;
+            if (!ev) continue;
+            int h = fd_host(p, fd);
+            if (h < 0) { np = -1; break; }
+            hp[np].fd = h; hp[np].events = ev; hp[np].revents = 0; map[np++] = fd;
+        }
+        if (np < 0) { r = ERR(9); break; }
+        int timeout = -1;
+        if (a4) { struct timespec *t = gptr(a4); timeout = (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000); }
+        int rc = poll(hp, (nfds_t)np, timeout);
+        if (rc < 0) { r = ERR(lx_errno(errno)); break; }
+        for (int k = 0; k < 3; k++) if (sets[k]) memset(sets[k], 0, (size_t)((n + 63) / 64) * 8);
+        int count = 0;
+        for (int i = 0; i < np; i++) {
+            int fd = map[i]; short re = hp[i].revents;
+            if (sets[0] && (re & (POLLIN | POLLHUP | POLLERR))) { sets[0][fd / 64] |= 1ull << (fd % 64); count++; }
+            if (sets[1] && (re & (POLLOUT | POLLERR))) { sets[1][fd / 64] |= 1ull << (fd % 64); count++; }
+            if (sets[2] && (re & POLLPRI)) { sets[2][fd / 64] |= 1ull << (fd % 64); count++; }
+        }
+        r = (uint64_t)count;
+        break;
+    }
+    case 227: r = HOSTRET(msync((void *)(uintptr_t)(c->base + UNTAG(a0)), a1, (a2 & 4 ? MS_SYNC : MS_ASYNC) | (a2 & 2 ? MS_INVALIDATE : 0))); break;   // msync
+    case 228: case 229: case 230: case 231: r = 0; break;   // mlock, munlock, mlockall, munlockall: memory is never paged out from under the guest
+    case 60: r = ERR(38); break;                            // quotactl: no quotas (quietly)
     case 73: {               // ppoll
         int timeout = -1;
         if (a2) { struct timespec *t = gptr(a2); timeout = (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000); }
