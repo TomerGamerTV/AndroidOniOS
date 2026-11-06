@@ -71,7 +71,7 @@ start gatekeeper
 service authsecret /apex/com.android.hardware.authsecret/bin/hw/android.hardware.authsecret-service.example
 service contexthub /apex/com.android.hardware.contexthub/bin/hw/android.hardware.contexthub-service.example
 service statsd /apex/com.android.os.statsd/bin/statsd
-  socket statsdw
+  socket statsdw dgram
 service gnss /vendor/bin/hw/android.hardware.gnss-service.ranchu
 service media.c2 /vendor/bin/hw/android.hardware.media.c2-service-goldfish
 start gnss

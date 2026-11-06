@@ -121,6 +121,7 @@ typedef void (*BuiltinAccept)(int host_fd, int peer_pid, void *arg);
 int  sock_builtin_stream(const char *guest_path, BuiltinAccept accept, void *arg);
 int  sock_builtin_dgram(const char *guest_path);           // returns the host fd that receives the datagrams
 int  sock_listen_for(struct Proc *p, const char *name);    // init-style socket for the first process: guest fd
+int  sock_dgram_for(struct Proc *p, const char *name);     // init-style datagram socket ("socket NAME dgram")
 
 // ---- /proc and /sys (procfs.c) ----
 int  procfs_open(struct Proc *p, const char *guest_path, int lflags);   // guest fd, -errno, or 1 = not ours

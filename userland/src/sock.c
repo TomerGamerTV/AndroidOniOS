@@ -366,6 +366,23 @@ static int64_t do_bind(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     return 0;
 }
 
+// A bound datagram socket handed to a process at startup (init's "socket NAME dgram", statsd's
+// statsdw): /dev/socket/<name> receives what clients send.
+int sock_dgram_for(Proc *p, const char *name) {
+    int sp[2];
+    if (socketpair_big(SOCK_DGRAM, sp)) return -errno;
+    fcntl(sp[1], F_SETFD, FD_CLOEXEC);
+    int g = sock_create(p, L_SOCK_DGRAM, sp[0], 0);
+    if (g < 0) { close(sp[1]); return g; }
+    Sock *s = sock_of(p, g, NULL);
+    snprintf(s->key, sizeof s->key, "/dev/socket/%s", name);
+    int e = name_add(s->key, s, NULL, NULL, -1);
+    if (e) { s->key[0] = 0; close(sp[1]); fd_close(p, g); return e; }
+    s->send_fd = sp[1];
+    s->state = S_BOUND;
+    return g;
+}
+
 static int64_t do_listen(GuestCtx *c, int gfd) {
     int h;
     Sock *s = sock_of(c->proc, gfd, &h);

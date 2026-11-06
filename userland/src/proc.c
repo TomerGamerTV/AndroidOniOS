@@ -1033,10 +1033,15 @@ static Proc *spawn(const char *path, char **argv, char **envp, const char **sock
     int ne = 0;
     for (; envp[ne] && ne < 200; ne++) env2[ne] = envp[ne];
     for (int i = 0; sockets && sockets[i] && ne < 250; i++) {
-        int g = sock_listen_for(p, sockets[i]);
-        if (g < 0) die("onirun: cannot create socket %s", sockets[i]);
-        char *kv = malloc(strlen(sockets[i]) + 40);
-        sprintf(kv, "ANDROID_SOCKET_%s=%d", sockets[i], g);
+        char name[64];
+        snprintf(name, sizeof name, "%s", sockets[i]);
+        char *colon = strchr(name, ':');                 // "name:dgram" from init's "socket name dgram"
+        bool dgram = colon && !strcmp(colon + 1, "dgram");
+        if (colon) *colon = 0;
+        int g = dgram ? sock_dgram_for(p, name) : sock_listen_for(p, name);
+        if (g < 0) die("onirun: cannot create socket %s", name);
+        char *kv = malloc(strlen(name) + 40);
+        sprintf(kv, "ANDROID_SOCKET_%s=%d", name, g);
         env2[ne++] = kv;
     }
     env2[ne] = NULL;

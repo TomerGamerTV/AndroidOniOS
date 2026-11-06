@@ -4,7 +4,7 @@
 // restarted unless marked oneshot; init.svc.<name> properties track their state.
 //
 //   service NAME /path/program args...     define a service
-//     socket NAME                          (after a service) create /dev/socket/NAME for it
+//     socket NAME [dgram]                  (after a service) create /dev/socket/NAME for it (stream listener, or datagram)
 //     oneshot                              (after a service) don't restart it when it exits
 //   interface IFACE NAME                   ctl.interface_start=IFACE starts service NAME
 //   start NAME                             start at boot, in order
@@ -164,8 +164,12 @@ bool init_start(const char *table_host_path, char **envp) {
             if (tail) tail->next = s; else svcs = s;
             tail = cur = s;
         } else if (!strcmp(kw, "socket") && cur) {
-            char *name = strtok_r(NULL, " \t", &save);
-            if (name && cur->nsockets < 7) cur->sockets[cur->nsockets++] = strdup(name);
+            char *name = strtok_r(NULL, " \t", &save), *type = strtok_r(NULL, " \t", &save);
+            if (name && cur->nsockets < 7) {
+                char buf[80];
+                snprintf(buf, sizeof buf, "%s%s", name, type && !strncmp(type, "dgram", 5) ? ":dgram" : "");
+                cur->sockets[cur->nsockets++] = strdup(buf);
+            }
         } else if (!strcmp(kw, "oneshot") && cur) {
             cur->oneshot = true;
         } else if (!strcmp(kw, "interface")) {
