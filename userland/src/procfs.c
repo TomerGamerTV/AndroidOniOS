@@ -12,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <zlib.h>
+
 #include "sys.h"
 
 // ---- generated files ----
@@ -220,6 +222,22 @@ static const FdOps attr_ops = { "proc-attr", attr_read, attr_write, NULL, NULL, 
 static int proc_open(Proc *p, const char *path, int lflags) {
     char buf[4096];
     int n = -1;
+    if (!strcmp(path, "/proc/config.gz")) {
+        // The kernel configuration, gzipped. system_server aborts if it can't read it (VMAP_STACK check).
+        static const char cfg[] =
+            "CONFIG_ARM64=y\nCONFIG_64BIT=y\nCONFIG_MMU=y\nCONFIG_SMP=y\nCONFIG_VMAP_STACK=y\nCONFIG_ANDROID_BINDER_IPC=y\n"
+            "CONFIG_ANDROID_BINDERFS=y\nCONFIG_ASHMEM=y\nCONFIG_BPF_SYSCALL=y\nCONFIG_CGROUP_BPF=y\nCONFIG_PSI=y\n"
+            "CONFIG_SECURITY_SELINUX=y\nCONFIG_STATIC_USERMODEHELPER=y\nCONFIG_ARM64_PAGE_SHIFT=14\nCONFIG_ARM64_16K_PAGES=y\n";
+        uint8_t gz[1024];
+        z_stream zs = {0};
+        if (deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY) != Z_OK) return -ENOMEM;
+        zs.next_in = (Bytef *)cfg; zs.avail_in = sizeof cfg - 1;
+        zs.next_out = gz; zs.avail_out = sizeof gz;
+        deflate(&zs, Z_FINISH);
+        size_t len = sizeof gz - zs.avail_out;
+        deflateEnd(&zs);
+        return serve_text(p, (const char *)gz, len, path, lflags);
+    }
     if (!strcmp(path, "/proc/net/psched")) n = snprintf(buf, sizeof buf, "000003e8 00000040 000f4240 3b9aca00\n");
     else if (!strcmp(path, "/proc/filesystems")) n = snprintf(buf, sizeof buf, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tselinuxfs\nnodev\tdevpts\n\text4\n\tfuse\n");
     else if (!strcmp(path, "/proc/version")) n = snprintf(buf, sizeof buf, "Linux version 6.6.0-oni (onirun) #1 SMP PREEMPT\n");

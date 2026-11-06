@@ -154,6 +154,7 @@ typedef struct Proc {
     uint32_t uid, gid;        // real ids (getuid); zygote preloads with euid 9999 and ruid 0
     uint32_t euid, egid;      // effective ids: credentials seen by binder, sockets and files
     uint32_t caps[6];         // capget/capset v3 data: effective, permitted, inheritable (low, high)
+    struct SigExtra sigx[65]; // POSIX timer details of process-directed pending signals
     uint32_t groups[32];
     int ngroups;
     int nepoll;               // epoll fds open, so close() knows whether to scan them
@@ -201,6 +202,7 @@ __attribute__((noreturn)) void proc_exit_group(GuestCtx *c, int status);
 uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint64_t rusage);
 uint64_t proc_kill(GuestCtx *c, int64_t pid, int sig);
 uint64_t proc_waitid(GuestCtx *c, int idtype, int64_t id, uint64_t infop, int options);
+uint64_t proc_timer_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);   // timer_create & co.
 uint64_t proc_pidfd_open(GuestCtx *c, int64_t pid, int flags);
 uint64_t proc_tgkill(GuestCtx *c, int64_t tgid, int64_t tid, int sig);
 uint64_t proc_sigsuspend(GuestCtx *c, uint64_t mask);   // sets x0 itself

@@ -1121,6 +1121,7 @@ void sys_dispatch(GuestCtx *c) {
         r = (uint64_t)count;
         break;
     }
+    case 107: case 108: case 109: case 110: case 111: r = proc_timer_call(c, nr, a0, a1, a2, a3); break;   // POSIX timers
     case 227: r = HOSTRET(msync((void *)(uintptr_t)(c->base + UNTAG(a0)), a1, (a2 & 4 ? MS_SYNC : MS_ASYNC) | (a2 & 2 ? MS_INVALIDATE : 0))); break;   // msync
     case 228: case 229: case 230: case 231: r = 0; break;   // mlock, munlock, mlockall, munlockall: memory is never paged out from under the guest
     case 60: r = ERR(38); break;                            // quotactl: no quotas (quietly)

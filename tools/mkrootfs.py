@@ -198,6 +198,53 @@ def main():
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)
+    # Every "mkdir /data/..." (and /metadata, /mnt) in the image's init scripts, with owner and mode:
+    # daemons expect init to have made them (bluetooth died on a missing /data/misc/bluedroid).
+    import glob, pwd as _pwd  # noqa: F401  (owner names come from Android's AID table below)
+    aid = {'root': 0, 'system': 1000, 'radio': 1001, 'bluetooth': 1002, 'graphics': 1003, 'input': 1004,
+           'audio': 1005, 'camera': 1006, 'log': 1007, 'compass': 1008, 'mount': 1009, 'wifi': 1010,
+           'adb': 1011, 'install': 1012, 'media': 1013, 'dhcp': 1014, 'sdcard_rw': 1015, 'vpn': 1016,
+           'keystore': 1017, 'usb': 1018, 'drm': 1019, 'mdnsr': 1020, 'gps': 1021, 'media_rw': 1023,
+           'mtp': 1024, 'nfc': 1027, 'sdcard_r': 1028, 'clat': 1029, 'loop_radio': 1030, 'mediadrm': 1031,
+           'package_info': 1032, 'sdcard_pics': 1033, 'sdcard_av': 1034, 'sdcard_all': 1035, 'logd': 1036,
+           'shared_relro': 1037, 'dbus': 1038, 'tlsdate': 1039, 'mediaex': 1040, 'audioserver': 1041,
+           'metrics_coll': 1042, 'metricsd': 1043, 'webserv': 1044, 'debuggerd': 1045, 'mediacodec': 1046,
+           'cameraserver': 1047, 'firewall': 1048, 'trunks': 1049, 'nvram': 1050, 'dns': 1051, 'dns_tether': 1052,
+           'webview_zygote': 1053, 'vehicle_network': 1054, 'media_audio': 1055, 'media_video': 1056,
+           'media_image': 1057, 'tombstoned': 1058, 'media_obb': 1059, 'ese': 1060, 'ota_update': 1061,
+           'automotive_evs': 1062, 'lowpan': 1063, 'hsm': 1064, 'reserved_disk': 1065, 'statsd': 1066,
+           'incidentd': 1067, 'secure_element': 1068, 'lmkd': 1069, 'llkd': 1070, 'iorapd': 1071,
+           'gpu_service': 1072, 'network_stack': 1073, 'gsid': 1074, 'fsverity_cert': 1075, 'credstore': 1076,
+           'external_storage': 1077, 'ext_data_rw': 1078, 'ext_obb_rw': 1079, 'context_hub': 1080,
+           'virtualizationservice': 1081, 'artd': 1082, 'uwb': 1083, 'thread_network': 1084, 'diced': 1085,
+           'dmesgd': 1086, 'jc_weaver': 1087, 'jc_strongbox': 1088, 'jc_identitycred': 1089, 'sdk_sandbox': 1090,
+           'security_log_writer': 1091, 'prng_seeder': 1092, 'uprobestats': 1093, 'cros_ec': 1094,
+           'mmd': 1095, 'update_engine_log': 1096, 'shell': 2000, 'cache': 2001, 'diag': 2002,
+           'net_bt_admin': 3001, 'net_bt': 3002, 'inet': 3003, 'net_raw': 3004, 'net_admin': 3005,
+           'net_bw_stats': 3006, 'net_bw_acct': 3007, 'readproc': 3009, 'wakelock': 3010, 'uhid': 3011,
+           'readtracefs': 3012, 'everybody': 9997, 'misc': 9998, 'nobody': 9999}
+    made = 0
+    rcs = []
+    for base in ('system/etc/init', 'system_ext/etc/init', 'product/etc/init', 'vendor/etc/init'):
+        rcs += glob.glob(os.path.join(R, base, '**', '*.rc'), recursive=True)
+    rcs += [f for f in glob.glob(os.path.join(R, 'apex', '*', 'etc', '*.rc')) if '@' not in f]
+    for rc in sorted(rcs):
+        for line in open(rc, errors='replace'):
+            f = line.split()
+            if len(f) < 2 or f[0] != 'mkdir' or not f[1].startswith(('/data/', '/metadata/', '/mnt/')) or '$' in f[1]:
+                continue
+            path = os.path.join(R, f[1].lstrip('/'))
+            if os.path.islink(path):
+                continue
+            os.makedirs(path, exist_ok=True)
+            made += 1
+            mode = int(f[2], 8) if len(f) > 2 and f[2].isdigit() else 0o755
+            uid = aid.get(f[3], 0) if len(f) > 3 else 0
+            gid = aid.get(f[4], uid) if len(f) > 4 else uid
+            for k, v in (('user.oni.mode', f'{mode:o}'), ('user.oni.uid', str(uid)), ('user.oni.gid', str(gid))):
+                subprocess.run(['xattr', '-w', k, v, path], check=True)
+    print(made, 'directories from the init scripts')
+
     # As init does: /data/user/0 is the primary user's view of /data/data
     u0 = os.path.join(R, 'data/user/0')
     if os.path.isdir(u0) and not os.path.islink(u0) and not os.listdir(u0):

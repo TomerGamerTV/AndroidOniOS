@@ -44,6 +44,7 @@ typedef struct GuestCtx {
     char name[16];
     struct GuestCtx *next_thread;
     uint64_t magic;                // CTX_MAGIC while the context is live (catches double frees)
+    struct SigExtra { int32_t code, timerid; uint64_t value; } sigx[65];   // POSIX timer details of pending signals
 } GuestCtx;
 #define CTX_MAGIC 0x6f6e697275e7c7c7ull
 

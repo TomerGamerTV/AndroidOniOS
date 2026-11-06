@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <dispatch/dispatch.h>
+
 #include "sys.h"
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -447,7 +449,12 @@ static void push_signal(GuestCtx *c, int sig, uint64_t saved_mask, int code, uin
     memset(f, 0, FRAME_SIZE);
     *(int32_t *)f = sig;                                   // siginfo.si_signo
     *(int32_t *)(f + 8) = code;                            // si_code
-    if (sig == 11 || sig == 7 || sig == 4 || sig == 8 || sig == 5) *(uint64_t *)(f + 16) = addr;   // si_addr
+    struct SigExtra *x = c->sigx[sig].code ? &c->sigx[sig] : p->sigx[sig].code ? &p->sigx[sig] : NULL;
+    if (x && code == 0) {                                  // a POSIX timer: SI_TIMER, timer id, overrun, sigev_value
+        *(int32_t *)(f + 8) = x->code; *(int32_t *)(f + 16) = x->timerid; *(int32_t *)(f + 20) = 0; *(uint64_t *)(f + 24) = x->value;
+        x->code = 0;
+    }
+    else if (sig == 11 || sig == 7 || sig == 4 || sig == 8 || sig == 5) *(uint64_t *)(f + 16) = addr;   // si_addr
     else { *(int32_t *)(f + 16) = p->pid; *(uint32_t *)(f + 20) = p->uid; }                          // si_pid, si_uid
     uint8_t *uc = f + 128;
     *(uint64_t *)(uc + 40) = saved_mask;                   // uc_sigmask
@@ -563,9 +570,15 @@ int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct
                 uint8_t *si = gptr(info);
                 memset(si, 0, 128);
                 *(int32_t *)si = sig;
-                *(int32_t *)(si + 8) = 0;                      // SI_USER
-                *(int32_t *)(si + 16) = p->pid;
-                *(uint32_t *)(si + 20) = p->uid;
+                struct SigExtra *x = c->sigx[sig].code ? &c->sigx[sig] : p->sigx[sig].code ? &p->sigx[sig] : NULL;
+                if (x) {                                       // SI_TIMER: bionic's SIGEV_THREAD helper checks it
+                    *(int32_t *)(si + 8) = x->code; *(int32_t *)(si + 16) = x->timerid; *(uint64_t *)(si + 24) = x->value;
+                    x->code = 0;
+                } else {
+                    *(int32_t *)(si + 8) = 0;                  // SI_USER
+                    *(int32_t *)(si + 16) = p->pid;
+                    *(uint32_t *)(si + 20) = p->uid;
+                }
             }
             r = sig;
             break;
@@ -732,6 +745,7 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     nc->clear_child_tid = (flags & L_CLONE_CHILD_CLEARTID) ? ctid : 0;
     nc->altstack_sp = nc->altstack_size = 0;
     nc->waitset = 0;
+    memset(nc->sigx, 0, sizeof nc->sigx);
     if (flags & L_CLONE_SETTLS) nc->tpidr = tls;
     if (newsp) nc->sp = newsp;
 
@@ -1131,4 +1145,123 @@ void proc_dump_all(void) {
     }
     pthread_mutex_unlock(&g_lock);
     binder_dump();
+}
+
+// ---- POSIX timers (timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete) ----
+// libdispatch timers that post the chosen signal with SI_TIMER details, to the process
+// (SIGEV_SIGNAL) or one thread (SIGEV_THREAD_ID, which bionic's SIGEV_THREAD timers use).
+typedef struct PTimer {
+    int id, pid, sig, notify;
+    uint64_t tid, value;
+    int64_t interval_ns, deadline_ns;
+    dispatch_source_t src;
+    struct PTimer *next;
+} PTimer;
+static PTimer *ptimers;            // g_lock
+static int next_timer_id = 1;
+static int64_t mono_ns(void) { return (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+
+static void ptimer_fire(PTimer *t) {
+    pthread_mutex_lock(&g_lock);
+    Proc *p = proc_find(t->pid);
+    if (p && t->notify != 1) {                                          // SIGEV_NONE: nothing to deliver
+        GuestCtx *th = NULL;
+        if (t->notify == 4) for (GuestCtx *x = p->threads; x; x = x->next_thread) if (x->tid == t->tid) th = x;
+        struct SigExtra *x = th ? &th->sigx[t->sig] : &p->sigx[t->sig];
+        x->code = -2; x->timerid = t->id; x->value = t->value;          // SI_TIMER
+        post_signal_locked(p, th, t->sig);
+    }
+    t->deadline_ns = t->interval_ns ? mono_ns() + t->interval_ns : 0;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static PTimer *ptimer_find_locked(Proc *p, int id) {
+    for (PTimer *t = ptimers; t; t = t->next) if (t->pid == p->pid && t->id == id) return t;
+    return NULL;
+}
+
+static void ptimer_disarm(PTimer *t) {
+    if (t->src) { dispatch_source_cancel(t->src); dispatch_release(t->src); t->src = NULL; }
+    t->deadline_ns = 0;
+}
+
+uint64_t proc_timer_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    Proc *p = c->proc;
+    uint64_t r = 0;
+    pthread_mutex_lock(&g_lock);
+    switch (nr) {
+    case 107: {                                                         // timer_create(clock, sigevent *, timer_t *id)
+        const uint8_t *ev = a1 ? gptr(a1) : NULL;
+        PTimer *t = calloc(1, sizeof *t);
+        t->pid = p->pid;
+        t->id = next_timer_id++;
+        t->sig = 14;                                                    // NULL sigevent: SIGALRM to the process
+        t->notify = 0;
+        t->value = (uint64_t)t->id;
+        if (ev) {                                                       // sigev_value 0, signo 8, notify 12, tid 16
+            memcpy(&t->value, ev, 8);
+            int32_t signo, notify, tid;
+            memcpy(&signo, ev + 8, 4); memcpy(&notify, ev + 12, 4); memcpy(&tid, ev + 16, 4);
+            t->sig = signo; t->notify = notify; t->tid = (uint64_t)tid;
+            if (notify != 1 && (signo < 1 || signo > 64)) { free(t); r = ERR(22); break; }
+        }
+        t->next = ptimers;
+        ptimers = t;
+        *(int32_t *)gptr(a2) = t->id;
+        break;
+    }
+    case 110: {                                                         // timer_settime(id, flags, new, old)
+        PTimer *t = ptimer_find_locked(p, (int)a0);
+        if (!t) { r = ERR(22); break; }
+        const int64_t *it = gptr(a2);                                   // it_interval, it_value
+        if (a3) {
+            int64_t *o = gptr(a3), rem = t->deadline_ns ? t->deadline_ns - mono_ns() : 0;
+            if (rem < 0) rem = 0;
+            o[0] = t->interval_ns / 1000000000; o[1] = t->interval_ns % 1000000000; o[2] = rem / 1000000000; o[3] = rem % 1000000000;
+        }
+        ptimer_disarm(t);
+        int64_t interval = it[0] * 1000000000 + it[1], value = it[2] * 1000000000 + it[3];
+        t->interval_ns = interval;
+        if (value) {
+            int64_t delay = value;
+            if (a1 & 1) {                                               // TIMER_ABSTIME (against realtime, as timerfd here)
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                delay = value - ((int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec);
+                if (delay < 0) delay = 0;
+            }
+            t->deadline_ns = mono_ns() + delay;
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
+            dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, delay), interval ? (uint64_t)interval : DISPATCH_TIME_FOREVER, 500000);
+            PTimer *tt = t;
+            dispatch_source_set_event_handler(src, ^{ ptimer_fire(tt); });
+            t->src = src;
+            dispatch_resume(src);
+        }
+        break;
+    }
+    case 108: {                                                         // timer_gettime(id, cur)
+        PTimer *t = ptimer_find_locked(p, (int)a0);
+        if (!t) { r = ERR(22); break; }
+        int64_t *o = gptr(a1), rem = t->deadline_ns ? t->deadline_ns - mono_ns() : 0;
+        if (rem < 0) rem = 0;
+        o[0] = t->interval_ns / 1000000000; o[1] = t->interval_ns % 1000000000; o[2] = rem / 1000000000; o[3] = rem % 1000000000;
+        break;
+    }
+    case 109: r = ptimer_find_locked(p, (int)a0) ? 0 : ERR(22); break; // timer_getoverrun: never overrun
+    case 111: {                                                         // timer_delete(id)
+        for (PTimer **pp = &ptimers; *pp; pp = &(*pp)->next)
+            if ((*pp)->pid == p->pid && (*pp)->id == (int)a0) {
+                PTimer *t = *pp; *pp = t->next;
+                // The handler may be about to run: cancel, and free only after cancellation completes.
+                if (t->src) { dispatch_source_t src = t->src; t->src = NULL; dispatch_source_set_cancel_handler(src, ^{ free(t); }); dispatch_source_cancel(src); dispatch_release(src); }
+                else free(t);
+                goto deleted;
+            }
+        r = ERR(22);
+    deleted:
+        break;
+    }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return r;
 }
