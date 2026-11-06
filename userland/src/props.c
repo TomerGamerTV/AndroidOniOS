@@ -128,10 +128,12 @@ static const char *pinfo_ctx(const char *name) {
         if (entry_ctx(pu32(node)) != ~0u) ctx = entry_ctx(pu32(node));
         rem = sep + 1;
     }
+    // Exact entries hang off the node of the last component and carry just that component's name
+    // (property_info_parser compares them with remaining_name).
     uint32_t ne = pu32(node + 20), ea = pu32(node + 24);
     for (uint32_t i = 0; i < ne; i++) {
         uint32_t e = pu32(ea + 4 * i);
-        if (!strcmp(name, entry_name(e))) { ctx = entry_ctx(e); break; }
+        if (!strcmp(rem, entry_name(e))) { ctx = entry_ctx(e); break; }
     }
     if (ctx == ~0u) return NULL;
     uint32_t coff = pu32(12), nctx = pu32(coff), carr = coff + 4;   // count, then string offsets
