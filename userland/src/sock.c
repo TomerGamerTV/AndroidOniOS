@@ -6,7 +6,10 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#define __APPLE_USE_RFC_3542 1
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -389,6 +392,7 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     int h;
     Sock *s = sock_of(c->proc, gfd, &h);
     if (!s) return -ENOTSOCK;
+    if (s->netlink) return 0;                              // connect() to the kernel: nothing to do
     if (s->vsock) {
         // The emulator's host serves qemud pipes on vsock port 5000 (libqemupipe's VsockPort::Data):
         // the connected socket becomes a goldfish pipe. Nothing listens on any other port.
@@ -677,9 +681,212 @@ static int64_t do_name(GuestCtx *c, int gfd, uint64_t addr, uint64_t lenp, bool 
     return 0;
 }
 
-int64_t sock_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+
+// ---- IP sockets: host sockets, with Linux <-> BSD translation of addresses, options and flags ----
+#define L_AF_INET 2
+#define L_AF_INET6 10
+static const FdOps inet_ops = { "inet", NULL, NULL, NULL, NULL, NULL };
+typedef struct { int domain, type; } InetSock;
+
+static InetSock *inet_of(Proc *p, int gfd, int *host) {
+    int h = fd_host(p, gfd);
+    FdObj *o = h >= 0 ? fd_obj(h) : NULL;
+    if (!o || o->ops != &inet_ops) return NULL;
+    if (host) *host = h;
+    return o->data;
+}
+
+// Linux sockaddr (u16 family first) -> BSD (u8 len, u8 family). Returns the BSD length or -errno.
+static int sa_in(uint64_t addr, uint64_t len, struct sockaddr_storage *out) {
+    const uint8_t *a = gptr(addr);
+    if (!a || len < 2) return -EINVAL;
+    uint16_t fam; memcpy(&fam, a, 2);
+    memset(out, 0, sizeof *out);
+    if (fam == L_AF_INET) {
+        if (len < 8) return -EINVAL;
+        struct sockaddr_in *sin = (struct sockaddr_in *)out;
+        sin->sin_len = sizeof *sin; sin->sin_family = AF_INET;
+        memcpy(&sin->sin_port, a + 2, 2); memcpy(&sin->sin_addr, a + 4, 4);
+        return sizeof *sin;
+    }
+    if (fam == L_AF_INET6) {
+        if (len < 24) return -EINVAL;
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+        s6->sin6_len = sizeof *s6; s6->sin6_family = AF_INET6;
+        memcpy(&s6->sin6_port, a + 2, 2); memcpy(&s6->sin6_flowinfo, a + 4, 4); memcpy(&s6->sin6_addr, a + 8, 16);
+        if (len >= 28) memcpy(&s6->sin6_scope_id, a + 24, 4);
+        return sizeof *s6;
+    }
+    if (fam == 0) { out->ss_len = 2; out->ss_family = AF_UNSPEC; return 2; }   // connect(AF_UNSPEC): dissolve
+    return -EAFNOSUPPORT;
+}
+
+// BSD sockaddr -> Linux, written to the guest (addr, *lenp) like the kernel (truncating).
+static void sa_out(const struct sockaddr *sa, uint64_t addr, uint64_t lenp) {
+    if (!addr || !lenp) return;
+    uint8_t b[28] = {0};
+    uint32_t n = 0;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const void *)sa;
+        uint16_t f = L_AF_INET; memcpy(b, &f, 2); memcpy(b + 2, &sin->sin_port, 2); memcpy(b + 4, &sin->sin_addr, 4); n = 16;
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const void *)sa;
+        uint16_t f = L_AF_INET6; memcpy(b, &f, 2); memcpy(b + 2, &s6->sin6_port, 2); memcpy(b + 4, &s6->sin6_flowinfo, 4);
+        memcpy(b + 8, &s6->sin6_addr, 16); memcpy(b + 24, &s6->sin6_scope_id, 4); n = 28;
+    }
+    uint32_t have; memcpy(&have, gptr(lenp), 4);
+    memcpy(gptr(addr), b, have < n ? have : n);
+    memcpy(gptr(lenp), &n, 4);
+}
+
+// Socket options: (level, name) Linux -> host. Returns false for options the host lacks.
+static bool opt_map(int level, int opt, int *hl, int *ho) {
+    static const int sol[][2] = { {2, SO_REUSEADDR}, {3, SO_TYPE}, {4, SO_ERROR}, {6, SO_BROADCAST}, {7, SO_SNDBUF},
+        {8, SO_RCVBUF}, {9, SO_KEEPALIVE}, {10, SO_OOBINLINE}, {13, SO_LINGER}, {15, SO_REUSEPORT}, {18, SO_RCVLOWAT},
+        {19, SO_SNDLOWAT}, {20, SO_RCVTIMEO}, {21, SO_SNDTIMEO}, {66, SO_RCVTIMEO}, {67, SO_SNDTIMEO}, {29, SO_TIMESTAMP} };
+    static const int ip[][2] = { {1, IP_TOS}, {2, IP_TTL}, {3, IP_HDRINCL}, {8, IP_RECVTTL}, {32, IP_MULTICAST_IF},
+        {33, IP_MULTICAST_TTL}, {34, IP_MULTICAST_LOOP}, {35, IP_ADD_MEMBERSHIP}, {36, IP_DROP_MEMBERSHIP} };
+    static const int ip6[][2] = { {16, IPV6_UNICAST_HOPS}, {17, IPV6_MULTICAST_IF}, {18, IPV6_MULTICAST_HOPS},
+        {19, IPV6_MULTICAST_LOOP}, {20, IPV6_JOIN_GROUP}, {21, IPV6_LEAVE_GROUP}, {26, IPV6_V6ONLY},
+        {49, IPV6_RECVPKTINFO}, {67, IPV6_TCLASS} };
+    static const int tcp[][2] = { {1, TCP_NODELAY}, {2, TCP_MAXSEG}, {4, TCP_KEEPALIVE}, {5, TCP_KEEPINTVL}, {6, TCP_KEEPCNT} };
+    const int (*t)[2] = NULL; size_t n = 0;
+    if (level == 1) { t = sol; n = sizeof sol / sizeof *sol; *hl = SOL_SOCKET; }
+    else if (level == 0) { t = ip; n = sizeof ip / sizeof *ip; *hl = IPPROTO_IP; }
+    else if (level == 41) { t = ip6; n = sizeof ip6 / sizeof *ip6; *hl = IPPROTO_IPV6; }
+    else if (level == 6) { t = tcp; n = sizeof tcp / sizeof *tcp; *hl = IPPROTO_TCP; }
+    for (size_t i = 0; i < n; i++) if (t[i][0] == opt) { *ho = t[i][1]; return true; }
+    return false;
+}
+
+static int64_t inet_socket(GuestCtx *c, int domain, int type, int protocol) {
+    int t = type & 0xf;
+    int ht = t == 1 ? SOCK_STREAM : t == 2 ? SOCK_DGRAM : t == 3 ? SOCK_RAW : -1;
+    if (ht < 0) return -EPROTONOSUPPORT;
+    if (ht == SOCK_RAW) return -EPERM;                     // raw sockets need privileges the host won't give
+    int h = socket(domain == L_AF_INET ? AF_INET : AF_INET6, ht, protocol == 1 || protocol == 58 ? protocol : 0);
+    if (h < 0) return -errno;
+    int one = 1;
+    setsockopt(h, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    fcntl(h, F_SETFD, FD_CLOEXEC);
+    if (type & L_SOCK_NONBLOCK) fcntl(h, F_SETFL, O_NONBLOCK);
+    InetSock *is = calloc(1, sizeof *is);
+    is->domain = domain; is->type = t;
+    FdObj *o = obj_new(&inet_ops, is, false);
+    char path[32];
+    snprintf(path, sizeof path, "socket:[%d]", h);
+    fd_set_path(h, path);
+    return fd_install_obj(c->proc, h, o, type & L_SOCK_CLOEXEC);
+}
+
+static int64_t inet_call(GuestCtx *c, InetSock *is, int h, uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    int n;
     switch (nr) {
-    case 198: return do_socket(c, (int)a0, (int)a1, (int)a2);
+    case 200: case 203:                                   // bind, connect
+        if ((n = sa_in(a1, a2, &ss)) < 0) return n;
+        if (nr == 200) return bind(h, (struct sockaddr *)&ss, (socklen_t)n) ? -errno : 0;
+        return connect(h, (struct sockaddr *)&ss, (socklen_t)n) ? -errno : 0;
+    case 201: return listen(h, (int)a1) ? -errno : 0;
+    case 202: case 242: {                                 // accept, accept4
+        int nh = accept(h, (struct sockaddr *)&ss, &sl);
+        if (nh < 0) return -errno;
+        sa_out((struct sockaddr *)&ss, a1, a2);
+        int one = 1;
+        setsockopt(nh, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        fcntl(nh, F_SETFD, FD_CLOEXEC);
+        if (nr == 242 && (a3 & L_SOCK_NONBLOCK)) fcntl(nh, F_SETFL, O_NONBLOCK);
+        InetSock *ns = calloc(1, sizeof *ns);
+        *ns = *is;
+        return fd_install_obj(c->proc, nh, obj_new(&inet_ops, ns, false), nr == 242 && (a3 & L_SOCK_CLOEXEC));
+    }
+    case 204: case 205:                                   // getsockname, getpeername
+        if ((nr == 204 ? getsockname(h, (struct sockaddr *)&ss, &sl) : getpeername(h, (struct sockaddr *)&ss, &sl))) return -errno;
+        sa_out((struct sockaddr *)&ss, a1, a2);
+        return 0;
+    case 206: {                                           // sendto
+        ssize_t r;
+        if (a4) { if ((n = sa_in(a4, a5, &ss)) < 0) return n; r = sendto(h, gptr(a1), a2, host_msg_flags(a3), (struct sockaddr *)&ss, (socklen_t)n); }
+        else r = send(h, gptr(a1), a2, host_msg_flags(a3));
+        return r < 0 ? -errno : r;
+    }
+    case 207: {                                           // recvfrom
+        ssize_t r = recvfrom(h, gptr(a1), a2, host_msg_flags(a3), (struct sockaddr *)&ss, &sl);
+        if (r < 0) return -errno;
+        if (a4 && sl) sa_out((struct sockaddr *)&ss, a4, a5);
+        else if (a5) memset(gptr(a5), 0, 4);
+        return r;
+    }
+    case 208: case 209: {                                 // setsockopt, getsockopt (a1 level, a2 name, a3 val, a4 len/lenp)
+        int hl, ho;
+        if (!opt_map((int)a1, (int)a2, &hl, &ho)) {
+            // SO_MARK, SO_BINDTODEVICE, SO_PROTOCOL, IP_PKTINFO...: accepted; reads report what we can
+            if (nr == 208) return 0;
+            int32_t v = 0;
+            if (a1 == 1 && a2 == 38) v = is->type == 1 ? 6 : 17;          // SO_PROTOCOL
+            else if (a1 == 1 && a2 == 39) v = is->domain;                // SO_DOMAIN
+            else return -ENOPROTOOPT;
+            memcpy(gptr(a3), &v, 4); uint32_t four = 4; memcpy(gptr(a4), &four, 4);
+            return 0;
+        }
+        if (nr == 208) {
+            int r = setsockopt(h, hl, ho, gptr(a3), (socklen_t)a4);
+            return r && (hl != SOL_SOCKET) ? 0 : r ? -errno : 0;          // IP-level options the host refuses: ignored
+        }
+        uint8_t buf[64];
+        socklen_t bl = sizeof buf;
+        if (getsockopt(h, hl, ho, buf, &bl)) return -errno;
+        if (hl == SOL_SOCKET && ho == SO_TYPE) { int32_t v = is->type; memcpy(buf, &v, 4); bl = 4; }
+        uint32_t want; memcpy(&want, gptr(a4), 4);
+        memcpy(gptr(a3), buf, want < bl ? want : bl);
+        memcpy(gptr(a4), &bl, 4);
+        return 0;
+    }
+    case 210: return shutdown(h, (int)a1) ? -errno : 0;
+    case 211: case 212: {                                 // sendmsg, recvmsg: data and names; control messages dropped
+        LxMsg m;
+        get_msg(a1, &m);
+        if (m.iovlen > 1024) return -EMSGSIZE;
+        struct iovec iov[1024];
+        const uint64_t *gi = gptr(m.iov);
+        for (uint64_t i = 0; i < m.iovlen; i++) { iov[i].iov_base = gptr(gi[2 * i]); iov[i].iov_len = gi[2 * i + 1]; }
+        struct msghdr hm = { .msg_iov = iov, .msg_iovlen = (int)m.iovlen };
+        if (nr == 211) {
+            if (m.name) { if ((n = sa_in(m.name, m.namelen, &ss)) < 0) return n; hm.msg_name = &ss; hm.msg_namelen = (socklen_t)n; }
+            ssize_t r = sendmsg(h, &hm, host_msg_flags(a2));
+            return r < 0 ? -errno : r;
+        }
+        hm.msg_name = &ss; hm.msg_namelen = sizeof ss;
+        ssize_t r = recvmsg(h, &hm, host_msg_flags(a2));
+        if (r < 0) return -errno;
+        uint8_t *gm = gptr(a1);
+        if (m.name && hm.msg_namelen) {
+            uint8_t out[28] = {0}; uint32_t on = 0;
+            if (ss.ss_family == AF_INET) { const struct sockaddr_in *sin = (void *)&ss; uint16_t f = L_AF_INET; memcpy(out, &f, 2); memcpy(out + 2, &sin->sin_port, 2); memcpy(out + 4, &sin->sin_addr, 4); on = 16; }
+            else if (ss.ss_family == AF_INET6) { const struct sockaddr_in6 *s6 = (void *)&ss; uint16_t f = L_AF_INET6; memcpy(out, &f, 2); memcpy(out + 2, &s6->sin6_port, 2); memcpy(out + 4, &s6->sin6_flowinfo, 4); memcpy(out + 8, &s6->sin6_addr, 16); memcpy(out + 24, &s6->sin6_scope_id, 4); on = 28; }
+            memcpy(gptr(m.name), out, m.namelen < on ? m.namelen : on);
+            memcpy(gm + 8, &on, 4);
+        } else memset(gm + 8, 0, 4);
+        uint64_t zero = 0; memcpy(gm + 40, &zero, 8);       // no control messages
+        int32_t of = (hm.msg_flags & MSG_TRUNC) ? L_MSG_TRUNC : 0;
+        memcpy(gm + 48, &of, 4);
+        return r;
+    }
+    }
+    return -EOPNOTSUPP;
+}
+
+int64_t sock_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (nr != 198 && nr != 199) {
+        int ih;
+        InetSock *is = inet_of(c->proc, (int)a0, &ih);
+        if (is) return inet_call(c, is, ih, nr, a1, a2, a3, a4, a5);
+    }
+    switch (nr) {
+    case 198:
+        if ((int)a0 == L_AF_INET || (int)a0 == L_AF_INET6) return inet_socket(c, (int)a0, (int)a1, (int)a2);
+        return do_socket(c, (int)a0, (int)a1, (int)a2);
     case 199: return do_socketpair(c, (int)a0, (int)a1, a3);
     case 200: return do_bind(c, (int)a0, a1, a2);
     case 201: return do_listen(c, (int)a0);
