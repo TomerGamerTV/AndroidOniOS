@@ -53,6 +53,7 @@ int mm_unmap(Mm *m, uint64_t addr, uint64_t len);
 int mm_protect(Mm *m, uint64_t addr, uint64_t len, int prot);
 int mm_dontneed(Mm *m, uint64_t addr, uint64_t len);
 int64_t mm_remap(Mm *m, uint64_t old, uint64_t oldsz, uint64_t newsz, int flags, uint64_t newaddr);
+int64_t mm_map_host(Mm *m, uint64_t addr, uint64_t len, int prot, void *host, const char *path);
 uint64_t mm_exec_end(Mm *m, uint64_t pc);
 void mm_symbolize(Mm *m, uint64_t addr, char *out, size_t n);
 bool mm_readable(Mm *m, uint64_t addr, uint64_t len);
@@ -69,6 +70,8 @@ typedef struct FdOps {
     int64_t (*ioctl)(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg);
     void (*mapped)(FdObj *o, GuestCtx *c, uint64_t gaddr, uint64_t len, int prot, uint64_t off);
     void (*release)(FdObj *o);
+    // Optional: the object maps itself (GPU buffers). Returns the guest address or -errno.
+    int64_t (*mmap)(FdObj *o, GuestCtx *c, uint64_t addr, uint64_t len, int prot, int lflags, uint64_t off);
 } FdOps;
 struct FdObj {
     const FdOps *ops;
@@ -76,6 +79,7 @@ struct FdObj {
     int rd, wr;               // readiness pipe (-1 if the host fd is something else)
     int mmap_fd;              // host fd to mmap for this object, -1 = not mappable
     bool map_shared;          // map it MAP_SHARED even if the guest asked for private
+    uint64_t size;            // reported by fstat/lseek(SEEK_END) when nonzero (dma-bufs)
     bool ready;
     pthread_mutex_t lock;
     void *data;
@@ -123,6 +127,9 @@ int  init_control(const char *what, const char *arg);      // ctl.<what>=<arg>
 // ---- system properties (props.c) ----
 void props_init(void);
 int  props_set(const char *name, const char *value);     // 0 or a PROP_ERROR_* code
+
+// ---- virtio-gpu over rutabaga/gfxstream (virtgpu.c) ----
+int  gpu_open(struct Proc *p, bool card, int lflags);     // /dev/dri/renderD128 (render) or card0 (KMS)
 
 // ---- binder (binder.c) ----
 int  binder_open(struct Proc *p, const char *context, int lflags);   // guest fd or -errno

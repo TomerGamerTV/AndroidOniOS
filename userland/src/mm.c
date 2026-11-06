@@ -332,6 +332,30 @@ out:
     return r;
 }
 
+// Maps host memory (a GPU buffer the host owns) into the window at a free guest address, sharing
+// the pages. Returns the guest address or a negative errno.
+int64_t mm_map_host(Mm *m, uint64_t addr, uint64_t len, int prot, void *host, const char *path) {
+    len = PG_UP(len);
+    if (!len || ((uintptr_t)host & (PG - 1))) return -EINVAL;
+    int64_t r;
+    pthread_mutex_lock(&m->lock);
+    addr &= ~(PG - 1);
+    if (!(addr >= MMAP_MIN && addr + len <= WIN_SIZE && vma_free(m, addr, addr + len))) addr = vma_gap(m, len);
+    if (!addr) { r = -ENOMEM; goto out; }
+    mach_vm_address_t dst = (mach_vm_address_t)(uintptr_t)(m->base + addr);
+    vm_prot_t cur, max;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)host, FALSE, &cur, &max, VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS) { r = -ENOMEM; goto out; }
+    if (mprotect(m->base + addr, len, host_prot(prot))) { r = -lx_errno(errno); goto out; }
+    vma_cut(m, addr, addr + len);
+    vma_insert(m, (Vma){ addr, addr + len, 0, prot, true, false, path ? strdup(path) : NULL });
+    r = (int64_t)addr;
+out:
+    pthread_mutex_unlock(&m->lock);
+    return r;
+}
+
 // ---- queries ----
 uint64_t mm_exec_end(Mm *m, uint64_t pc) {
     pthread_mutex_lock(&m->lock);

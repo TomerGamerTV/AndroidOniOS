@@ -1,11 +1,16 @@
 # onirun: macOS (Apple silicon) prototype of the user-mode Android runtime.
 OUT := ../build/userland
-SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/init.c src/cpu.S
-CFLAGS := -O2 -g -Wall -Wno-unused-function -std=gnu11 -fblocks
+SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/init.c src/virtgpu.c src/cpu.S
+CFLAGS := -O2 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -I../build/sysroot-macos/include -Isrc/uapi
+# The GPU is the host's gfxstream/rutabaga (the QEMU app's libraries, built into build/sysroot-macos).
+GFXLIBS := ../build/sysroot-macos/lib/librutabaga_gfx_ffi.a ../build/sysroot-macos/lib/libgfxstream_backend.a
+FRAMEWORKS := -framework Foundation -framework CoreFoundation -framework AppKit -framework Cocoa -framework CoreVideo \
+              -framework IOKit -framework IOSurface -framework Metal -framework QuartzCore -framework OpenGL
+LDLIBS := $(GFXLIBS) $(FRAMEWORKS) -lc++ -lz
 
 $(OUT)/onirun: $(SRC) src/onx.h src/sys.h
 	@mkdir -p $(OUT)
-	clang $(CFLAGS) -o $@ $(SRC)
+	clang $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 	codesign -s - -f $@
 
 clean:

@@ -116,7 +116,7 @@ def main():
     data/misc/credstore data/misc/appcompat data/misc/apns data/misc/emergencynumberdb data/misc/sdksandbox
     data/misc/threadnetwork data/misc/uprobestats data/misc/aconfig_flags data/misc/connectivityblobdb
     data/misc/odsign data/misc/virtualizationservice data/misc/oem_lock data/misc/bootstat data/misc/keychain
-    data/misc/ota data/misc/adbd data/misc/system_server data/misc/securitylog dev/socket dev/__properties__
+    data/misc/ota data/misc/adbd data/misc/system_server data/misc/securitylog data/misc/surfaceflinger data/misc/gpu dev/dri dev/socket dev/__properties__
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)

@@ -40,3 +40,11 @@ service gatekeeper /apex/com.android.hardware.gatekeeper/bin/hw/android.hardware
 service vibrator /apex/com.android.hardware.vibrator/bin/hw/android.hardware.vibrator-service.example
 start vibrator
 start gatekeeper
+
+# graphics: gralloc (minigbm over virtio-gpu), the composer, SurfaceFlinger
+service allocator /vendor/bin/hw/android.hardware.graphics.allocator-service.minigbm
+service hwcomposer /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu
+service surfaceflinger /system/bin/surfaceflinger
+start allocator
+start hwcomposer
+start surfaceflinger

@@ -225,6 +225,8 @@ static uint64_t dev_rdev(const char *kind) {
     if (!strncmp(kind, "ashmem", 6)) return lx_makedev(10, 259);
     if (!strcmp(kind, "binder")) return lx_makedev(0, 0x1a);
     if (!strcmp(kind, "kmsg")) return lx_makedev(1, 11);
+    if (!strcmp(kind, "dri/card0") || !strcmp(kind, "drm-card")) return lx_makedev(226, 0);
+    if (!strcmp(kind, "dri/renderD128") || !strcmp(kind, "drm-render")) return lx_makedev(226, 128);
     return lx_makedev(1, 3);
 }
 
@@ -238,7 +240,7 @@ static bool shell_owned(const char *gpath) {
 static bool is_devnode(const char *gpath) {
     return gpath && !strncmp(gpath, "/dev/", 5) && strncmp(gpath, "/dev/__properties__", 19) &&
            strncmp(gpath, "/dev/socket", 11) && !strchr(gpath + 5, '/') ? true :
-           gpath && !strncmp(gpath, "/dev/binderfs/", 14);
+           gpath && (!strncmp(gpath, "/dev/binderfs/", 14) || !strncmp(gpath, "/dev/dri/", 9));
 }
 
 static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
@@ -404,9 +406,10 @@ static void obj_stat_mode(int host, struct stat *st) {
     if (!o) return;
     const char *k = o->ops->name;
     if (!strcmp(k, "socket")) st->st_mode = S_IFSOCK | 0777;
-    else if (!strcmp(k, "binder") || !strcmp(k, "ashmem") || !strcmp(k, "kmsg")) { st->st_mode = S_IFCHR | 0666; st->st_rdev = (dev_t)dev_rdev(k); }
+    else if (!strcmp(k, "binder") || !strcmp(k, "ashmem") || !strcmp(k, "kmsg") || !strncmp(k, "drm-", 4)) { st->st_mode = S_IFCHR | 0666; st->st_rdev = (dev_t)dev_rdev(k); }
     else if (!strcmp(k, "procdir")) {}
     else st->st_mode = S_IFREG | 0600;                           // anon inodes (eventfd, epoll, timerfd...)
+    if (o->size) st->st_size = (off_t)o->size;
 }
 
 // "/proc/<pid>/fd/N" or "/proc/self/fd/N" -> the host fd behind it (true if the path is one).
@@ -500,7 +503,13 @@ void sys_dispatch(GuestCtx *c) {
     }
     case 67: h = HFD(a0); r = HOSTRET(pread(h, gptr(a1), a2, (off_t)a3)); break;
     case 68: h = HFD(a0); r = HOSTRET(pwrite(h, gptr(a1), a2, (off_t)a3)); break;
-    case 62: h = HFD(a0); r = HOSTRET(lseek(h, (off_t)a1, (int)a2)); break;
+    case 62: {
+        h = HFD(a0);
+        FdObj *o = fd_obj(h);
+        if (o && o->size) { r = a2 == 2 ? o->size + a1 : a2 == 0 ? a1 : 0; break; }   // objects with a size: SEEK_END/SET
+        r = HOSTRET(lseek(h, (off_t)a1, (int)a2));
+        break;
+    }
     case 71: {   // sendfile(out, in, *offset, count)
         int ho = HFD(a0), hi = HFD(a1);
         char buf[65536];
@@ -660,6 +669,7 @@ void sys_dispatch(GuestCtx *c) {
         else {
             h = HFD(a4);
             FdObj *o = fd_obj(h);
+            if (o && o->ops->mmap) { r = OBJRET(o->ops->mmap(o, c, a0, a1, (int)(a2 & 7), (int)a3, a5)); break; }
             if (o && o->mmap_fd < 0) { r = ERR(19); break; }          // ENODEV: not mappable
             int mfd = o ? o->mmap_fd : h;
             int fl = (int)a3 | (o && o->map_shared ? LX_MAP_SHARED : 0);
