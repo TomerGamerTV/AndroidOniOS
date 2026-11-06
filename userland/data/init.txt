@@ -21,6 +21,8 @@ service aconfigd /system/bin/aconfigd-system start-socket
   socket aconfigd_system
 service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
   socket aconfigd_mainline
+# stand-ins for daemons the host can't run (userland/stubs/stubsvc.c)
+service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver vold=android.os.IVold
 service idmap2d /system/bin/idmap2d
 service lmkd /system/bin/lmkd
   socket lmkd
@@ -35,6 +37,7 @@ start aconfigd-init
 start aconfigd-mainline-init
 start aconfigd
 start aconfigd-mainline
+start stubs
 start lmkd
 start tombstoned
 start keystore2

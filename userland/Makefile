@@ -43,3 +43,13 @@ check: $(OUT)/onirun tests
 	@$(RUN) /system/bin/sh /data/local/tmp/shell.sh 2>/dev/null | tail -3
 	@$(RUN) /system/bin/sh /data/local/tmp/service.sh 2>/dev/null | tail -3
 	@$(RUN) /system/bin/sh /data/local/tmp/art.sh 2>/dev/null | tail -3
+
+# Guest-side stand-in services (userland/stubs), built with the NDK against the image's libraries
+# and installed into the rootfs by mkrootfs.py (or by hand: cp to rootfs/system/bin/).
+STUB_OUT := ../build/userland/stubs
+ROOTFS ?= ../build/userland/rootfs
+stubs: $(STUB_OUT)/onistub
+$(STUB_OUT)/onistub: stubs/stubsvc.c
+	@mkdir -p $(STUB_OUT)
+	$(NDK_CC) -O2 -Wall -Wl,-z,max-page-size=16384 -L$(ROOTFS)/system/lib64 -Wl,--allow-shlib-undefined -o $@ $< -lbinder_ndk -llog
+	cp $@ $(ROOTFS)/system/bin/onistub
