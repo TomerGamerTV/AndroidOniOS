@@ -76,6 +76,8 @@ struct BNode {
     uint32_t flags;
     int internal_strong, local_strong, local_weak, nrefs;
     bool has_strong, has_weak, pending_strong, pending_weak, queued, dead;
+    bool async_busy;          // a oneway transaction to this node is with its owner (until BC_FREE_BUFFER)
+    struct { struct BWork *head, *tail; } async_todo;   // further oneway transactions, delivered in order
     BRef *refs;               // all references to this node
     struct BNode *next;       // in proc->nodes
 };
@@ -109,6 +111,7 @@ struct BBuf {                 // a slice of the receiver's mapped area
     // objects translated into this buffer, undone when it is freed
     struct { uint32_t type; BNode *node; BRef *ref; int fd; } *objs;
     int nobjs;
+    BNode *async_node;        // oneway transaction's target: freeing the buffer lets the next one through
     BBuf *next;
 };
 
@@ -222,7 +225,7 @@ static void node_check(BNode *n) {   // queues node work to its owner if its use
 }
 
 static void node_free_if_unused(BNode *n) {
-    if (n->refs || n->internal_strong || n->local_strong || n->local_weak || n->queued) return;
+    if (n->refs || n->internal_strong || n->local_strong || n->local_weak || n->queued || n->async_busy || n->async_todo.head) return;
     if (n->proc) {
         for (BNode **pp = &n->proc->nodes; *pp; pp = &(*pp)->next) if (*pp == n) { *pp = n->next; break; }
         if (n->proc->ctx->mgr == n) n->proc->ctx->mgr = NULL;
@@ -326,6 +329,7 @@ static BBuf *buf_alloc(BProc *p, uint64_t size) {
 static void buf_free(BProc *p, BBuf *b) {
     b->free = true;
     b->t = NULL;
+    b->async_node = NULL;
     free(b->objs);
     b->objs = NULL;
     b->nobjs = 0;
@@ -637,6 +641,13 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
     queue_thread(th, done);
     BWork *w = work_new(W_TRANSACTION);
     w->t = t;
+    if (!t->need_reply && target_node) {
+        // Like the driver: oneway transactions to one node run one at a time, in order. The next is
+        // released when the receiver frees this one's buffer (ClientTransactions depend on it).
+        b->async_node = target_node;
+        if (target_node->async_busy) { work_push((WorkList *)&target_node->async_todo, w); return; }
+        target_node->async_busy = true;
+    }
     if (target_thread) queue_thread(target_thread, w);
     else queue_proc(target_proc, w);
     return;
@@ -689,8 +700,15 @@ static int do_write(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t s
             if (b) {
                 if (b->t && b->t->flags & TF_CLEAR_BUF) memset(p->buf_host + b->off, 0, b->size);
                 if (b->t) b->t->buf = NULL;
+                BNode *an = b->async_node;
+                b->async_node = NULL;
                 buf_release_objs(p, b);
                 buf_free(p, b);
+                if (an) {
+                    BWork *next = work_pop((WorkList *)&an->async_todo);
+                    if (next && an->proc && !an->proc->dead) queue_proc(an->proc, next);
+                    else { if (next) { if (next->t) trans_free(next->t); free(next); } an->async_busy = false; node_free_if_unused(an); }
+                }
             }
             break;
         }
