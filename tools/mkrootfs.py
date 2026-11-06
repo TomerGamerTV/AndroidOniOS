@@ -148,6 +148,8 @@ def main():
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)
+    # A fresh fstrim stamp: without vold, PackageManager's periodic fstrim would NPE in system_server.
+    open(os.path.join(R, 'data/system/last-fstrim'), 'a').close()
     # cgroup trees (controllers from /system/etc/cgroups.json; the groups from task_profiles.json)
     groups = ['', 'application', 'application/background', 'application/performance', 'background', 'camera-daemon',
               'dex2oat', 'foreground', 'foreground_window', 'nnapi-hal', 'restricted', 'rt', 'system', 'system-background',
