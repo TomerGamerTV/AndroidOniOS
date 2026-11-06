@@ -43,7 +43,9 @@ typedef struct GuestCtx {
     void *altstack;
     char name[16];
     struct GuestCtx *next_thread;
+    uint64_t magic;                // CTX_MAGIC while the context is live (catches double frees)
 } GuestCtx;
+#define CTX_MAGIC 0x6f6e697275e7c7c7ull
 
 #define CTX_X(n) ((n) * 8)
 #define CTX_SP 248

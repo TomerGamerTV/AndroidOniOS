@@ -227,6 +227,7 @@ static void *thread_main(void *arg) {
 }
 
 static int thread_spawn_locked(GuestCtx *c) {
+    c->magic = CTX_MAGIC;
     c->altstack = malloc(ALTSTACK_SIZE);
     pthread_attr_t at;
     pthread_attr_init(&at);
@@ -260,7 +261,14 @@ __attribute__((noreturn)) static void thread_leave(GuestCtx *c) {
     tr_leave();
     stack_t ss = { .ss_flags = SS_DISABLE };
     sigaltstack(&ss, NULL);
+    if (c->magic != CTX_MAGIC || (c->host_thread && (pthread_t)c->host_thread != pthread_self())) {
+        fprintf(stderr, "onirun: thread_leave: bad context %p (magic %llx, tid %llu, owner %p, self %p); not freeing it\n",
+                (void *)c, (unsigned long long)c->magic, (unsigned long long)c->tid, c->host_thread, (void *)pthread_self());
+        pthread_exit(NULL);
+    }
+    c->magic = 0;
     free(c->altstack);
+    c->altstack = NULL;
     free(c);
     pthread_exit(NULL);
 }

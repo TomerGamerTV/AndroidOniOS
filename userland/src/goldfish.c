@@ -103,6 +103,36 @@ static int64_t gp_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool n
 static void gp_release(FdObj *o) { GPipe *g = o->data; free(g->out); free(g); }
 static const FdOps gp_ops = { "goldfish-pipe", gp_read, gp_write, NULL, NULL, gp_release };
 
+// /dev/tun: a TUN device with nothing behind it. TUNSETIFF names the interface, packets written
+// to it are dropped and nothing ever arrives (the Thread network stack opens one at boot).
+static int64_t tun_read(FdObj *o, GuestCtx *c, void *buf, size_t n, bool nonblock) {
+    (void)c; (void)buf; (void)n;
+    int r = obj_wait(o->rd, POLLIN, nonblock);
+    return r ? r : 0;
+}
+static int64_t tun_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock) { (void)o; (void)c; (void)buf; (void)nonblock; return (int64_t)n; }
+static int64_t tun_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
+    (void)o;
+    uint8_t *ifr = arg ? (uint8_t *)(uintptr_t)(c->base + UNTAG(arg)) : NULL;
+    switch (req & 0xffff) {
+    case 0x54ca:                                       // TUNSETIFF: struct ifreq { char name[16]; short flags; }
+        if (ifr && !ifr[0]) memcpy(ifr, "tun0", 5);
+        return 0;
+    case 0x54d2:                                       // TUNGETIFF
+        if (ifr) memcpy(ifr, "tun0", 5);
+        return 0;
+    default:
+        return 0;                                      // TUNSETPERSIST, TUNSETOWNER, offload flags...
+    }
+}
+static const FdOps tun_ops = { "tun", tun_read, tun_write, tun_ioctl, NULL, NULL };
+int tun_open(Proc *p, const char *path, int lflags) {
+    FdObj *o = obj_new(&tun_ops, NULL, true);
+    if (!o) return -ENFILE;
+    fd_set_path(o->rd, path);
+    return fd_install_obj(p, o->rd, o, lflags & 02000000);
+}
+
 int goldfish_pipe_open(Proc *p, const char *path, int lflags) {
     FdObj *o = obj_new(&gp_ops, calloc(1, sizeof(GPipe)), true);
     if (!o) return -ENFILE;
