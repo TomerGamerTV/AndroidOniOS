@@ -136,6 +136,7 @@ typedef struct Proc {
     char exe[1024];
     char cmdline[512];        // argv, NUL-separated, for /proc/<pid>/cmdline
     size_t cmdline_len;
+    uint64_t stack_start;     // initial sp, reported as startstack in /proc/<pid>/stat
     mode_t umask;
     uint64_t sigact[65][4];   // Linux struct sigaction: handler, flags, restorer, mask
     volatile uint64_t pending;   // process-directed signals
@@ -174,6 +175,7 @@ uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint
 uint64_t proc_kill(GuestCtx *c, int64_t pid, int sig);
 uint64_t proc_tgkill(GuestCtx *c, int64_t tgid, int64_t tid, int sig);
 uint64_t proc_sigsuspend(GuestCtx *c, uint64_t mask);   // sets x0 itself
+int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct timespec *timeout);
 void proc_sigreturn(GuestCtx *c);
 int  proc_deliverable(GuestCtx *c);                   // a pending signal with a handler, or 0
 void proc_raise(GuestCtx *c, int sig);                // thread-directed, from the syscall layer

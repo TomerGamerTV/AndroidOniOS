@@ -30,12 +30,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: onirun [-v] --root ROOTFS /guest/program [args...]\n");
         return 2;
     }
-    char *envp[] = {
+    // The guest environment: Android's defaults, plus classpath variables from the host
+    // environment when set (init derives them from /system/etc/classpaths on a device).
+    char *envp[64] = {
         "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system/xbin",
         "ANDROID_ROOT=/system", "ANDROID_DATA=/data", "ANDROID_ART_ROOT=/apex/com.android.art",
         "ANDROID_I18N_ROOT=/apex/com.android.i18n", "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
-        "HOME=/data", "TMPDIR=/data/local/tmp", "SHELL=/system/bin/sh", NULL,
+        "HOME=/data", "TMPDIR=/data/local/tmp", "SHELL=/system/bin/sh",
     };
+    int ne = 9;
+    const char *pass[] = { "BOOTCLASSPATH", "DEX2OATBOOTCLASSPATH", "SYSTEMSERVERCLASSPATH", "STANDALONE_SYSTEMSERVER_JARS",
+                           "ANDROID_SOCKET_zygote", "ANDROID_SOCKET_usap_pool_primary", "TERM", NULL };
+    for (int k = 0; pass[k] && ne < 63; k++) {
+        const char *v = getenv(pass[k]);
+        if (!v) continue;
+        char *kv = malloc(strlen(pass[k]) + strlen(v) + 2);
+        sprintf(kv, "%s=%s", pass[k], v);
+        envp[ne++] = kv;
+    }
+    envp[ne] = NULL;
     tr_init();
     sys_init(root);
     sys_main(argv[i], argv + i, envp);

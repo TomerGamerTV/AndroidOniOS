@@ -15,8 +15,15 @@ clean:
 NDK_CC := ../build/ndk-dl/android-ndk-r27d/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang
 TEST_OUT := ../build/userland/rootfs/data/local/tmp
 TESTS := $(patsubst tests/%.c,$(TEST_OUT)/%,$(wildcard tests/*.c)) \
-         $(patsubst tests/%.sh,$(TEST_OUT)/%.sh,$(wildcard tests/*.sh))
+         $(patsubst tests/%.sh,$(TEST_OUT)/%.sh,$(wildcard tests/*.sh)) \
+         $(TEST_OUT)/hello.dex $(TEST_OUT)/bench.dex $(TEST_OUT)/android-env.sh
 tests: $(TESTS)
+$(TEST_OUT)/hello.dex: ../tools/mkdex.py
+	python3 -I $< $@ hello
+$(TEST_OUT)/bench.dex: ../tools/mkdex.py
+	python3 -I $< $@ bench
+$(TEST_OUT)/android-env.sh: data/android-env.sh
+	cp $< $@
 $(TEST_OUT)/%: tests/%.c
 	@mkdir -p $(TEST_OUT)
 	$(NDK_CC) -O2 -Wall -Wno-inline-asm -Wl,-z,max-page-size=16384 -o $@ $<
@@ -30,3 +37,4 @@ check: $(OUT)/onirun tests
 	@for t in threads procs blocked rewrite ipc binder; do $(RUN) /data/local/tmp/$$t 2>/dev/null | tail -1; done
 	@$(RUN) /system/bin/sh /data/local/tmp/shell.sh 2>/dev/null | tail -3
 	@$(RUN) /system/bin/sh /data/local/tmp/service.sh 2>/dev/null | tail -3
+	@$(RUN) /system/bin/sh /data/local/tmp/art.sh 2>/dev/null | tail -3

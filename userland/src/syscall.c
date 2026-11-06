@@ -624,10 +624,32 @@ void sys_dispatch(GuestCtx *c) {
     }
     case 139: proc_sigreturn(c); return;          // rt_sigreturn: registers come from the frame
     case 133: proc_sigsuspend(c, *(uint64_t *)gptr(a0)); return;
-    case 132:                 // sigaltstack: report none (handlers run on the normal stack)
-        if (a1) { memset(gptr(a1), 0, 24); *(int32_t *)((char *)gptr(a1) + 8) = 2; }
+    case 132: {               // sigaltstack: stack_t { void *ss_sp; int ss_flags; size_t ss_size; }
+        bool on_alt = c->altstack_size && c->sp > c->altstack_sp && c->sp <= c->altstack_sp + c->altstack_size;
+        if (a1) {
+            uint8_t *old = gptr(a1);
+            memset(old, 0, 24);
+            *(uint64_t *)old = c->altstack_sp;
+            *(int32_t *)(old + 8) = c->altstack_size ? (on_alt ? 1 : 0) : 2;   // SS_ONSTACK / SS_DISABLE
+            *(uint64_t *)(old + 16) = c->altstack_size;
+        }
+        if (a0) {
+            const uint8_t *ns = gptr(a0);
+            int32_t fl = *(int32_t *)(ns + 8);
+            uint64_t sz = *(uint64_t *)(ns + 16);
+            if (on_alt) { r = ERR(1); break; }                              // EPERM while running on it
+            if (fl & 2) { c->altstack_sp = c->altstack_size = 0; }          // SS_DISABLE
+            else if (sz < 2048) { r = ERR(12); break; }                      // ENOMEM: too small
+            else { c->altstack_sp = *(uint64_t *)ns; c->altstack_size = sz; }
+        }
         r = 0;
         break;
+    }
+    case 137: {               // rt_sigtimedwait(set, info, timeout, sigsetsize)
+        int64_t v = proc_sigtimedwait(c, *(uint64_t *)gptr(a0), a1, a2 ? gptr(a2) : NULL);
+        r = v < 0 ? ERR(lx_errno((int)-v)) : (uint64_t)v;
+        break;
+    }
     case 167:                 // prctl
         switch (a0) {
         case 15: snprintf(c->name, sizeof c->name, "%s", gstr(a1)); r = 0; break;          // PR_SET_NAME
@@ -837,8 +859,31 @@ void sys_dispatch(GuestCtx *c) {
         r = 0;
         break;
     case 91: r = 0; break;          // capset
+    case 270: case 271: {           // process_vm_readv / writev: only within this process
+        if ((int64_t)(int32_t)a0 != p->pid) { r = ERR(1); break; }
+        struct iovec *lv = iov_in(a1, a2), *rv = iov_in(a3, a4);
+        if (!lv || !rv) { free(lv); free(rv); r = ERR(22); break; }
+        uint64_t done = 0;
+        size_t li = 0, loff = 0;
+        for (uint64_t i = 0; i < a4 && li < a2; i++) {
+            uint64_t raddr = ((uint64_t *)gptr(a3))[2 * i], rlen = rv[i].iov_len;
+            for (uint64_t off = 0; off < rlen && li < a2;) {
+                size_t n = rlen - off;
+                if (n > lv[li].iov_len - loff) n = lv[li].iov_len - loff;
+                if (!mm_readable(p->mm, raddr + off, n)) goto vm_done;
+                if (nr == 270) memcpy((uint8_t *)lv[li].iov_base + loff, (uint8_t *)rv[i].iov_base + off, n);
+                else memcpy((uint8_t *)rv[i].iov_base + off, (uint8_t *)lv[li].iov_base + loff, n);
+                off += n; loff += n; done += n;
+                if (loff == lv[li].iov_len) { li++; loff = 0; }
+            }
+        }
+    vm_done:
+        free(lv); free(rv);
+        r = done ? done : ERR(14);
+        break;
+    }
     case 283: r = 0; break;         // membarrier
-    case 293: case 435: case 291: r = ERR(38); break;   // rseq, clone3, statx
+    case 293: case 435: case 291: case 282: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd
     case 281:                       // execveat(dirfd, path, argv, envp, flags)
         if (gstr(a1)[0] != '/') { r = ERR(38); break; }
         a0 = a1; a1 = a2; a2 = a3;
@@ -871,6 +916,7 @@ int sys_emulate(GuestCtx *c, uint64_t pc, uint32_t insn) {
         uint64_t v = 0;
         if (op1 == 0 && crn == 0 && crm == 0 && op2 == 0) v = 0x611f0220;   // MIDR_EL1
         if (op1 == 0 && crn == 0 && crm == 0 && op2 == 5) v = 0x80000000;   // MPIDR_EL1
+        if (op1 == 3 && crn == 0 && crm == 0 && op2 == 1) v = 0x8444c004;   // CTR_EL0: 64-byte lines, PIPT
         if (t != 31) c->x[t] = v;
         return 0;
     }

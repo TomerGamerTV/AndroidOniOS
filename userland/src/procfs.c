@@ -98,8 +98,10 @@ static int proc_open(Proc *p, const char *path, int lflags) {
                          b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, t->nthreads);
         } else if (!strcmp(rest, "/stat")) {
             const char *b = strrchr(t->exe, '/');
-            n = snprintf(buf, sizeof buf, "%d (%.15s) R %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                         t->pid, b ? b + 1 : t->exe, t->ppid, t->pgid, t->sid, t->nthreads);
+            // ... num_threads itrealvalue starttime vsize rss rsslim startcode endcode startstack ...
+            n = snprintf(buf, sizeof buf, "%d (%.15s) R %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 %d 0 0 %llu 0 18446744073709551615 0 0 %llu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                         t->pid, b ? b + 1 : t->exe, t->ppid, t->pgid, t->sid, t->nthreads, (unsigned long long)WIN_SIZE,
+                         (unsigned long long)t->stack_start);
         } else if (!strcmp(rest, "/oom_score_adj") || !strcmp(rest, "/oom_adj")) n = snprintf(buf, sizeof buf, "0\n");
         else if (!strcmp(rest, "/timerslack_ns")) n = snprintf(buf, sizeof buf, "50000\n");
         else if (!strcmp(rest, "/maps") || !strcmp(rest, "/smaps")) {

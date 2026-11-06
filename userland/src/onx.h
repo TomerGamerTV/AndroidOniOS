@@ -31,9 +31,12 @@ typedef struct GuestCtx {
     uint64_t tid;
     uint64_t clear_child_tid;
     uint64_t sigmask;
+    uint64_t altstack_sp, altstack_size;   // sigaltstack, per thread
+    volatile uint64_t waitset;     // signals this thread is blocked in rt_sigtimedwait for
     volatile uint64_t pending;     // signals sent to this thread (tgkill)
     volatile int kill;             // set by another thread: leave now (exit_group, exec, fatal signal)
     int fault_sig;                 // Linux signal when translated code faulted
+    int fault_code;                // its si_code
     uint64_t fault_addr;           // guest address of that fault
     void *host_thread;             // pthread_t
     void *altstack;
@@ -60,7 +63,8 @@ enum { EXIT_DIRECT = 1, EXIT_INDIRECT = 2, EXIT_SYSCALL = 3, EXIT_EMULATE = 4, E
 
 // cpu.S
 void onx_enter(GuestCtx *ctx, void *host_code);
-void onx_exit_common(void);
+void onx_exit_common(void);     // guest x0/x1 already saved in the context
+void onx_exit_spilled(void);    // guest x0/x1 at [sp-32]
 void onx_abandon(void);        // x0 = ctx: leave translated code without saving guest state
 extern uint64_t onx_tsd_off;   // byte offset of our context slot in the Darwin TSD
 
@@ -78,10 +82,10 @@ void sys_init(const char *rootfs);
 __attribute__((noreturn)) void sys_main(const char *path, char **argv, char **envp);
 void sys_dispatch(GuestCtx *c);
 void sys_deliver_signals(GuestCtx *c);          // may not return (thread leaves)
-__attribute__((noreturn)) void sys_abandoned(GuestCtx *c);
+void sys_abandoned(GuestCtx *c);                // a thread pulled out of translated code
 int  sys_emulate(GuestCtx *c, uint64_t pc, uint32_t insn); // 0 = handled
 uint64_t sys_code_end(GuestCtx *c, uint64_t pc);           // end of the executable mapping at pc, 0 = none
-void sys_fault(GuestCtx *c, int sig, uint64_t addr);       // a guest fault outside translated code
+void sys_fault(GuestCtx *c, int sig, int code, uint64_t addr);   // deliver or die
 
 __attribute__((noreturn, format(printf, 1, 2))) void die(const char *fmt, ...);
 extern int g_verbose;

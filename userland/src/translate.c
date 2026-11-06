@@ -8,6 +8,7 @@
 // Instructions that read sp as a value subtract the base, and instructions that write it add the
 // base.
 #include <errno.h>
+#include <execinfo.h>
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -32,7 +33,7 @@ _Static_assert(IB_SIZE == (0x40u << 12), "the inline probe subtracts #0x40, lsl 
 #define CACHE_SIZE (512u << 20)
 #define CHUNK_WORDS ((1u << 20) / 4)
 #define NCHUNKS (CACHE_SIZE / (CHUNK_WORDS * 4))
-#define TRAMP_WORDS 6
+#define TRAMP_WORDS 12            // two trampolines: exit stubs (x0/x1 in ctx) and the branch probe miss (x0/x1 at [sp-32])
 #define MAX_BLOCK_INSNS 256
 #define BLOCK_RESERVE (MAX_BLOCK_INSNS * 32 + 64)
 
@@ -43,12 +44,23 @@ static pthread_mutex_t tr_lock = PTHREAD_MUTEX_INITIALIZER;
 __thread GuestCtx *tr_cur;
 
 // ---- translation spaces (one per address space) ----
+// For precise faults: where each guest instruction's host code starts, and which guest registers
+// were borrowed (spilled below sp) while a memory instruction naming x16/x17/x18 ran.
+typedef struct Borrow { uint16_t start, end; uint8_t nt, t[4]; } Borrow;
 typedef struct Block {
     uint64_t pc;
     uint32_t *host;
     uint32_t *host_end;
+    uint16_t *imap;           // host word offset of each guest instruction
+    int ninsn;
+    Borrow *borrows;
+    int nborrows;
     struct Block *next;
 } Block;
+static uint16_t cur_imap[MAX_BLOCK_INSNS + 1];
+static Borrow cur_borrows[MAX_BLOCK_INSNS];
+static int cur_nborrows;
+static uint32_t *cur_start;
 // Exit records give the dispatcher the target of a direct branch and the stub to patch.
 typedef struct ExitRec { uint64_t target; uint32_t *patch; struct ExitRec *next; } ExitRec;
 typedef struct EmuRec { uint64_t pc; uint32_t insn; struct EmuRec *next; } EmuRec;
@@ -61,7 +73,7 @@ typedef struct TrSpace {
     ExitRec *exits;
     EmuRec *emus;
     int *chunks, nchunks;
-    uint32_t *ptr, *end, *tramp;   // current chunk
+    uint32_t *ptr, *end, *tramp, *tramp_spilled;   // current chunk
     struct TrSpace *next;
 } TrSpace;
 static TrSpace *spaces;
@@ -90,7 +102,7 @@ TrSpace *tr_space_new(uint8_t *base) {
 void tr_space_free(TrSpace *s) {
     pthread_mutex_lock(&tr_lock);
     for (unsigned i = 0; i < (1u << HBITS); i++)
-        for (Block *b = s->htab[i]; b;) { Block *n = b->next; free(b); b = n; }
+        for (Block *b = s->htab[i]; b;) { Block *n = b->next; free(b->imap); free(b->borrows); free(b); b = n; }
     while (s->exits) { ExitRec *n = s->exits->next; free(s->exits); s->exits = n; }
     while (s->emus) { EmuRec *n = s->emus->next; free(s->emus); s->emus = n; }
     for (int i = 0; i < s->nchunks; i++) chunk_used[s->chunks[i]] = false;
@@ -112,14 +124,17 @@ static void space_grow(TrSpace *s) {
     s->chunks = realloc(s->chunks, (size_t)(s->nchunks + 1) * sizeof(int));
     s->chunks[s->nchunks++] = i;
     uint32_t *c = cache + (size_t)i * CHUNK_WORDS;
-    c[0] = 0xa93e07e0;                                 // stp x0, x1, [sp, #-32]
-    c[1] = 0x58000060;                                 // ldr x0, c+16
-    c[2] = 0xd61f0000;                                 // br x0
-    c[3] = 0xd503201f;                                 // nop
-    c[4] = (uint32_t)(uintptr_t)onx_exit_common;
-    c[5] = (uint32_t)((uintptr_t)onx_exit_common >> 32);
+    c[0] = 0x58000040;                                 // ldr x0, c+8
+    c[1] = 0xd61f0000;                                 // br x0
+    c[2] = (uint32_t)(uintptr_t)onx_exit_common;
+    c[3] = (uint32_t)((uintptr_t)onx_exit_common >> 32);
+    c[4] = 0x58000040;                                 // ldr x0, c+24
+    c[5] = 0xd61f0000;                                 // br x0
+    c[6] = (uint32_t)(uintptr_t)onx_exit_spilled;
+    c[7] = (uint32_t)((uintptr_t)onx_exit_spilled >> 32);
     sys_icache_invalidate(c, TRAMP_WORDS * 4);
     s->tramp = c;
+    s->tramp_spilled = c + 4;
     s->ptr = c + TRAMP_WORDS;
     s->end = c + CHUNK_WORDS;
 }
@@ -157,7 +172,10 @@ static void emit_get_ctx(int rd) {
     emit(ldr_imm(rd, rd, (unsigned)onx_tsd_off));
 }
 
+// Guest x0/x1 go straight into the context (never through the guest stack, which may be gone).
 static void emit_exit(uint64_t arg, int kind) {
+    emit_get_ctx(17);
+    emit(stp_x(0, 1, 17, 0));
     emit_mov64(16, arg);
     emit(movz(17, 0, kind));
     uint32_t *at = ts->ptr;
@@ -392,6 +410,10 @@ static bool rewrite(uint32_t insn, const Ops *o, uint64_t pc) {
         if (!(used & (1u << POOL[k]))) t[nt++] = POOL[k];
     int map[19] = {0}, ctx = t[nst];
     for (int r = 16, j = 0; r <= 18; r++) if (stolen & (1u << r)) map[r] = t[j++];
+    Borrow *bw = &cur_borrows[cur_nborrows++];
+    bw->start = (uint16_t)(ts->ptr - cur_start);
+    bw->nt = (uint8_t)nt;
+    for (int k = 0; k < 4; k++) bw->t[k] = k < nt ? (uint8_t)t[k] : 0xff;
     emit(stp_x(t[0], t[1], 31, -512));
     if (nt > 2) emit(stp_x(t[2], nt > 3 ? t[3] : 31, 31, -496));
     emit_get_ctx(ctx);
@@ -421,6 +443,7 @@ static bool rewrite(uint32_t insn, const Ops *o, uint64_t pc) {
         if (nt > 2) emit(ldp_x(t[2], nt > 3 ? t[3] : 31, 31, -496));
     }
     if (spdst) emit(ADD_SP_X16_X17);
+    bw->end = (uint16_t)(ts->ptr - cur_start);
     return true;
 }
 
@@ -466,8 +489,10 @@ static int rewrite_sys(uint32_t insn, uint64_t pc, Ops *o) {
     unsigned op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15, crm = (insn >> 8) & 15, op2 = (insn >> 5) & 7;
     *o = (Ops){ .base = -1, .spsrc = -1, .spdst = -1 };
     if ((insn & 0xfff00000) == 0xd5300000) {          // other mrs
-        // EL0-readable registers run natively: CTR, DCZID, NZCV, FPCR, FPSR, counters.
-        if (op1 == 3 && (crn == 0 || crn == 4 || crn == 14)) { opf(o, 0, false); return SYS_REWRITE; }
+        // EL0-readable registers run natively: DCZID, NZCV, FPCR, FPSR, counters. Not CTR_EL0:
+        // Darwin traps it (bionic and ART read it for cache line sizes).
+        bool ctr = op1 == 3 && crn == 0 && crm == 0 && op2 == 1;
+        if (!ctr && op1 == 3 && (crn == 0 || crn == 4 || crn == 14)) { opf(o, 0, false); return SYS_REWRITE; }
         emit_emulate(pc, insn);                       // MIDR/ID registers and the like
         return SYS_EXIT;
     }
@@ -477,10 +502,14 @@ static int rewrite_sys(uint32_t insn, uint64_t pc, Ops *o) {
         return SYS_EXIT;
     }
     if ((insn & 0xfffff000) == 0xd50b7000) {          // DC/IC by address
-        if (crm == 5 && op2 == 1) return SYS_DONE;    // IC IVAU: guest code is translated, not run
-        o->base = 0;
-        opf(o, 0, false);                             // DC ZVA etc.: the address needs the base
-        return SYS_REWRITE;
+        if (crm == 4 && op2 == 1) {                   // DC ZVA: the address needs the base
+            o->base = 0;
+            opf(o, 0, false);
+            return SYS_REWRITE;
+        }
+        // IC IVAU: guest code is translated, not run in place. Other DC ops (CVAU, CIVAC...): the
+        // host keeps its caches coherent itself, and Darwin traps them at EL0.
+        return SYS_DONE;
     }
     // PACIA1716 and friends work on x16/x17, which aren't the guest's in translated code.
     if (insn == 0xd503211f || insn == 0xd503215f || insn == 0xd503219f || insn == 0xd50321df) return SYS_DONE;
@@ -492,9 +521,14 @@ static Block *translate(TrSpace *s, uint64_t pc, uint64_t limit) {
     ts = s;
     if (!s->ptr || (size_t)(s->end - s->ptr) < BLOCK_RESERVE) space_grow(s);
     uint32_t *start = s->ptr;
+    cur_start = start;
+    cur_nborrows = 0;
+    int ninsn = 0;
     uint64_t gpc = pc;
     for (int n = 0;; n++, gpc += 4) {
+        cur_imap[n] = (uint16_t)(s->ptr - start);
         if (n == MAX_BLOCK_INSNS || gpc >= limit) { emit_direct_exit(gpc); break; }
+        ninsn = n + 1;
         uint32_t insn = *(const uint32_t *)(s->base + gpc);
 
         if ((insn & 0x7c000000) == 0x14000000) {       // B / BL
@@ -540,11 +574,10 @@ static Block *translate(TrSpace *s, uint64_t pc, uint64_t limit) {
             emit(0xaa0103f1);                           // mov x17, x1
             emit(0xa97e07e0);                           // ldp x0, x1, [sp, #-32]
             emit(0xd61f0220);                           // br x17
-            emit(0xa97e07e0);                           // miss: ldp x0, x1, [sp, #-32]
-            emit(0xaa1103f0);                           // mov x16, x17
+            emit(0xaa1103f0);                           // miss: mov x16, x17 (x0/x1 still at [sp-32])
             emit(movz(17, 0, EXIT_INDIRECT));
             uint32_t *at = s->ptr;
-            emit(b_to(at, s->tramp));
+            emit(b_to(at, s->tramp_spilled));
             break;
         }
         if ((insn & 0xfe1f0000) == 0xd61f0000) {        // pointer-auth branch forms (BRAA...)
@@ -617,6 +650,14 @@ static Block *translate(TrSpace *s, uint64_t pc, uint64_t limit) {
     b->pc = pc;
     b->host = start;
     b->host_end = s->ptr;
+    b->ninsn = ninsn;
+    b->imap = malloc((size_t)ninsn * sizeof(uint16_t));
+    memcpy(b->imap, cur_imap, (size_t)ninsn * sizeof(uint16_t));
+    if (cur_nborrows) {
+        b->borrows = malloc((size_t)cur_nborrows * sizeof(Borrow));
+        memcpy(b->borrows, cur_borrows, (size_t)cur_nborrows * sizeof(Borrow));
+        b->nborrows = cur_nborrows;
+    }
     unsigned h = hidx(pc);
     b->next = s->htab[h];
     s->htab[h] = b;
@@ -659,7 +700,7 @@ void tr_run(GuestCtx *c) {
         pthread_mutex_lock(&tr_lock);
         uint32_t *h = get_block(c, c->pc);
         pthread_mutex_unlock(&tr_lock);
-        if (!h) { sys_fault(c, 11, c->pc); continue; }
+        if (!h) { sys_fault(c, 11, 1, c->pc); continue; }
         onx_enter(c, h);
         switch (c->exit_kind) {
         case EXIT_DIRECT: {
@@ -695,16 +736,17 @@ void tr_run(GuestCtx *c) {
                 fprintf(stderr, "onirun: unsupported instruction %08x at guest pc %llx\n", r->insn,
                         (unsigned long long)r->pc);
                 c->pc = r->pc;
-                sys_fault(c, 4, r->pc);
+                sys_fault(c, 4, 1, r->pc);                // ILL_ILLOPC
             }
             break;
         }
         case EXIT_BRK:
             c->pc = c->exit_arg;
-            sys_fault(c, 5, c->exit_arg);
+            sys_fault(c, 5, 1, c->exit_arg);              // TRAP_BRKPT
             break;
         case EXIT_KILLED:
             sys_abandoned(c);
+            break;
         default:
             die("onirun: bad exit kind %llu", (unsigned long long)c->exit_kind);
         }
@@ -742,22 +784,41 @@ static void fault_handler(int sig, siginfo_t *si, void *uc_) {
     char buf[512];
     int n;
     if (c && in_cache(pc)) {
-        // Guest code faulted: its process dies with the matching Linux signal.
+        // Guest code faulted. Rebuild the exact guest state (registers, precise pc) so the fault
+        // can be delivered to the guest's handler, or reported.
         const Block *b = find_host(c->space, pc);
         // Unused window space is PROT_NONE, which Darwin reports as SIGBUS (with si_code
         // BUS_ADRALN, so it can't be told from a real alignment fault); Linux says SIGSEGV.
         c->fault_sig = sig == SIGSEGV || sig == SIGBUS ? 11 : sig == SIGILL ? 4 : sig == SIGFPE ? 8 : 5;
         c->fault_addr = (uint64_t)(uintptr_t)si->si_addr - c->base;
-        for (int r = 0; r < 31; r++)
+        c->fault_code = 1;
+        bool pc_fault = sig == SIGILL || sig == SIGTRAP;   // si_addr is the instruction: use the guest pc below
+        for (int r = 0; r < 29; r++)
             if (r < 16 || r > 18) c->x[r] = uc->uc_mcontext->__ss.__x[r];
         c->x[29] = uc->uc_mcontext->__ss.__fp;
         c->x[30] = uc->uc_mcontext->__ss.__lr;
-        c->sp = uc->uc_mcontext->__ss.__sp - c->base;
-        c->pc = b ? b->pc : 0;
-        n = snprintf(buf, sizeof buf, "onirun: [%llu] signal %d at guest address %llx, in the block at guest pc %llx (+%lld host insns)\n",
-                     (unsigned long long)c->tid, c->fault_sig, (unsigned long long)c->fault_addr,
-                     (unsigned long long)c->pc, b ? (long long)((pc - (uint64_t)(uintptr_t)b->host) / 4) : -1ll);
-        write(2, buf, (size_t)n);
+        uint64_t hsp = uc->uc_mcontext->__ss.__sp;
+        c->sp = hsp - c->base;
+        c->nzcv = uc->uc_mcontext->__ss.__cpsr & 0xf0000000u;
+        c->fpsr = uc->uc_mcontext->__ns.__fpsr;
+        c->fpcr = uc->uc_mcontext->__ns.__fpcr;
+        memcpy(c->q, uc->uc_mcontext->__ns.__v, sizeof c->q);
+        c->pc = 0;
+        if (b) {
+            uint32_t hoff = (uint32_t)((pc - (uint64_t)(uintptr_t)b->host) / 4);
+            int lo = 0, hi = b->ninsn - 1;
+            while (lo < hi) { int mid = (lo + hi + 1) / 2; if (b->imap[mid] <= hoff) lo = mid; else hi = mid - 1; }
+            c->pc = b->pc + 4 * (uint64_t)lo;
+            if (pc_fault) c->fault_addr = c->pc;
+            for (int i = 0; i < b->nborrows; i++) {
+                const Borrow *bw = &b->borrows[i];
+                if (hoff < bw->start || hoff >= bw->end) continue;
+                for (int k = 0; k < bw->nt; k++) c->x[bw->t[k]] = *(uint64_t *)(uintptr_t)(hsp - 512 + 8 * (uint64_t)k);
+            }
+        } else {
+            n = snprintf(buf, sizeof buf, "onirun: [%llu] fault at host pc %llx outside any block\n", (unsigned long long)c->tid, (unsigned long long)pc);
+            write(2, buf, (size_t)n);
+        }
         uc->uc_mcontext->__ss.__x[0] = (uint64_t)(uintptr_t)c;
         uc->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)onx_abandon;
         return;
@@ -765,6 +826,15 @@ static void fault_handler(int sig, siginfo_t *si, void *uc_) {
     n = snprintf(buf, sizeof buf, "onirun: internal fault: signal %d at host pc %llx (address %p)\n", sig,
                  (unsigned long long)pc, si->si_addr);
     write(2, buf, (size_t)n);
+    if (c) {
+        n = snprintf(buf, sizeof buf, "  guest tid %llu pc %llx sp %llx base %llx exit_kind %llu\n", (unsigned long long)c->tid,
+                     (unsigned long long)c->pc, (unsigned long long)c->sp, (unsigned long long)c->base, (unsigned long long)c->exit_kind);
+        write(2, buf, (size_t)n);
+    }
+    void *frames[32];
+    frames[0] = (void *)(uintptr_t)pc;
+    int nf = backtrace(frames + 1, 31);
+    backtrace_symbols_fd(frames, nf + 1, 2);
     for (int r = 0; r < 29; r += 4) {
         n = snprintf(buf, sizeof buf, "  x%-2d %016llx x%-2d %016llx x%-2d %016llx x%-2d %016llx\n",
                      r, uc->uc_mcontext->__ss.__x[r], r + 1, uc->uc_mcontext->__ss.__x[r + 1],

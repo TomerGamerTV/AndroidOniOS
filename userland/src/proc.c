@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <os/os_sync_wait_on_address.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -339,7 +340,7 @@ void post_signal_locked(Proc *p, GuestCtx *t, int sig) {
     } else {
         __atomic_or_fetch(&p->pending, bit, __ATOMIC_SEQ_CST);
         for (GuestCtx *x = p->threads; x; x = x->next_thread)
-            if (!(x->sigmask & bit)) kick(x);
+            if (!(x->sigmask & bit) || (x->waitset & bit)) kick(x);
     }
     pthread_cond_broadcast(&g_cond);
     pthread_cond_signal(&hk_cond);
@@ -381,18 +382,26 @@ int proc_deliverable(GuestCtx *c) {
 }
 
 #define FRAME_SIZE 4688   // siginfo (128) + arm64 ucontext (4560)
-static void push_signal(GuestCtx *c, int sig, uint64_t saved_mask) {
+static void push_signal(GuestCtx *c, int sig, uint64_t saved_mask, int code, uint64_t addr) {
     Proc *p = c->proc;
     uint64_t handler = p->sigact[sig][0], flags = p->sigact[sig][1];
     uint64_t restorer = p->sigact[sig][2], mask = p->sigact[sig][3];
-    uint64_t sp = (c->sp - FRAME_SIZE - 32) & ~15ull;
+    uint64_t base = c->sp;
+    bool on_alt = c->altstack_size && c->sp > c->altstack_sp && c->sp <= c->altstack_sp + c->altstack_size;
+    if ((flags & 0x08000000) && c->altstack_size && !on_alt) base = c->altstack_sp + c->altstack_size;   // SA_ONSTACK
+    uint64_t sp = (base - FRAME_SIZE - 32) & ~15ull;
+    LOGV("[%llu] push signal %d: sp %llx -> frame %llx (alt %llx+%llx, on_alt %d, flags %llx)\n", (unsigned long long)c->tid, sig,
+         (unsigned long long)c->sp, (unsigned long long)sp, (unsigned long long)c->altstack_sp, (unsigned long long)c->altstack_size, on_alt, (unsigned long long)flags);
     uint8_t *f = gptr(sp);
     memset(f, 0, FRAME_SIZE);
     *(int32_t *)f = sig;                                   // siginfo.si_signo
-    *(int32_t *)(f + 8) = sig == 17 ? 1 : 0;               // si_code (CLD_EXITED / SI_USER)
+    *(int32_t *)(f + 8) = code;                            // si_code
+    if (sig == 11 || sig == 7 || sig == 4 || sig == 8 || sig == 5) *(uint64_t *)(f + 16) = addr;   // si_addr
+    else { *(int32_t *)(f + 16) = p->pid; *(uint32_t *)(f + 20) = g_uid; }                           // si_pid, si_uid
     uint8_t *uc = f + 128;
     *(uint64_t *)(uc + 40) = saved_mask;                   // uc_sigmask
     uint8_t *mc = uc + 176;                                // uc_mcontext
+    *(uint64_t *)mc = addr;                                // fault_address
     memcpy(mc + 8, c->x, 31 * 8);
     *(uint64_t *)(mc + 256) = c->sp;
     *(uint64_t *)(mc + 264) = c->pc;
@@ -432,6 +441,7 @@ void proc_sigreturn(GuestCtx *c) {
         rec += size;
     }
     c->sigmask = *(uint64_t *)(uc + 40) & ~UNBLOCKABLE;
+    LOGV("[%llu] sigreturn: pc %llx sp %llx\n", (unsigned long long)c->tid, (unsigned long long)c->pc, (unsigned long long)c->sp);
 }
 
 __attribute__((noreturn)) static void die_by_signal(GuestCtx *c, int sig) {
@@ -454,7 +464,7 @@ void sys_deliver_signals(GuestCtx *c) {
             die_by_signal(c, sig);
         }
         LOGV("[%llu] deliver signal %d at pc %llx\n", (unsigned long long)c->tid, sig, (unsigned long long)c->pc);
-        push_signal(c, sig, c->sigmask);
+        push_signal(c, sig, c->sigmask, sig == 17 ? 1 : 0, 0);
         return;
     }
 }
@@ -473,13 +483,55 @@ uint64_t proc_sigsuspend(GuestCtx *c, uint64_t mask) {
     c->x[0] = ERR(4);
     int sig = c->kill ? 0 : take_signal(c);
     if (sig && c->proc->sigact[sig][0] > 1) {
-        push_signal(c, sig, old);            // the handler returns to the caller's mask
+        push_signal(c, sig, old, sig == 17 ? 1 : 0, 0);   // the handler returns to the caller's mask
     } else {
         c->sigmask = old;
         if (sig && c->proc->sigact[sig][0] == 0 && sig_default(sig) != D_IGN && sig_default(sig) != D_STOP)
             die_by_signal(c, sig);
     }
     return 0;
+}
+
+// rt_sigtimedwait: take a signal from set, waiting up to timeout (NULL = forever). Fills a Linux
+// siginfo. Returns the signal number or -errno.
+int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct timespec *timeout) {
+    Proc *p = c->proc;
+    set &= ~UNBLOCKABLE;
+    int64_t deadline = -1;
+    if (timeout) deadline = (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC) + timeout->tv_sec * 1000000000 + timeout->tv_nsec;
+    c->waitset = set;
+    int64_t r;
+    for (;;) {
+        uint64_t avail = (c->pending | p->pending) & set;
+        if (avail) {
+            int sig = __builtin_ctzll(avail) + 1;
+            uint64_t bit = 1ull << (sig - 1);
+            if (!(__atomic_fetch_and(&c->pending, ~bit, __ATOMIC_SEQ_CST) & bit) &&
+                !(__atomic_fetch_and(&p->pending, ~bit, __ATOMIC_SEQ_CST) & bit)) continue;
+            if (info) {
+                uint8_t *si = gptr(info);
+                memset(si, 0, 128);
+                *(int32_t *)si = sig;
+                *(int32_t *)(si + 8) = 0;                      // SI_USER
+                *(int32_t *)(si + 16) = p->pid;
+                *(uint32_t *)(si + 20) = g_uid;
+            }
+            r = sig;
+            break;
+        }
+        if (c->kill) { r = -EINTR; break; }
+        int ms = -1;
+        if (deadline >= 0) {
+            int64_t left = deadline - (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            if (left <= 0) { r = -EAGAIN; break; }
+            ms = (int)((left + 999999) / 1000000);
+        }
+        int rc = poll(NULL, 0, ms);                           // a kick (SIGUSR1) interrupts this
+        if (rc < 0 && errno != EINTR) { r = -errno; break; }
+        if (proc_deliverable(c)) { r = -EINTR; break; }
+    }
+    c->waitset = 0;
+    return r;
 }
 
 // ---- diagnostics ----
@@ -506,18 +558,37 @@ static const char *sig_name(int s) {
     return s > 0 && s < 16 ? n[s] : "signal";
 }
 
-void sys_fault(GuestCtx *c, int sig, uint64_t addr) {
-    fprintf(stderr, "onirun: [%d] %s: %s at guest address %llx\n", c->proc->pid, c->proc->exe, sig_name(sig),
-            (unsigned long long)addr);
+// A fault in guest code (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) at c->pc. Delivered to the
+// guest's handler if it has one and the signal isn't blocked, as the kernel would; otherwise the
+// process dies. ART relies on this: its interpreter and compiled code use implicit null and
+// stack-overflow checks and turn the resulting SIGSEGV into Java exceptions.
+void sys_fault(GuestCtx *c, int sig, int code, uint64_t addr) {
+    Proc *p = c->proc;
+    uint64_t bit = 1ull << (sig - 1);
+    if (sig == 11 && p->mm && mm_readable(p->mm, addr & ~(PG - 1), 1)) code = 2;   // SEGV_ACCERR: mapped but not that way
+    if (p->sigact[sig][0] > 1 && !(c->sigmask & bit) && p->state == P_RUNNING) {
+        if (g_verbose) {
+            char where[1200];
+            mm_symbolize(p->mm, c->pc, where, sizeof where);
+            uint32_t insn = mm_readable(p->mm, c->pc, 4) ? *(uint32_t *)(uintptr_t)(c->base + c->pc) : 0;
+            LOGV("[%llu] fault signal %d code %d at pc %llx (%s, insn %08x) addr %llx -> handler\n", (unsigned long long)c->tid,
+                 sig, code, (unsigned long long)c->pc, where, insn, (unsigned long long)addr);
+        }
+        push_signal(c, sig, c->sigmask, code, addr);
+        return;
+    }
+    fprintf(stderr, "onirun: [%d] %s: %s at guest address %llx\n", p->pid, p->exe, sig_name(sig), (unsigned long long)addr);
     proc_backtrace(c);
     die_by_signal(c, sig);
 }
 
 void sys_abandoned(GuestCtx *c) {
     if (c->fault_sig) {
-        fprintf(stderr, "onirun: [%d] %s: %s\n", c->proc->pid, c->proc->exe, sig_name(c->fault_sig));
-        proc_backtrace(c);
-        die_by_signal(c, c->fault_sig);
+        int sig = c->fault_sig, code = c->fault_code;
+        uint64_t addr = c->fault_addr;
+        c->fault_sig = 0;
+        sys_fault(c, sig, code, addr);
+        return;
     }
     thread_leave(c);
 }
@@ -525,6 +596,9 @@ void sys_abandoned(GuestCtx *c) {
 // Notes an abort() or similar so the reason isn't lost when the process dies.
 static void note_self_fatal(GuestCtx *c, Proc *q, int sig) {
     if (q != c->proc || q->sigact[sig][0] != 0 || sig_default(sig) != D_CORE) return;
+    bool can = false;                                 // only fatal if some thread can take it
+    for (GuestCtx *x = q->threads; x && !can; x = x->next_thread) can = !(x->sigmask & (1ull << (sig - 1)));
+    if (!can) return;
     fprintf(stderr, "onirun: [%d] %s: %s\n", q->pid, q->exe, sig_name(sig));
     proc_backtrace(c);
 }
@@ -572,6 +646,8 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     nc->host_thread = NULL;
     nc->next_thread = NULL;
     nc->clear_child_tid = (flags & L_CLONE_CHILD_CLEARTID) ? ctid : 0;
+    nc->altstack_sp = nc->altstack_size = 0;
+    nc->waitset = 0;
     if (flags & L_CLONE_SETTLS) nc->tpidr = tls;
     if (newsp) nc->sp = newsp;
 
@@ -688,6 +764,7 @@ uint64_t proc_execve(GuestCtx *c, const char *gpath, uint64_t argv_g, uint64_t e
         if (p->sigact[s][0] > 1) memset(p->sigact[s], 0, sizeof p->sigact[s]);
     snprintf(p->exe, sizeof p->exe, "%s", path);
     set_cmdline(p, argv);
+    p->stack_start = img.sp;
     p->vfork_done = true;
     pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);
@@ -803,6 +880,7 @@ Proc *proc_start(const char *path, char **argv, char **envp) {
     if (e) die("onirun: cannot load %s (errno %d)", path, -e);
     snprintf(p->exe, sizeof p->exe, "%s", path);
     set_cmdline(p, argv);
+    p->stack_start = img.sp;
     GuestCtx *c = calloc(1, sizeof *c);
     c->proc = p;
     c->base = (uint64_t)(uintptr_t)p->mm->base;

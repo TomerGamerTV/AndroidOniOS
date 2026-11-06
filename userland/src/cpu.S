@@ -10,6 +10,7 @@
     .text
     .globl _onx_enter
     .globl _onx_exit_common
+    .globl _onx_exit_spilled
     .globl _onx_abandon
     .globl _onx_tsd_off
 
@@ -55,7 +56,10 @@ _onx_enter:
     ldr x9, [x0, #248]
     add x9, x9, x16
     mov sp, x9
-    str x1, [sp, #-16]          // the block to run, parked below the guest stack
+    // Park the block address in the context: the guest stack must not be touched here (a thread
+    // exiting the bionic way has already unmapped its stack, and ART's signal handler briefly
+    // leaves sp misaligned, which sp-based accesses would trap on).
+    str x1, [x0, #296]
     mov x17, x0
     ldp x0, x1, [x17, #0]
     ldp x2, x3, [x17, #16]
@@ -71,12 +75,14 @@ _onx_enter:
     ldp x25, x26, [x17, #200]
     ldp x27, x28, [x17, #216]
     ldp x29, x30, [x17, #232]
-    ldr x17, [sp, #-16]
+    ldr x17, [x17, #296]
     br x17
 
     .p2align 2
-// Entered from a chunk trampoline. [sp-32] = guest x0,x1; x16 = exit argument; x17 = exit kind.
-_onx_exit_common:
+// Entered from a chunk trampoline. Guest x0,x1 are already in the context (exit stubs store them
+// there) or, for _onx_exit_spilled, at [sp-32] (the inline branch probe parks them there).
+// x16 = exit argument; x17 = exit kind.
+_onx_exit_spilled:
     mrs x0, tpidrro_el0
     and x0, x0, #0xfffffffffffffff8
     adrp x1, _onx_tsd_off@PAGE
@@ -85,6 +91,15 @@ _onx_exit_common:
     stp x16, x17, [x0, #296]
     ldp x16, x17, [sp, #-32]
     stp x16, x17, [x0, #0]
+    b Lsave_rest
+_onx_exit_common:
+    mrs x0, tpidrro_el0
+    and x0, x0, #0xfffffffffffffff8
+    adrp x1, _onx_tsd_off@PAGE
+    ldr x1, [x1, _onx_tsd_off@PAGEOFF]
+    ldr x0, [x0, x1]
+    stp x16, x17, [x0, #296]
+Lsave_rest:
     stp x2, x3, [x0, #16]
     stp x4, x5, [x0, #32]
     stp x6, x7, [x0, #48]

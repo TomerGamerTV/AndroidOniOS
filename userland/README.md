@@ -40,12 +40,13 @@ Android 17's own programs run, as many guest processes inside one host process:
 - `/system/bin/sh` (mksh) and toybox: scripts, pipes, subshells, command substitution, background jobs, `wait`, `trap`
 - multithreaded programs: mutexes, condition variables, thread-directed signals
 - **`servicemanager`**, Android's service directory, unmodified, with the stock `service` tool talking to it over binder from another process. Its SELinux checks run against a permissive policy that onirun serves from `/sys/fs/selinux`.
+- **ART**, Android's Java runtime (`dalvikvm64` from the ART APEX), both interpreting and with its JIT compiler: hand-written dex programs (`tools/mkdex.py`) print, catch a `NullPointerException` that ART detects through our fault delivery, and run a 30-million-iteration loop (1.1 s in total with the JIT, 1.6 s interpreted). The boot class path runs imageless, because the image's boot image was built for a garbage collector that needs `userfaultfd`.
 
 ### Linux services provided by onirun
 
 | Area | What's there |
 |---|---|
-| Processes | fork (copy-on-write), vfork, exec, wait, kill, process groups, exit_group; threads; futexes (`os_sync_wait_on_address`, also on iOS) |
+| Processes | fork (copy-on-write), vfork, exec, wait, kill, process groups, exit_group; threads; futexes (`os_sync_wait_on_address`, also on iOS); `sigaltstack`, `rt_sigtimedwait`, `process_vm_readv` |
 | Memory | mmap/munmap/mprotect/mremap (incl. `MREMAP_FIXED`), `MADV_DONTNEED`, memfd, ashmem (`/dev/ashmem`) |
 | Files | the rootfs with Android's symlinks, `/proc/self/{exe,fd,maps,cmdline,status,attr/current}`, `/proc/{filesystems,cpuinfo,meminfo,...}`, `/dev/kmsg` |
 | Events | eventfd, epoll, timerfd (on libdispatch), inotify (never fires), ppoll |
@@ -69,14 +70,13 @@ Under QEMU TCG (how the iPhone runs Android today), the first two tests used 2.3
 
 Limits:
 - **Memory isolation:** windows stop correct programs from seeing each other, but a wild 64-bit pointer isn't masked. One process could still corrupt another, as in a single address space.
-- **Signals and faults:**
-  - A signal with a handler reaches a thread at its next system call or block exit. A thread that never makes another call won't get it. Default-fatal signals and `SIGKILL` work regardless.
-  - Guest `SIGSEGV` handlers aren't called yet: a crashing process is killed. ART will need this.
+- **Signals:** a signal with a handler reaches a thread at its next system call or block exit. A thread that never makes another call won't get it. Default-fatal signals and `SIGKILL` work regardless. Faults (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP`) are delivered precisely, with the guest pc and `si_addr`, on the alternate stack when asked.
+- **Cache maintenance** (`dc`, `ic ivau`) is dropped, so code that is overwritten in place (ART's JIT reusing code-cache memory) could run stale translations. Not seen yet.
 - **Binder** uses one lock for everything and copies transaction data once into the receiver's buffer; it isn't tuned yet. Freezing and oneway spam detection are accepted and ignored.
 - **No networking.** `AF_INET` sockets fail with `EAFNOSUPPORT`.
 
 Not done yet:
-- **ART and the Android framework** (`app_process`, zygote, `system_server`), which also need `SIGSEGV` handlers and `/proc/<pid>` directories.
+- **The Android framework** (`app_process`, zygote, `system_server`), and eventually SurfaceFlinger with native graphics.
 - **Sharing translations between processes**, so each new program doesn't translate libc and the linker again.
 - **iOS.** Executable memory there comes from the JIT region StikJIT enables. The window size must also fit iOS's address-space limit.
 
