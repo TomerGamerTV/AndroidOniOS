@@ -12,6 +12,15 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-s
   socket zygote
   socket usap_pool_primary
 
+# aconfig flag storage (/metadata/aconfig): the framework reads flags from the files these write
+service aconfigd-init /system/bin/aconfigd-system platform-init
+  oneshot
+service aconfigd-mainline-init /apex/com.android.configinfrastructure/bin/aconfigd-mainline init
+  oneshot
+service aconfigd /system/bin/aconfigd-system start-socket
+  socket aconfigd_system
+service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
+  socket aconfigd_mainline
 service idmap2d /system/bin/idmap2d
 service lmkd /system/bin/lmkd
   socket lmkd
@@ -22,6 +31,10 @@ service tombstoned /system/bin/tombstoned
 
 start servicemanager
 start hwservicemanager
+start aconfigd-init
+start aconfigd-mainline-init
+start aconfigd
+start aconfigd-mainline
 start lmkd
 start tombstoned
 start keystore2

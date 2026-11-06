@@ -145,6 +145,7 @@ def main():
     data/misc/threadnetwork data/misc/uprobestats data/misc/aconfig_flags data/misc/connectivityblobdb
     data/misc/odsign data/misc/virtualizationservice data/misc/oem_lock data/misc/bootstat data/misc/keychain
     data/misc/ota data/misc/adbd data/misc/system_server data/misc/securitylog data/misc/surfaceflinger data/misc/gpu dev/dri dev/socket dev/__properties__
+    metadata/aconfig/flags metadata/aconfig/maps metadata/aconfig/boot
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)
