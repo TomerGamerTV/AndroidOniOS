@@ -247,7 +247,7 @@ static bool is_devnode(const char *gpath) {
 // Pinned BPF objects carry the owner and mode netbpfload would have given them (mkbpffs.py stores
 // them as xattrs; the host files themselves stay ours).
 static bool bpf_attrs(const char *gpath, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
-    if (!gpath || strncmp(gpath, "/sys/fs/bpf/", 12)) return false;
+    if (!gpath || (strncmp(gpath, "/sys/fs/bpf", 11) && strncmp(gpath, "/apex/com.android.tethering/bin/for-system", 42))) return false;
     char hp[1400], v[32];
     snprintf(hp, sizeof hp, "%s%s", g_rootfs, gpath);
     ssize_t n = getxattr(hp, "user.oni.mode", v, sizeof v - 1, 0, 0);

@@ -220,7 +220,8 @@ static const FdOps attr_ops = { "proc-attr", attr_read, attr_write, NULL, NULL, 
 static int proc_open(Proc *p, const char *path, int lflags) {
     char buf[4096];
     int n = -1;
-    if (!strcmp(path, "/proc/filesystems")) n = snprintf(buf, sizeof buf, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tselinuxfs\nnodev\tdevpts\n\text4\n\tfuse\n");
+    if (!strcmp(path, "/proc/net/psched")) n = snprintf(buf, sizeof buf, "000003e8 00000040 000f4240 3b9aca00\n");
+    else if (!strcmp(path, "/proc/filesystems")) n = snprintf(buf, sizeof buf, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tselinuxfs\nnodev\tdevpts\n\text4\n\tfuse\n");
     else if (!strcmp(path, "/proc/version")) n = snprintf(buf, sizeof buf, "Linux version 6.6.0-oni (onirun) #1 SMP PREEMPT\n");
     else if (!strcmp(path, "/proc/sys/kernel/pid_max")) n = snprintf(buf, sizeof buf, "32768\n");
     else if (!strcmp(path, "/proc/sys/kernel/random/boot_id")) n = snprintf(buf, sizeof buf, "0f3a6d9e-7c1b-4b2a-9d6e-0a1b2c3d4e5f\n");

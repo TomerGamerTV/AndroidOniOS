@@ -178,6 +178,20 @@ def main():
             ctx = f'u:object_r:fs_bpf_{sub}:s0' if sub else 'u:object_r:fs_bpf:s0'
             for k, v in (('security.selinux', ctx), ('user.oni.uid', str(uid)), ('user.oni.gid', str(gid)), ('user.oni.mode', f'{mode:o}')):
                 subprocess.run(['xattr', '-w', k, v, host], check=True)
+    # The directories and the clatd helper are verified too (ClatCoordinator): bpffs directories are
+    # 1777 with fs_bpf labels, clatd is a setuid/setgid binary owned by the clat user (1029).
+    def attrs(rel, mode, uid, gid, ctx):
+        host = os.path.join(R, rel)
+        if not os.path.exists(host):
+            return
+        for k, v in (('security.selinux', ctx), ('user.oni.uid', str(uid)), ('user.oni.gid', str(gid)), ('user.oni.mode', f'{mode:o}')):
+            subprocess.run(['xattr', '-w', k, v, host], check=True)
+    attrs('sys/fs/bpf', 0o1777, 0, 0, 'u:object_r:fs_bpf:s0')
+    for sub in sorted(os.listdir(os.path.join(R, 'sys/fs/bpf'))):
+        if os.path.isdir(os.path.join(R, 'sys/fs/bpf', sub)):
+            attrs(f'sys/fs/bpf/{sub}', 0o1777, 0, 0, f'u:object_r:fs_bpf_{sub}:s0')
+    attrs('apex/com.android.tethering/bin/for-system', 0o750, 1029, 1000, 'u:object_r:system_file:s0')
+    attrs('apex/com.android.tethering/bin/for-system/clatd', 0o6755, 1029, 1029, 'u:object_r:clatd_exec:s0')
     print(f'{len(lines)} BPF objects laid out under {R}/sys/fs/bpf')
 
 
