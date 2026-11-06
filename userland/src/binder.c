@@ -337,6 +337,14 @@ static void buf_free(BProc *p, BBuf *b) {
         }
     }
 }
+
+// A transaction's buffer outlives it until the receiver frees the buffer: the buffer must not keep
+// pointing at freed memory (BC_FREE_BUFFER writes through b->t).
+static void trans_free(BTrans *t) {
+    if (t->buf && t->buf->t == t) t->buf->t = NULL;
+    free(t);
+}
+
 static BBuf *buf_find(BProc *p, uint64_t gaddr) {
     for (BBuf *b = p->bufs; b; b = b->next) if (!b->free && p->buf_gaddr + b->off == gaddr) return b;
     return NULL;
@@ -609,7 +617,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
     if (reply) {
         target_thread->stack = in_reply_to->from_parent;
         in_reply_to->from = NULL;
-        free(in_reply_to);
+        trans_free(in_reply_to);
         BWork *w = work_new(W_REPLY);
         w->t = t;
         queue_thread(target_thread, w);
@@ -637,11 +645,11 @@ failed:
     LOGV("onirun: binder: transaction from pid %d failed (%s, code %u, data %llu, offsets %llu, sg %llu, ctx %s)\n", p->pid,
          reply ? "reply" : "call", tr.code, (unsigned long long)tr.data_size, (unsigned long long)tr.offsets_size,
          (unsigned long long)buffers_size, p->ctx->name);
-    free(t);
+    trans_free(t);
     if (reply) {
         // The waiting caller gets the failure; we still owe ourselves a completion.
         target_thread->stack = in_reply_to->from_parent;
-        free(in_reply_to);
+        trans_free(in_reply_to);
         fail_sender(target_thread, BR_FAILED_REPLY);
         fail_sender(th, BR_TRANSACTION_COMPLETE);
         return;
@@ -650,7 +658,7 @@ failed:
     return;
 
 drop_reply:
-    free(in_reply_to);
+    trans_free(in_reply_to);
     fail_sender(th, BR_TRANSACTION_COMPLETE);   // nobody is waiting; the reply just vanishes
 }
 
@@ -819,6 +827,13 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
         switch (w->kind) {
         case W_TRANSACTION: case W_REPLY: {
             BTrans *t = w->t;
+            if (!t || !t->buf) {                           // lost its buffer (should not happen): fail it
+                fprintf(stderr, "onirun: binder: dropping a %s without a buffer\n", w->kind == W_REPLY ? "reply" : "transaction");
+                if (t && t->from && w->kind == W_TRANSACTION) { t->from->stack = t->from_parent; fail_sender(t->from, BR_FAILED_REPLY); }
+                if (t) trans_free(t);
+                free(w);
+                continue;
+            }
             uint32_t cmd = w->kind == W_REPLY ? BR_REPLY : t->has_secctx ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION;
             uint64_t need = 4 + IOC_SIZE(cmd);
             if (pos + need > size) { work_push_front(&th->todo, w); goto out; }   // leave it for the next read
@@ -834,7 +849,7 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             if (cmd == BR_TRANSACTION_SEC_CTX) { uint64_t sc = tr.buffer + t->secctx_off; PUT(&sc, 8); }
             if (w->kind == W_REPLY || !t->need_reply) {   // nothing more to track for these
                 if (t->buf) t->buf->t = NULL;
-                free(t);
+                trans_free(t);
             }
             free(w);
             goto out;                                      // one transaction per read, like the driver
@@ -981,7 +996,7 @@ static void binder_release(FdObj *o) {
     for (BWork *w; (w = work_pop(&p->todo));) {
         if ((w->kind == W_TRANSACTION) && w->t) {
             if (w->t->from) { w->t->from->stack = w->t->from_parent; fail_sender(w->t->from, BR_DEAD_REPLY); }
-            free(w->t);
+            trans_free(w->t);
         }
         free(w);
     }
@@ -990,8 +1005,8 @@ static void binder_release(FdObj *o) {
         for (BWork *w; (w = work_pop(&t->todo));) {
             if ((w->kind == W_TRANSACTION) && w->t) {
                 if (w->t->from) { w->t->from->stack = w->t->from_parent; fail_sender(w->t->from, BR_DEAD_REPLY); }
-                free(w->t);
-            } else if (w->kind == W_REPLY && w->t) free(w->t);
+                trans_free(w->t);
+            } else if (w->kind == W_REPLY && w->t) trans_free(w->t);
             free(w);
         }
         thread_free(p, t);
