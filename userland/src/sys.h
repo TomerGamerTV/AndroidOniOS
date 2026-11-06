@@ -206,7 +206,9 @@ const char *proc_secontext(Proc *p);                 // SELinux context we claim
 Proc *proc_find(int pid);                            // g_lock held
 Proc *proc_list(void);                               // g_lock held
 void proc_forward_host_signal(int lsig);
-void proc_dump_all(void);                             // SIGINFO: print every guest thread
+void proc_dump_all(void);
+void binder_dump(void);                             // SIGINFO: print every guest thread
+uint64_t proc_membarrier(GuestCtx *c, int cmd);
 
 // ---- paths and errors (syscall.c) ----
 extern char g_rootfs[1024];

@@ -767,10 +767,12 @@ static const Block *find_host(TrSpace *s, uint64_t host_pc) {
 
 // SIGUSR1 interrupts a thread's blocking host call. A thread whose process is going away is pulled
 // straight out of translated code.
+volatile uint64_t g_barrier_gen;   // membarrier generation (proc.c bumps it, every thread acks it here)
 static void kick_handler(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     ucontext_t *uc = uc_;
     GuestCtx *c = pthread_getspecific(ctx_key);
+    if (c) { __atomic_thread_fence(__ATOMIC_SEQ_CST); c->barrier_ack = g_barrier_gen; }
     if (c && c->kill && in_cache(uc->uc_mcontext->__ss.__pc)) {
         uc->uc_mcontext->__ss.__x[0] = (uint64_t)(uintptr_t)c;
         uc->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)onx_abandon;

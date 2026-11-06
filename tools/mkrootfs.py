@@ -99,6 +99,14 @@ def main():
     with open(os.path.join(R, 'apex/apex-info-list.xml'), 'w') as f:
         f.write('<?xml version="1.0" encoding="utf-8"?>\n<apex-info-list>\n' + '\n'.join(entries) + '\n</apex-info-list>\n')
 
+    # 2b. Pre-compiled boot image and odex files: built for a collector that needs userfaultfd, so
+    # ART can't use them; left in place they only make its stack dumper abort.
+    for rel in ('system/framework/arm64', 'system/framework/oat'):
+        shutil.rmtree(os.path.join(R, rel), ignore_errors=True)
+    for f in os.listdir(os.path.join(R, 'system/framework')):
+        if f.startswith('boot') and f.endswith('.vdex'):
+            os.remove(os.path.join(R, 'system/framework', f))
+
     # 3. Directories init, vold and the framework expect
     dirs = '''mnt/user/0 mnt/expand mnt/runtime/default/emulated mnt/runtime/read/emulated mnt/runtime/write/emulated
     mnt/runtime/full/emulated mnt/sdcard mnt/media_rw mnt/pass_through/0/emulated mnt/installer/0/emulated

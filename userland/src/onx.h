@@ -33,6 +33,7 @@ typedef struct GuestCtx {
     uint64_t sigmask;
     uint64_t altstack_sp, altstack_size;   // sigaltstack, per thread
     volatile uint64_t waitset;     // signals this thread is blocked in rt_sigtimedwait for
+    volatile uint64_t barrier_ack; // membarrier: generation this thread has acknowledged
     volatile uint64_t pending;     // signals sent to this thread (tgkill)
     volatile int kill;             // set by another thread: leave now (exit_group, exec, fatal signal)
     int fault_sig;                 // Linux signal when translated code faulted

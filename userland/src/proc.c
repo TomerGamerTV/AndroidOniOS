@@ -18,6 +18,7 @@
 #include "sys.h"
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+extern volatile uint64_t g_barrier_gen;   // translate.c
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;    // process and thread state changes
 static pthread_cond_t hk_cond = PTHREAD_COND_INITIALIZER;   // wakes the housekeeping thread
 static Proc *g_procs;
@@ -536,6 +537,28 @@ int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct
     return r;
 }
 
+// membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED): like the kernel's IPIs, every other thread of the
+// process runs a full barrier (its kick handler) before we return. ART's collector depends on it.
+uint64_t proc_membarrier(GuestCtx *c, int cmd) {
+    if (cmd == 0) return 1 | 8 | 16 | 32 | 64;            // QUERY: GLOBAL, PRIVATE_EXPEDITED (+REGISTER), SYNC_CORE variants
+    if (cmd == 16 || cmd == 64 || cmd == 2) return 0;    // REGISTER_* and GLOBAL_EXPEDITED: nothing to set up
+    Proc *p = c->proc;
+    uint64_t gen = __atomic_add_fetch(&g_barrier_gen, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&g_lock);
+    for (GuestCtx *t = p->threads; t; t = t->next_thread) if (t != c) kick(t);
+    pthread_mutex_unlock(&g_lock);
+    for (int spins = 0; spins < 2000; spins++) {           // up to ~100 ms
+        bool all = true;
+        pthread_mutex_lock(&g_lock);
+        for (GuestCtx *t = p->threads; t && all; t = t->next_thread) if (t != c && t->barrier_ack < gen) all = false;
+        pthread_mutex_unlock(&g_lock);
+        if (all) break;
+        usleep(50);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return 0;
+}
+
 // ---- diagnostics ----
 void proc_backtrace(GuestCtx *c) {
     Mm *m = c->proc->mm;
@@ -568,7 +591,18 @@ void sys_fault(GuestCtx *c, int sig, int code, uint64_t addr) {
     Proc *p = c->proc;
     uint64_t bit = 1ull << (sig - 1);
     if (sig == 11 && p->mm && mm_readable(p->mm, addr & ~(PG - 1), 1)) code = 2;   // SEGV_ACCERR: mapped but not that way
+    static int show_faults = -1;
+    if (show_faults < 0) show_faults = getenv("ONIRUN_FAULTS") != NULL;
     if (p->sigact[sig][0] > 1 && !(c->sigmask & bit) && p->state == P_RUNNING) {
+        if (show_faults && sig != 11) {                   // SIGSEGV is ART's null check; the others are news
+            fprintf(stderr, "onirun: [%d] %s: signal %d at pc %llx\n", p->pid, p->exe, sig, (unsigned long long)c->pc);
+            proc_backtrace(c);
+        } else if (show_faults && sig == 11 && addr > 0x10000) {   // a real bad pointer, not a null check
+            char where[1200];
+            mm_symbolize(p->mm, c->pc, where, sizeof where);
+            fprintf(stderr, "onirun: [%d] %s: SIGSEGV at %s addr %llx\n", p->pid, p->exe, where, (unsigned long long)addr);
+            proc_backtrace(c);
+        }
         if (g_verbose) {
             char where[1200];
             mm_symbolize(p->mm, c->pc, where, sizeof where);
@@ -991,4 +1025,5 @@ void proc_dump_all(void) {
         }
     }
     pthread_mutex_unlock(&g_lock);
+    binder_dump();
 }

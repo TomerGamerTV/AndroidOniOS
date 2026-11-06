@@ -454,6 +454,16 @@ void sys_dispatch(GuestCtx *c) {
         if (gstr(a1) && gstr(a1)[0] == '/') {
             int d = vfs_open_dev(p, gstr(a1), (int)a2);
             if (d != 1) { r = OBJRET(d); break; }
+        } else if (gstr(a1) && (int)a0 != L_AT_FDCWD) {
+            // openat(dirfd of /proc/N or /sys/..., "status"): the directory is a listing we generate,
+            // so resolve the name against its guest path and serve it the same way.
+            int h0 = fd_host(p, (int)a0);
+            char dirp[1024];
+            if (h0 >= 0 && fd_get_path(h0, dirp, sizeof dirp) && (!strncmp(dirp, "/proc", 5) || !strncmp(dirp, "/sys", 4))) {
+                snprintf(path, sizeof path, "%s/%s", dirp, gstr(a1));
+                int d = vfs_open_dev(p, path, (int)a2);
+                if (d != 1) { r = OBJRET(d); break; }
+            }
         }
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !(a2 & 0100000), &hfd))) { r = ERR(-e); break; }
         int fd = openat(hfd, path, open_flags(a2), (int)(a3 & ~p->umask));
@@ -1014,17 +1024,31 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 102: case 103: if (nr == 103 && a2) memset(gptr(a2), 0, 32); if (nr == 102) memset(gptr(a1), 0, 32); r = 0; break;   // getitimer/setitimer: accepted, never fire
-    case 283: r = 0; break;         // membarrier
+    case 5: case 6: case 7: r = 0; break;                              // setxattr, lsetxattr, fsetxattr: accepted (SELinux labels)
+    case 8: case 9: case 10: {                                          // getxattr, lgetxattr, fgetxattr
+        const char *name = gstr(nr == 10 ? a1 : a1);
+        if (name && !strcmp(name, "security.selinux")) {
+            const char *ctx = "u:object_r:system_data_file:s0";
+            size_t n = strlen(ctx) + 1;
+            if (a3 == 0) { r = n; break; }
+            if (a3 < n) { r = ERR(34); break; }
+            memcpy(gptr(a2), ctx, n);
+            r = n;
+        } else r = ERR(61);                                             // ENODATA
+        break;
+    }
+    case 11: case 12: case 13: r = 0; break;                            // listxattr family: none
+    case 14: case 15: case 16: r = 0; break;                            // removexattr family
+    case 283: r = proc_membarrier(c, (int)a0); break;   // membarrier
     case 293: case 435: case 291: case 282: case 280: case 117: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd, bpf, ptrace
-    case 232: {               // mincore: Linux reports 4 KiB pages; the host has 16 KiB ones
+    case 232: {               // mincore: one byte per page; the guest's page size is the host's (AT_PAGESZ)
         uint64_t len = PG_UP(a1);
-        if (a0 & 4095) { r = ERR(22); break; }
-        if (!mm_readable(p->mm, a0 & ~(PG - 1), 1) && !p->mm) { r = ERR(12); break; }
+        if (a0 & (PG - 1)) { r = ERR(22); break; }
+        if (!len || a0 + len > WIN_SIZE) { r = ERR(12); break; }
         char *hv = calloc(len / PG + 1, 1);
-        if (mincore((void *)(uintptr_t)(c->base + (a0 & ~(PG - 1))), len, hv)) { free(hv); r = ERR(lx_errno(errno)); break; }
+        if (mincore((void *)(uintptr_t)(c->base + a0), len, hv)) { free(hv); r = ERR(lx_errno(errno)); break; }
         uint8_t *out = gptr(a2);
-        uint64_t npages = (a1 + 4095) / 4096, first = (a0 & (PG - 1)) / 4096;
-        for (uint64_t i = 0; i < npages; i++) out[i] = (hv[(i + first) * 4096 / PG] & 1) ? 1 : 0;
+        for (uint64_t i = 0; i < len / PG; i++) out[i] = hv[i] & 1;
         free(hv);
         r = 0;
         break;

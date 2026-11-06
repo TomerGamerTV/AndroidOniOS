@@ -152,9 +152,14 @@ struct BProc {
     int max_threads, requested_threads, started_threads, ready_threads;
     bool dead;
     char secctx[64];
+    BProc *next_all;
 };
+static BProc *all_bprocs;
 
 static pthread_mutex_t blk = PTHREAD_MUTEX_INITIALIZER;   // one lock for the whole driver
+static uint64_t blk_owner;                                  // host thread id holding blk (diagnostics)
+static const char *blk_where;
+#define BLK_LOCK(w) do { pthread_mutex_lock(&blk); pthread_threadid_np(NULL, &blk_owner); blk_where = (w); } while (0)
 static BCtx *ctxs;
 static __thread BThread *cur_th;      // the thread inside the ioctl, for work that belongs to the caller
 
@@ -178,7 +183,8 @@ static bool proc_has_work(BProc *p) {
 }
 
 static void thread_wake(BThread *t) {
-    if (t->wake_wr >= 0) { char b = 1; write(t->wake_wr, &b, 1); }
+    // Non-blocking: a full pipe already means a wake is pending, and blocking here would hold blk.
+    if (t->wake_wr >= 0) { char b = 0x7d; (void)!write(t->wake_wr, &b, 1); }
 }
 
 // Something changed in p's queues: wake a thread that waits for process work and update the fd.
@@ -360,7 +366,10 @@ static BThread *thread_get(BProc *p, uint64_t tid) {
     t->proc = p;
     t->tid = tid;
     int pf[2];
-    if (pipe(pf) == 0) { t->wake_rd = pf[0]; t->wake_wr = pf[1]; fcntl(pf[0], F_SETFD, FD_CLOEXEC); fcntl(pf[1], F_SETFD, FD_CLOEXEC); }
+    if (pipe(pf) == 0) {
+        t->wake_rd = pf[0]; t->wake_wr = pf[1];
+        for (int i = 0; i < 2; i++) { fcntl(pf[i], F_SETFD, FD_CLOEXEC); fcntl(pf[i], F_SETFL, O_NONBLOCK); }
+    }
     else t->wake_rd = t->wake_wr = -1;
     t->next = p->threads;
     p->threads = t;
@@ -784,12 +793,12 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             pthread_mutex_unlock(&blk);
             struct pollfd pf = { th->wake_rd, POLLIN, 0 };
             int r = poll(&pf, 1, -1);
-            pthread_mutex_lock(&blk);
+            BLK_LOCK(__func__);
             th->looper &= ~LOOPER_WAITING;
             if (th->waiting_proc) p->ready_threads--;
             th->waiting_proc = false;
-            char junk[16];
-            while (read(th->wake_rd, junk, sizeof junk) > 0 && !(fcntl(th->wake_rd, F_GETFL) & O_NONBLOCK)) break;
+            char junk[64];
+            while (read(th->wake_rd, junk, sizeof junk) > 0) {}      // drain every pending wake
             if (r < 0) { *consumed = pos; return -EINTR; }
             if (c->kill) { *consumed = pos; return -EINTR; }
             continue;
@@ -861,7 +870,7 @@ static int64_t binder_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
     BProc *p = o->data;
     if (IOC_TYPE(req) != 'b') return -ENOTTY;
     int64_t r = 0;
-    pthread_mutex_lock(&blk);
+    BLK_LOCK(__func__);
     if (p->dead) { pthread_mutex_unlock(&blk); return -ENODEV; }
     BThread *th = thread_get(p, c->tid);
     cur_th = th;
@@ -918,7 +927,7 @@ static int64_t binder_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
 static void binder_mapped(FdObj *o, GuestCtx *c, uint64_t gaddr, uint64_t len, int prot, uint64_t off) {
     (void)c; (void)prot; (void)off;
     BProc *p = o->data;
-    pthread_mutex_lock(&blk);
+    BLK_LOCK(__func__);
     if (!p->buf_host) {
         ftruncate(o->mmap_fd, (off_t)len);
         void *alias = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, o->mmap_fd, 0);
@@ -938,8 +947,9 @@ static void binder_mapped(FdObj *o, GuestCtx *c, uint64_t gaddr, uint64_t len, i
 // The last fd to this BProc closed: the process is gone as far as binder is concerned.
 static void binder_release(FdObj *o) {
     BProc *p = o->data;
-    pthread_mutex_lock(&blk);
+    BLK_LOCK(__func__);
     p->dead = true;
+    for (BProc **pp = &all_bprocs; *pp; pp = &(*pp)->next_all) if (*pp == p) { *pp = p->next_all; break; }
     if (p->ctx->mgr && p->ctx->mgr->proc == p) p->ctx->mgr = NULL;
     // Our references go away.
     while (p->refs) { BRef *r = p->refs; r->death = false; while (r->strong) ref_dec(r, true); while (r->weak) ref_dec(r, false); if (p->refs == r) ref_free(r); }
@@ -979,6 +989,45 @@ static void binder_release(FdObj *o) {
     free(p);
 }
 
+
+static void dump_trans(const char *tag, BTrans *t) {
+    fprintf(stderr, "      %s %s code %u flags %#x from %d/%llu to %d/%llu need_reply %d size %llu\n", tag,
+            t->is_reply ? "reply" : "txn", t->code, t->flags, t->from_proc ? t->from_proc->pid : -1,
+            (unsigned long long)(t->from ? t->from->tid : 0), t->to_proc ? t->to_proc->pid : -1,
+            (unsigned long long)(t->to_thread ? t->to_thread->tid : 0), t->need_reply, (unsigned long long)t->data_size);
+}
+
+// SIGINFO companion of proc_dump_all: every binder thread's transaction stack and pending work.
+void binder_dump(void) {
+    int tries = 0;
+    while (pthread_mutex_trylock(&blk) != 0) {
+        if (++tries > 200) { fprintf(stderr, "onirun: binder lock is held; dumping unlocked (owner tid %llu in %s)\n", (unsigned long long)blk_owner, blk_where ? blk_where : "?"); break; }
+        usleep(10000);
+    }
+    bool locked = tries <= 200;
+    fprintf(stderr, "onirun: --- binder ---\n");
+    for (BProc *p = all_bprocs; p; p = p->next_all) {
+        int ntodo = 0;
+        for (BWork *w = p->todo.head; w; w = w->next) ntodo++;
+        fprintf(stderr, "  [%d] %s threads max %d started %d ready %d requested %d proc-todo %d\n", p->pid, p->ctx->name,
+                p->max_threads, p->started_threads, p->ready_threads, p->requested_threads, ntodo);
+        for (BWork *w = p->todo.head; w; w = w->next)
+            if (w->kind == W_TRANSACTION && w->t) dump_trans("queued", w->t);
+            else fprintf(stderr, "      queued work kind %d\n", w->kind);
+        for (BThread *t = p->threads; t; t = t->next) {
+            int n = 0;
+            for (BWork *w = t->todo.head; w; w = w->next) n++;
+            if (!t->stack && !n) continue;
+            fprintf(stderr, "    tid %llu looper %#x waiting_proc %d todo %d\n", (unsigned long long)t->tid, t->looper, t->waiting_proc, n);
+            for (BTrans *x = t->stack; x; x = x->from == t ? x->from_parent : x->to_parent) dump_trans("stack", x);
+            for (BWork *w = t->todo.head; w; w = w->next)
+                if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t) dump_trans("todo", w->t);
+                else fprintf(stderr, "      todo work kind %d err %#x\n", w->kind, w->error);
+        }
+    }
+    if (locked) pthread_mutex_unlock(&blk);
+}
+
 static const FdOps binder_ops = { "binder", NULL, NULL, binder_ioctl, binder_mapped, binder_release };
 
 static BCtx *ctx_get(const char *name) {
@@ -996,7 +1045,9 @@ int binder_open(Proc *proc, const char *context, int lflags) {
     p->pid = proc->pid;
     p->next_desc = 1;
     p->max_threads = 15;
-    pthread_mutex_lock(&blk);
+    BLK_LOCK(__func__);
+    p->next_all = all_bprocs;
+    all_bprocs = p;
     p->ctx = ctx_get(context);
     pthread_mutex_unlock(&blk);
     FdObj *o = obj_new(&binder_ops, p, true);

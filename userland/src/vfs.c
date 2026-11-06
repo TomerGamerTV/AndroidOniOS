@@ -45,7 +45,7 @@ void obj_put(FdObj *o) {
 void obj_set_ready(FdObj *o, bool ready) {
     if (ready == o->ready || o->wr < 0) { o->ready = ready; return; }
     o->ready = ready;
-    char b = 1;
+    char b = 0x7e;                       // a recognizable byte, in case it ever lands where it shouldn't
     if (ready) write(o->wr, &b, 1);
     else read(o->rd, &b, 1);
 }
