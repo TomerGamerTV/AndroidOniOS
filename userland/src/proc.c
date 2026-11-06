@@ -249,6 +249,44 @@ static void wake_tid_word(GuestCtx *c, uint64_t addr) {
 
 static void finish_proc_locked(Proc *p);
 
+// ---- pidfds: an fd per process that becomes readable when it exits ----
+typedef struct PidFd { int pid; FdObj *o; struct PidFd *next; } PidFd;
+static PidFd *pidfds;                     // g_lock
+static void pidfd_release(FdObj *o) {
+    pthread_mutex_lock(&g_lock);
+    for (PidFd **pp = &pidfds; *pp; pp = &(*pp)->next)
+        if ((*pp)->o == o) { PidFd *x = *pp; *pp = x->next; free(x); break; }
+    pthread_mutex_unlock(&g_lock);
+}
+static const FdOps pidfd_ops = { "pidfd", NULL, NULL, NULL, NULL, pidfd_release };
+static void pidfd_exited_locked(int pid) {
+    for (PidFd *x = pidfds; x; x = x->next)
+        if (x->pid == pid) { pthread_mutex_lock(&x->o->lock); obj_set_ready(x->o, true); pthread_mutex_unlock(&x->o->lock); }
+}
+Proc *proc_find(int pid);
+uint64_t proc_pidfd_open(GuestCtx *c, int64_t pid, int flags) {
+    pthread_mutex_lock(&g_lock);
+    Proc *q = proc_find((int)pid);
+    if (!q) { pthread_mutex_unlock(&g_lock); return ERR(3); }
+    bool dead = q->state == P_ZOMBIE;
+    PidFd *x = calloc(1, sizeof *x);
+    x->pid = (int)pid;
+    x->o = obj_new(&pidfd_ops, (void *)(intptr_t)pid, true);
+    x->next = pidfds;
+    pidfds = x;
+    if (dead) { pthread_mutex_lock(&x->o->lock); obj_set_ready(x->o, true); pthread_mutex_unlock(&x->o->lock); }
+    pthread_mutex_unlock(&g_lock);
+    fd_set_path(x->o->rd, "anon_inode:[pidfd]");
+    int g = fd_install_obj(c->proc, x->o->rd, x->o, true);
+    (void)flags;
+    return g < 0 ? ERR(-g) : (uint64_t)g;
+}
+int proc_pidfd_pid(Proc *p, int gfd) {
+    int h = fd_host(p, gfd);
+    FdObj *o = h >= 0 ? fd_obj(h) : NULL;
+    return o && o->ops == &pidfd_ops ? (int)(intptr_t)o->data : -1;
+}
+
 // The calling thread leaves its process; the last thread out finishes the process.
 __attribute__((noreturn)) static void thread_leave(GuestCtx *c) {
     Proc *p = c->proc;
@@ -306,6 +344,7 @@ static void finish_proc_locked(Proc *p) {
         q = n;
     }
     p->state = P_ZOMBIE;
+    pidfd_exited_locked(p->pid);
     Proc *par = p->parent;
     bool autoreap = !par || par->sigact[17][0] == 1 || (par->sigact[17][1] & L_SA_NOCLDWAIT);
     if (par && p->exit_signal) post_signal_locked(par, NULL, p->exit_signal);
@@ -841,7 +880,9 @@ fail:
 }
 
 // ---- wait ----
-uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint64_t rusage) {
+// Waits for a child matching pid (wait4 conventions). Returns its id and status, 0 for WNOHANG
+// with nothing ready, or -errno. nowait leaves the zombie in place (waitid WNOWAIT).
+static int64_t wait_core(GuestCtx *c, int64_t pid, bool nohang, bool nowait, int *wstatus, uint32_t *uid) {
     Proc *p = c->proc;
     pthread_mutex_lock(&g_lock);
     for (;;) {
@@ -852,20 +893,54 @@ uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint
             if (!match) continue;
             any = true;
             if (q->state != P_ZOMBIE) continue;
-            int id = q->pid, ws = q->wstatus;
-            proc_free_locked(q);
+            int id = q->pid;
+            *wstatus = q->wstatus;
+            if (uid) *uid = q->uid;
+            if (!nowait) proc_free_locked(q);
             pthread_mutex_unlock(&g_lock);
-            if (status) *(int32_t *)gptr(status) = ws;
-            if (rusage) memset(gptr(rusage), 0, 144);
-            return (uint64_t)id;
+            return id;
         }
-        if (!any) { pthread_mutex_unlock(&g_lock); return ERR(10); }   // ECHILD
-        if (options & 1) { pthread_mutex_unlock(&g_lock); return 0; } // WNOHANG
-        if (c->kill || proc_deliverable(c)) { pthread_mutex_unlock(&g_lock); return ERR(4); }
+        if (!any) { pthread_mutex_unlock(&g_lock); return -10; }        // ECHILD
+        if (nohang) { pthread_mutex_unlock(&g_lock); return 0; }
+        if (c->kill || proc_deliverable(c)) { pthread_mutex_unlock(&g_lock); return -4; }
         pthread_cond_wait(&g_cond, &g_lock);
     }
 }
 
+// waitid(idtype, id, infop, options): P_ALL 0, P_PID 1, P_PGID 2, P_PIDFD 3; WNOHANG 1, WNOWAIT 0x01000000.
+uint64_t proc_waitid(GuestCtx *c, int idtype, int64_t id, uint64_t infop, int options) {
+    int64_t sel;
+    if (idtype == 0) sel = -1;
+    else if (idtype == 1) sel = id;
+    else if (idtype == 2) sel = id ? -id : 0;
+    else if (idtype == 3) { int pid = proc_pidfd_pid(c->proc, (int)id); if (pid < 0) return ERR(9); sel = pid; }
+    else return ERR(22);
+    int ws = 0;
+    uint32_t uid = 0;
+    int64_t r = wait_core(c, sel, options & 1, options & 0x01000000, &ws, &uid);
+    if (r < 0) return ERR(-r);
+    if (infop) {
+        uint8_t *si = gptr(infop);
+        memset(si, 0, 128);
+        if (r > 0) {
+            int32_t signo = 17, code, st;
+            if (ws & 0x7f) { code = (ws & 0x80) ? 3 : 2; st = ws & 0x7f; }   // CLD_DUMPED / CLD_KILLED
+            else { code = 1; st = (ws >> 8) & 0xff; }                          // CLD_EXITED
+            memcpy(si, &signo, 4); memcpy(si + 8, &code, 4);
+            int32_t pid32 = (int32_t)r; memcpy(si + 16, &pid32, 4); memcpy(si + 20, &uid, 4); memcpy(si + 24, &st, 4);
+        }
+    }
+    return 0;
+}
+
+uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint64_t rusage) {
+    int ws = 0;
+    int64_t r = wait_core(c, pid, options & 1, false, &ws, NULL);
+    if (r <= 0) return r < 0 ? ERR(-r) : 0;
+    if (status) *(int32_t *)gptr(status) = ws;
+    if (rusage) memset(gptr(rusage), 0, 144);
+    return (uint64_t)r;
+}
 // ---- process groups ----
 uint64_t proc_setpgid(GuestCtx *c, int64_t pid, int64_t pgid) {
     uint64_t r = ERR(3);

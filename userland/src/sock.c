@@ -656,6 +656,15 @@ static int64_t do_getsockopt(GuestCtx *c, int gfd, int level, int opt, uint64_t 
     case 38: break;                                                           // SO_PROTOCOL
     case 39: *(int32_t *)out = L_AF_UNIX; break;                              // SO_DOMAIN
     case 16: *(int32_t *)out = s->passcred; break;                            // SO_PASSCRED
+    case 20: case 21: case 66: case 67: {                                     // SO_RCVTIMEO / SO_SNDTIMEO (old and 64-bit)
+        struct timeval htv = {0};
+        socklen_t hl = sizeof htv;
+        if (getsockopt(h, SOL_SOCKET, (opt == 20 || opt == 66) ? SO_RCVTIMEO : SO_SNDTIMEO, &htv, &hl)) return -errno;
+        int64_t tv[2] = { (int64_t)htv.tv_sec, (int64_t)htv.tv_usec };
+        memcpy(out, tv, 16);
+        n = 16;
+        break;
+    }
     default: return -ENOPROTOOPT;
     }
     if (*len < n) n = *len;
@@ -671,11 +680,11 @@ static int64_t do_setsockopt(GuestCtx *c, int gfd, int level, int opt, uint64_t 
     if (level != L_SOL_SOCKET) return 0;
     switch (opt) {
     case 16: s->passcred = *(int32_t *)gptr(val) != 0; return 0;              // SO_PASSCRED
-    case 20: case 21: {                                                       // SO_RCVTIMEO / SO_SNDTIMEO
+    case 20: case 21: case 66: case 67: {                                     // SO_RCVTIMEO / SO_SNDTIMEO (old and 64-bit)
         if (len < 16) return -EINVAL;
         const int64_t *tv = gptr(val);
         struct timeval htv = { (time_t)tv[0], (suseconds_t)tv[1] };
-        return setsockopt(h, SOL_SOCKET, opt == 20 ? SO_RCVTIMEO : SO_SNDTIMEO, &htv, sizeof htv) ? -errno : 0;
+        return setsockopt(h, SOL_SOCKET, (opt == 20 || opt == 66) ? SO_RCVTIMEO : SO_SNDTIMEO, &htv, sizeof htv) ? -errno : 0;
     }
     default: return 0;
     }

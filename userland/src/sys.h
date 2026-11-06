@@ -198,6 +198,8 @@ __attribute__((noreturn)) void proc_exit_thread(GuestCtx *c, int status);
 __attribute__((noreturn)) void proc_exit_group(GuestCtx *c, int status);
 uint64_t proc_wait4(GuestCtx *c, int64_t pid, uint64_t status, int options, uint64_t rusage);
 uint64_t proc_kill(GuestCtx *c, int64_t pid, int sig);
+uint64_t proc_waitid(GuestCtx *c, int idtype, int64_t id, uint64_t infop, int options);
+uint64_t proc_pidfd_open(GuestCtx *c, int64_t pid, int flags);
 uint64_t proc_tgkill(GuestCtx *c, int64_t tgid, int64_t tid, int sig);
 uint64_t proc_sigsuspend(GuestCtx *c, uint64_t mask);   // sets x0 itself
 int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct timespec *timeout);

@@ -926,20 +926,11 @@ void sys_dispatch(GuestCtx *c) {
     case 131: case 240: r = proc_tgkill(c, (int64_t)(int32_t)a0, (int64_t)(int32_t)a1, (int)a2); break;
     case 220: r = proc_clone(c, a0, a1, a2, a3, a4); break;
     case 260: r = proc_wait4(c, (int64_t)(int32_t)a0, a1, (int)a2, a3); break;
-    case 95: {                // waitid(idtype, id, infop, options, rusage)
-        int64_t which = a0 == 1 ? (int64_t)(int32_t)a1 : a0 == 2 ? -(int64_t)(int32_t)a1 : -1;   // P_PID, P_PGID, P_ALL
-        if (a0 == 2 && a1 == 0) which = 0;
-        int32_t status = 0;
-        uint64_t ws = proc_wait4(c, which, 0, (int)(a3 & 1), 0);          // WNOHANG passes through
-        if ((int64_t)ws < 0) { r = ws; break; }
-        if (ws > 0) {
-            Proc *dead = NULL;   // the status was consumed by proc_wait4; recover it from its return value
-            (void)dead;
-        }
-        r = ws;
-        (void)status;
+    case 95:                  // waitid(idtype, id, infop, options, rusage)
+        r = proc_waitid(c, (int)a0, (int64_t)(int32_t)a1, a2, (int)a3);
+        if (a4) memset(gptr(a4), 0, 144);
         break;
-    }
+    case 434: r = proc_pidfd_open(c, (int64_t)(int32_t)a0, (int)a1); break;   // pidfd_open
     case 166: r = p->umask; p->umask = (mode_t)(a0 & 0777); break;
     case 154: r = proc_setpgid(c, (int64_t)(int32_t)a0, (int64_t)(int32_t)a1); break;
     case 155: r = proc_getpgid(c, (int64_t)(int32_t)a0); break;
