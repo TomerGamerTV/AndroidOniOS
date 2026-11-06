@@ -180,7 +180,7 @@ def main():
     dirs = '''mnt/user/0 mnt/expand mnt/runtime/default/emulated mnt/runtime/read/emulated mnt/runtime/write/emulated
     mnt/runtime/full/emulated mnt/sdcard mnt/media_rw mnt/pass_through/0/emulated mnt/installer/0/emulated
     mnt/androidwritable/0/emulated storage/emulated/0 storage/self cache config metadata data/system data/misc
-    data/misc_ce/0 data/misc_de/0 data/system_ce/0 data/system_de/0 data/user/0 data/user_de/0 data/app
+    data/misc_ce/0 data/misc_de/0 data/system_ce/0 data/system_de/0 data/user data/user_de/0 data/app
     data/app-private data/app-ephemeral data/app-lib data/app-staging data/apex data/dalvik-cache/arm64 data/data
     data/media/0 data/local/tmp data/vendor data/vendor_ce/0 data/vendor_de/0 data/property data/anr data/tombstones
     data/backup data/cache data/drm data/mediadrm data/nfc data/resource-cache data/ss data/misc/wifi
@@ -198,6 +198,11 @@ def main():
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)
+    # As init does: /data/user/0 is the primary user's view of /data/data
+    u0 = os.path.join(R, 'data/user/0')
+    if os.path.isdir(u0) and not os.path.islink(u0) and not os.listdir(u0):
+        os.rmdir(u0)
+    symlink('/data/data', u0)
     # Classes whose static initializers the boot image used to pre-run (policy metadata registers
     # itself that way); without a boot image, zygote's preload initializes them instead.
     pre = os.path.join(R, 'system/etc/preloaded-classes')

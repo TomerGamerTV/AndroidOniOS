@@ -246,23 +246,56 @@ static bool is_devnode(const char *gpath) {
 
 // Pinned BPF objects carry the owner and mode netbpfload would have given them (mkbpffs.py stores
 // them as xattrs; the host files themselves stay ours).
+// Guest ownership and mode, where the guest set them (chown/chmod) or mkbpffs recorded them, are
+// xattrs on the host file; the host file itself stays owned by, and writable for, onirun's user.
+static bool has_stored_attrs(const char *gpath) {
+    return gpath && (!strncmp(gpath, "/data/", 6) || !strncmp(gpath, "/sys/fs/bpf", 11) ||
+                     !strncmp(gpath, "/apex/com.android.tethering/bin/for-system", 42) || !strncmp(gpath, "/mnt/", 5) ||
+                     !strncmp(gpath, "/metadata/", 10) || !strncmp(gpath, "/dev/socket/", 12));
+}
 static bool bpf_attrs(const char *gpath, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
-    if (!gpath || (strncmp(gpath, "/sys/fs/bpf", 11) && strncmp(gpath, "/apex/com.android.tethering/bin/for-system", 42))) return false;
+    if (!has_stored_attrs(gpath)) return false;
     char hp[1400], v[32];
     snprintf(hp, sizeof hp, "%s%s", g_rootfs, gpath);
-    ssize_t n = getxattr(hp, "user.oni.mode", v, sizeof v - 1, 0, 0);
-    if (n <= 0) return false;
-    v[n] = 0; *mode = (uint32_t)strtoul(v, NULL, 8);
-    if ((n = getxattr(hp, "user.oni.uid", v, sizeof v - 1, 0, 0)) > 0) { v[n] = 0; *uid = (uint32_t)strtoul(v, NULL, 10); }
-    if ((n = getxattr(hp, "user.oni.gid", v, sizeof v - 1, 0, 0)) > 0) { v[n] = 0; *gid = (uint32_t)strtoul(v, NULL, 10); }
-    return true;
+    bool any = false;
+    ssize_t n;
+    if ((n = getxattr(hp, "user.oni.mode", v, sizeof v - 1, 0, XATTR_NOFOLLOW)) > 0) { v[n] = 0; *mode = (uint32_t)strtoul(v, NULL, 8); any = true; }
+    if ((n = getxattr(hp, "user.oni.uid", v, sizeof v - 1, 0, XATTR_NOFOLLOW)) > 0) { v[n] = 0; *uid = (uint32_t)strtoul(v, NULL, 10); any = true; }
+    if ((n = getxattr(hp, "user.oni.gid", v, sizeof v - 1, 0, XATTR_NOFOLLOW)) > 0) { v[n] = 0; *gid = (uint32_t)strtoul(v, NULL, 10); any = true; }
+    return any;
+}
+static void store_attr(int hfd_or_dir, const char *path, int fd, const char *key, const char *val, bool nofollow) {
+    if (fd >= 0) { fsetxattr(fd, key, val, strlen(val), 0, 0); return; }
+    if (hfd_or_dir == AT_FDCWD) { setxattr(path, key, val, strlen(val), 0, nofollow ? XATTR_NOFOLLOW : 0); return; }
+    int d = openat(hfd_or_dir, path, O_RDONLY | (nofollow ? O_SYMLINK : 0));
+    if (d >= 0) { fsetxattr(d, key, val, strlen(val), 0, 0); close(d); }
+}
+
+
+// The system partitions are read-only on a device; here they are ordinary host files, so callers
+// that check writability (ART refuses to load a writable dex for apps targeting U+) must hear EROFS.
+static bool readonly_partition(Proc *p, int hfd, const char *path) {
+    (void)p;
+    char g[1400];
+    if (hfd == AT_FDCWD) snprintf(g, sizeof g, "%s", guest_of(path));
+    else {
+        char dir[1024];
+        if (!fd_get_path(hfd, dir, sizeof dir)) return false;
+        snprintf(g, sizeof g, "%s/%s", dir, path);
+    }
+    static const char *ro[] = { "/system", "/system_ext", "/product", "/vendor", "/odm", "/apex" };
+    for (size_t i = 0; i < sizeof ro / sizeof *ro; i++) {
+        size_t n = strlen(ro[i]);
+        if (!strncmp(g, ro[i], n) && (g[n] == 0 || g[n] == '/')) return true;
+    }
+    return false;
 }
 
 static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
     uint32_t owner = shell_owned(gpath) ? 2000 : 0, group = owner;
     uint32_t mode = st->st_mode;
-    uint32_t bmode;
-    if (bpf_attrs(gpath, &owner, &group, &bmode)) mode = (st->st_mode & S_IFMT) | bmode;
+    uint32_t bmode = st->st_mode & 07777;
+    if (bpf_attrs(gpath, &owner, &group, &bmode)) mode = (st->st_mode & S_IFMT) | (bmode & 07777);
     uint64_t rdev = (uint64_t)st->st_rdev;
     if (is_devnode(gpath) && S_ISREG(st->st_mode)) { mode = S_IFCHR | 0666; rdev = dev_rdev(gpath + 5); }   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};
@@ -619,6 +652,7 @@ void sys_dispatch(GuestCtx *c) {
     }
     case 48: case 439: {   // faccessat, faccessat2
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, true, &hfd))) { r = ERR(-e); break; }
+        if ((a2 & 2) && readonly_partition(p, hfd, path)) { r = faccessat(hfd, path, F_OK, 0) ? ERR(lx_errno(errno)) : ERR(30); break; }   // W_OK: EROFS
         r = HOSTRET(faccessat(hfd, path, (int)a2, 0));
         break;
     }
@@ -982,7 +1016,16 @@ void sys_dispatch(GuestCtx *c) {
     }
     case 36: {               // symlinkat(target, dirfd, linkpath)
         if ((e = resolve_at(p, (int)a1, gstr(a2), path, sizeof path, false, &hfd))) { r = ERR(-e); break; }
-        r = HOSTRET(symlinkat(gstr(a0), hfd, path));
+        int rc = symlinkat(gstr(a0), hfd, path);
+        if (rc && errno == EEXIST) {
+            // The same link already there counts as success: zygote recreates /data/user/0 -> /data/data
+            // inside a mount namespace it can't have here (its tmpfs mount over /data/user is a no-op).
+            char cur[1024];
+            ssize_t n = readlinkat(hfd, path, cur, sizeof cur - 1);
+            if (n >= 0) { cur[n] = 0; if (!strcmp(cur, gstr(a0))) rc = 0; }
+            if (rc) errno = EEXIST;
+        }
+        r = HOSTRET(rc);
         break;
     }
     case 37: {               // linkat
@@ -991,7 +1034,63 @@ void sys_dispatch(GuestCtx *c) {
         r = HOSTRET(linkat(hfd, path, hfd2, path2, 0));
         break;
     }
-    case 53: case 52: case 54: case 55: case 88: case 452: r = 0; break;   // chmod/chown/utimens/fchmodat2: accept
+    case 52: case 53: case 452: {   // fchmod(fd, mode), fchmodat(dirfd, path, mode[, flags]): guest mode stored, host keeps u+rw(x)
+        uint32_t mode = (uint32_t)(nr == 52 ? a1 : a2) & 07777;
+        char v[16];
+        snprintf(v, sizeof v, "%o", mode);
+        struct stat hs;
+        if (nr == 52) {
+            h = HFD(a0);
+            if (fstat(h, &hs)) { r = ERR(lx_errno(errno)); break; }
+            fchmod(h, (mode_t)(mode | (S_ISDIR(hs.st_mode) ? 0700 : 0600)));
+            store_attr(-1, NULL, h, "user.oni.mode", v, false);
+            r = 0;
+            break;
+        }
+        bool nofollow = nr == 452 && (a3 & 0x100);
+        if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !nofollow, &hfd))) { r = ERR(-e); break; }
+        if (fstatat(hfd, path, &hs, nofollow ? AT_SYMLINK_NOFOLLOW : 0)) { r = ERR(lx_errno(errno)); break; }
+        if (!S_ISLNK(hs.st_mode)) fchmodat(hfd, path, (mode_t)(mode | (S_ISDIR(hs.st_mode) ? 0700 : 0600)), 0);
+        store_attr(hfd, path, -1, "user.oni.mode", v, nofollow);
+        r = 0;
+        break;
+    }
+    case 54: case 55: {   // fchownat(dirfd, path, uid, gid, flags), fchown(fd, uid, gid): recorded as xattrs
+        int64_t uid = (int32_t)(nr == 55 ? a1 : a2), gid = (int32_t)(nr == 55 ? a2 : a3);
+        char vu[16], vg[16];
+        snprintf(vu, sizeof vu, "%lld", (long long)uid); snprintf(vg, sizeof vg, "%lld", (long long)gid);
+        if (nr == 55) {
+            h = HFD(a0);
+            if (uid >= 0) store_attr(-1, NULL, h, "user.oni.uid", vu, false);
+            if (gid >= 0) store_attr(-1, NULL, h, "user.oni.gid", vg, false);
+            r = 0;
+            break;
+        }
+        bool nofollow = a4 & 0x100;
+        if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !nofollow, &hfd))) { r = ERR(-e); break; }
+        struct stat hs;
+        if (fstatat(hfd, path, &hs, nofollow ? AT_SYMLINK_NOFOLLOW : 0)) { r = ERR(lx_errno(errno)); break; }
+        if (uid >= 0) store_attr(hfd, path, -1, "user.oni.uid", vu, nofollow);
+        if (gid >= 0) store_attr(hfd, path, -1, "user.oni.gid", vg, nofollow);
+        r = 0;
+        break;
+    }
+    case 88: {   // utimensat(dirfd, path, times[2], flags): Linux UTIME_NOW/OMIT differ from the host's
+        struct timespec ts[2], *tp = NULL;
+        if (a2) {
+            const int64_t *g = gptr(a2);
+            for (int i = 0; i < 2; i++) {
+                ts[i].tv_sec = (time_t)g[2 * i];
+                int64_t ns = g[2 * i + 1];
+                ts[i].tv_nsec = ns == (1 << 30) - 1 ? UTIME_NOW : ns == (1 << 30) - 2 ? UTIME_OMIT : (long)ns;
+            }
+            tp = ts;
+        }
+        if (!a1) { h = HFD(a0); r = HOSTRET(futimens(h, tp)); break; }
+        if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !(a3 & 0x100), &hfd))) { r = ERR(-e); break; }
+        r = HOSTRET(utimensat(hfd, path, tp, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0));
+        break;
+    }
     case 72: {               // pselect6(n, readfds, writefds, exceptfds, timeout, sigmask): via poll
         int n = (int)a0;
         if (n < 0 || n > 1024) { r = ERR(22); break; }
