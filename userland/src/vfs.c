@@ -489,6 +489,7 @@ int vfs_open_dev(Proc *p, const char *path, int lflags) {
     if (!strcmp(n, "binder") || !strcmp(n, "binderfs/binder")) return binder_open(p, "binder", lflags);
     if (!strcmp(n, "hwbinder") || !strcmp(n, "binderfs/hwbinder")) return binder_open(p, "hwbinder", lflags);
     if (!strcmp(n, "vndbinder") || !strcmp(n, "binderfs/vndbinder")) return binder_open(p, "vndbinder", lflags);
+    if (!strncmp(n, "goldfish_pipe", 13) || !strcmp(n, "qemu_pipe")) return goldfish_pipe_open(p, path, lflags);
     if (!strcmp(n, "dri/renderD128")) return gpu_open(p, false, lflags);
     if (!strcmp(n, "dri/card0")) return gpu_open(p, true, lflags);
     return 1;

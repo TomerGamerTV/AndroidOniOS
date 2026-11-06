@@ -35,7 +35,7 @@ typedef struct Sock {
     uint32_t peer_uid, peer_gid;
     char key[112];
     int send_fd;              // bound datagram socket: the end senders write to
-    bool passcred, netlink;
+    bool passcred, netlink, vsock;
     Pending *q;
     int qn, qcap;
     FdObj *o;
@@ -269,6 +269,17 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
         s->o->ops = &netlink_ops;
         return g;
     }
+    if (domain == 40) {                                   // AF_VSOCK: exists (libqemupipe probes it), connects to nothing
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp)) return -errno;
+        fcntl(sp[1], F_SETFD, FD_CLOEXEC);
+        int g = sock_create(c->proc, L_SOCK_STREAM | (type & ~0xf), sp[0], type);
+        if (g < 0) { close(sp[1]); return g; }
+        Sock *s = sock_of(c->proc, g, NULL);
+        s->send_fd = sp[1];
+        s->vsock = true;
+        return g;
+    }
     if (domain != L_AF_UNIX) return -EAFNOSUPPORT;
     int t = type & 0xf;
     if (t != L_SOCK_STREAM && t != L_SOCK_DGRAM && t != L_SOCK_SEQPACKET) return -EPROTONOSUPPORT;
@@ -300,6 +311,7 @@ static int64_t do_bind(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     int h;
     Sock *s = sock_of(c->proc, gfd, &h);
     if (!s) return -ENOTSOCK;
+    if (s->vsock) return -EADDRNOTAVAIL;
     if (s->netlink) return 0;
     if (s->state != S_NEW) return -EINVAL;
     char key[112];
@@ -361,6 +373,19 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     int h;
     Sock *s = sock_of(c->proc, gfd, &h);
     if (!s) return -ENOTSOCK;
+    if (s->vsock) {
+        // The emulator's host serves qemud pipes on vsock port 5000 (libqemupipe's VsockPort::Data):
+        // the connected socket becomes a goldfish pipe. Nothing listens on any other port.
+        const uint8_t *sa = gptr(addr);
+        uint32_t port = len >= 12 && sa ? *(const uint32_t *)(sa + 4) : 0;
+        if (port != 5000) return -ECONNREFUSED;
+        bool cloexec = fd_cloexec(c->proc, gfd, -1) > 0;
+        int g = goldfish_pipe_open(c->proc, "/dev/goldfish_pipe", cloexec ? 02000000 : 0);
+        if (g < 0) return g;
+        int r = fd_dup(c->proc, g, gfd, true, cloexec);
+        fd_close(c->proc, g);
+        return r < 0 ? r : 0;
+    }
     char key[112];
     int e = addr_key(addr, len, key, sizeof key);
     if (e) return e;

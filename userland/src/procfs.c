@@ -193,6 +193,30 @@ static int mounts_text(bool info, char **out) {
     return (int)n;
 }
 
+
+// /proc/<pid>/attr/{fscreate,sockcreate,...}: libselinux's setfscreatecon() and friends write the
+// context a thread wants for new objects; it is stored for reading back and otherwise ignored.
+static int64_t attr_read(FdObj *o, GuestCtx *c, void *buf, size_t n, bool nonblock) {
+    (void)c; (void)nonblock;
+    char *v = o->data;
+    size_t k = strlen(v);
+    if (v[255]) return 0;            // already read once
+    v[255] = 1;
+    if (k > n) k = n;
+    memcpy(buf, v, k);
+    return (int64_t)k;
+}
+static int64_t attr_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock) {
+    (void)c; (void)nonblock;
+    char *v = o->data;
+    size_t k = n < 254 ? n : 254;
+    memcpy(v, buf, k);
+    v[k] = 0;
+    return (int64_t)n;
+}
+static void attr_release(FdObj *o) { free(o->data); }
+static const FdOps attr_ops = { "proc-attr", attr_read, attr_write, NULL, NULL, attr_release };
+
 static int proc_open(Proc *p, const char *path, int lflags) {
     char buf[4096];
     int n = -1;
@@ -244,6 +268,12 @@ static int proc_open(Proc *p, const char *path, int lflags) {
         const char *tname = th && th->name[0] ? th->name : (strrchr(t->exe, '/') ? strrchr(t->exe, '/') + 1 : t->exe);
         int tid = th ? (int)th->tid : t->pid;
         if (!strcmp(rest, "/attr/current")) n = snprintf(buf, sizeof buf, "%s", proc_secontext(t));
+        else if (!strncmp(rest, "/attr/", 6)) {           // fscreate, sockcreate, exec, keycreate, prev: accepted, read back
+            FdObj *o = obj_new(&attr_ops, calloc(1, 256), true);
+            if (!o) return -ENFILE;
+            fd_set_path(o->rd, path);
+            return fd_install_obj(p, o->rd, o, lflags & 02000000);
+        }
         else if (!strcmp(rest, "/cmdline")) { memcpy(buf, t->cmdline, t->cmdline_len); n = (int)t->cmdline_len; }
         else if (!strcmp(rest, "/comm")) n = snprintf(buf, sizeof buf, "%.15s\n", tname);
         else if (!strcmp(rest, "/exe")) return 1;        // resolved by readlink/stat elsewhere
