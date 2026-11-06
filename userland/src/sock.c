@@ -39,6 +39,7 @@ typedef struct Sock {
     char key[112];
     int send_fd;              // bound datagram socket: the end senders write to
     bool passcred, netlink, vsock;
+    bool borrowed_key;        // key names the listener we were accepted from; not ours to unregister
     Pending *q;
     int qn, qcap;
     FdObj *o;
@@ -135,7 +136,7 @@ int sock_builtin_dgram(const char *path) {
 // ---- the socket object ----
 static void sock_release(FdObj *o) {
     Sock *s = o->data;
-    if (s->key[0]) name_remove(s->key);
+    if (s->key[0] && !s->borrowed_key) name_remove(s->key);
     if (s->send_fd >= 0) close(s->send_fd);
     for (int i = 0; i < s->qn; i++) close(s->q[i].fd);
     free(s->q);
@@ -473,6 +474,8 @@ static int64_t do_accept(GuestCtx *c, int gfd, uint64_t addr, uint64_t lenp, int
             ns->peer_pid = pe.pid;
             ns->peer_uid = pe.uid;
             ns->peer_gid = pe.gid;
+            memcpy(ns->key, s->key, sizeof ns->key);   // getsockname on an accepted socket names the listener (Linux)
+            ns->borrowed_key = true;
             put_addr(addr, lenp, NULL);
             return g;
         }
