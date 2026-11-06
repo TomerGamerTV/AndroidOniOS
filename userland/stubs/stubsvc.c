@@ -5,8 +5,9 @@
 //
 //   onistub NAME=INTERFACE[+EXTENSION_INTERFACE[@CODE]] ...   e.g. onistub netd=android.net.INetd vold=android.os.IVold
 //   +EXT attaches a second stub as the binder's extension (how unstable AIDL companions are published);
-//   @CODE[,CODE...] also answers those transaction codes with the extension binder (methods returning a binder,
-//   e.g. IDnsResolver.getUnstableInterface, IAudioPolicyService.registerSoundTriggerCaptureStateListener).
+//   @CODE:b answers that transaction code with the extension binder (IDnsResolver.getUnstableInterface);
+//   @CODE:iN answers it with the int32 N (IAudioPolicyService.registerSoundTriggerCaptureStateListener -> true).
+//   Several specs are separated by commas.
 //
 // Built with the NDK against the image's own libbinder_ndk.so (see userland/Makefile, target stubs).
 #include <android/binder_ibinder.h>
@@ -28,7 +29,8 @@ void ABinderProcess_joinThreadPool(void);
 #define TAG "onistub"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-typedef struct { const char *name, *iface; AIBinder *ext; int ext_codes[16], n_ext_codes; } Svc;
+typedef struct { int code; char kind; int32_t value; } Reply;   // kind 'b': the extension binder, 'i': an int32
+typedef struct { const char *name, *iface; AIBinder *ext; Reply replies[16]; int n_replies; } Svc;
 
 static void *on_create(void *args) { return args; }
 static void on_destroy(void *userdata) { (void)userdata; }
@@ -52,8 +54,11 @@ static binder_status_t on_transact(AIBinder *binder, transaction_code_t code, co
     }
     LOGI("%s: transaction %u acknowledged", s->name, (unsigned)code);
     AParcel_writeInt32(out, 0);                   // exception header: none
-    for (int i = 0; i < s->n_ext_codes; i++)
-        if (s->ext && (int)code == s->ext_codes[i]) AParcel_writeStrongBinder(out, s->ext);   // methods that return a binder
+    for (int i = 0; i < s->n_replies; i++) {
+        if ((int)code != s->replies[i].code) continue;
+        if (s->replies[i].kind == 'b' && s->ext) AParcel_writeStrongBinder(out, s->ext);
+        else if (s->replies[i].kind == 'i') AParcel_writeInt32(out, s->replies[i].value);
+    }
     return STATUS_OK;
 }
 
@@ -70,7 +75,16 @@ int main(int argc, char **argv) {
         char *plus = strchr(eq + 1, '+');
         if (plus) *plus = 0;
         char *at = plus ? strchr(plus + 1, '@') : NULL;
-        if (at) { *at = 0; for (char *t = strtok(at + 1, ","); t && s->n_ext_codes < 16; t = strtok(NULL, ",")) s->ext_codes[s->n_ext_codes++] = atoi(t); }
+        if (at) {
+            *at = 0;
+            for (char *t = strtok(at + 1, ","); t && s->n_replies < 16; t = strtok(NULL, ",")) {
+                char *colon = strchr(t, ':');
+                Reply *r = &s->replies[s->n_replies++];
+                r->code = atoi(t);
+                r->kind = colon && colon[1] == 'i' ? 'i' : 'b';
+                r->value = colon && colon[1] == 'i' ? atoi(colon + 2) : 0;
+            }
+        }
         AIBinder_Class *cls = AIBinder_Class_define(s->iface, on_create, on_destroy, on_transact);
         AIBinder_Class_disableInterfaceTokenHeader(cls);   // callers may use variant descriptors (…unstable.descriptor.…)
         AIBinder *b = AIBinder_new(cls, s);

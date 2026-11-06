@@ -22,7 +22,7 @@ service aconfigd /system/bin/aconfigd-system start-socket
 service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
   socket aconfigd_mainline
 # stand-ins for daemons the host can't run (userland/stubs/stubsvc.c)
-service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17 dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold media.audio_policy=android.media.IAudioPolicyService+android.media.IAudioPolicyService@106 media.audio_flinger=android.media.IAudioFlingerService
+service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17:b dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold media.audio_policy=android.media.IAudioPolicyService+android.media.IAudioPolicyService@106:i1 media.audio_flinger=android.media.IAudioFlingerService
 service idmap2d /system/bin/idmap2d
 service lmkd /system/bin/lmkd
   socket lmkd
@@ -68,6 +68,13 @@ service gatekeeper /apex/com.android.hardware.gatekeeper/bin/hw/android.hardware
 service vibrator /apex/com.android.hardware.vibrator/bin/hw/android.hardware.vibrator-service.example
 start vibrator
 start gatekeeper
+service authsecret /apex/com.android.hardware.authsecret/bin/hw/android.hardware.authsecret-service.example
+service contexthub /apex/com.android.hardware.contexthub/bin/hw/android.hardware.contexthub-service.example
+service statsd /apex/com.android.os.statsd/bin/statsd
+  socket statsdw
+start authsecret
+start contexthub
+start statsd
 service gatekeeperd /system/bin/gatekeeperd /data/misc/gatekeeper
 start gatekeeperd
 
