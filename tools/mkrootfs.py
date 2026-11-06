@@ -225,6 +225,13 @@ def main():
 
     # 5. SELinux tree, properties defaults, service table, environment
     run(os.path.join(HERE, 'mkselinuxfs.py'), os.path.join(REPO, 'userland/data/selinux-classes.txt'), R)
+    # BPF objects the network stack expects pinned (served by onirun's bpf emulation), and the CPU
+    # topology files bionic's get_nprocs_conf() reads (per-CPU map values are one per CPU)
+    run(os.path.join(HERE, 'mkbpffs.py'), R)
+    cpus = os.cpu_count() or 8
+    os.makedirs(os.path.join(R, 'sys/devices/system/cpu'), exist_ok=True)
+    for name in ('possible', 'online', 'present'):
+        open(os.path.join(R, 'sys/devices/system/cpu', name), 'w').write(f'0-{cpus - 1}\n')
     shutil.copy(os.path.join(REPO, 'userland/data/android-properties.txt'), os.path.join(R, 'oni/properties.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/init.txt'), os.path.join(R, 'oni/init.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/android-env.sh'), os.path.join(R, 'data/local/tmp/android-env.sh'))

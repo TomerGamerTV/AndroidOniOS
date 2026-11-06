@@ -244,9 +244,25 @@ static bool is_devnode(const char *gpath) {
            gpath && (!strncmp(gpath, "/dev/binderfs/", 14) || !strncmp(gpath, "/dev/dri/", 9));
 }
 
+// Pinned BPF objects carry the owner and mode netbpfload would have given them (mkbpffs.py stores
+// them as xattrs; the host files themselves stay ours).
+static bool bpf_attrs(const char *gpath, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
+    if (!gpath || strncmp(gpath, "/sys/fs/bpf/", 12)) return false;
+    char hp[1400], v[32];
+    snprintf(hp, sizeof hp, "%s%s", g_rootfs, gpath);
+    ssize_t n = getxattr(hp, "user.oni.mode", v, sizeof v - 1, 0, 0);
+    if (n <= 0) return false;
+    v[n] = 0; *mode = (uint32_t)strtoul(v, NULL, 8);
+    if ((n = getxattr(hp, "user.oni.uid", v, sizeof v - 1, 0, 0)) > 0) { v[n] = 0; *uid = (uint32_t)strtoul(v, NULL, 10); }
+    if ((n = getxattr(hp, "user.oni.gid", v, sizeof v - 1, 0, 0)) > 0) { v[n] = 0; *gid = (uint32_t)strtoul(v, NULL, 10); }
+    return true;
+}
+
 static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
-    uint32_t owner = shell_owned(gpath) ? 2000 : 0;
+    uint32_t owner = shell_owned(gpath) ? 2000 : 0, group = owner;
     uint32_t mode = st->st_mode;
+    uint32_t bmode;
+    if (bpf_attrs(gpath, &owner, &group, &bmode)) mode = (st->st_mode & S_IFMT) | bmode;
     uint64_t rdev = (uint64_t)st->st_rdev;
     if (is_devnode(gpath) && S_ISREG(st->st_mode)) { mode = S_IFCHR | 0666; rdev = dev_rdev(gpath + 5); }   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};
@@ -255,7 +271,7 @@ static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
     *(uint32_t *)(b + 16) = mode;
     *(uint32_t *)(b + 20) = st->st_nlink;
     *(uint32_t *)(b + 24) = owner;
-    *(uint32_t *)(b + 28) = owner;
+    *(uint32_t *)(b + 28) = group;
     *(uint64_t *)(b + 32) = (uint64_t)rdev;
     *(int64_t *)(b + 48) = st->st_size;
     *(int32_t *)(b + 56) = st->st_blksize;
@@ -942,6 +958,7 @@ void sys_dispatch(GuestCtx *c) {
         }
         uint64_t type = 0xEF53;                                   // ext4
         if (!strncmp(gp, "/sys/fs/selinux", 15)) type = 0xf97cff8c;
+        else if (!strncmp(gp, "/sys/fs/bpf", 11)) type = 0xcafe4a11;
         else if (!strncmp(gp, "/proc", 5)) type = 0x9fa0;
         else if (!strncmp(gp, "/sys", 4)) type = 0x62656572;
         else if (!strncmp(gp, "/dev", 4)) type = 0x01021994;      // tmpfs
@@ -1072,7 +1089,8 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 283: r = proc_membarrier(c, (int)a0); break;   // membarrier
-    case 293: case 435: case 291: case 282: case 280: case 117: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd, bpf, ptrace
+    case 280: r = OBJRET(bpf_syscall(c, (int)a0, gptr(a1), a2)); break;   // bpf
+    case 293: case 435: case 291: case 282: case 117: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd, ptrace
     case 232: {               // mincore: one byte per page; the guest's page size is the host's (AT_PAGESZ)
         uint64_t len = PG_UP(a1);
         if (a0 & (PG - 1)) { r = ERR(22); break; }

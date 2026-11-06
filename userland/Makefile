@@ -1,6 +1,6 @@
 # onirun: macOS (Apple silicon) prototype of the user-mode Android runtime.
 OUT := ../build/userland
-SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/init.c src/virtgpu.c src/goldfish.c src/cpu.S
+SRC := src/main.c src/loader.c src/translate.c src/syscall.c src/proc.c src/mm.c src/vfs.c src/sock.c src/props.c src/binder.c src/procfs.c src/init.c src/virtgpu.c src/goldfish.c src/bpf.c src/cpu.S
 CFLAGS := -O2 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -I../build/sysroot-macos/include -Isrc/uapi
 # The GPU is the host's gfxstream/rutabaga (the QEMU app's libraries, built into build/sysroot-macos).
 GFXLIBS := ../build/sysroot-macos/lib/librutabaga_gfx_ffi.a ../build/sysroot-macos/lib/libgfxstream_backend.a

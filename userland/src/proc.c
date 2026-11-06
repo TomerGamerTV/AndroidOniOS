@@ -999,6 +999,7 @@ void sys_main(const char *path, char **argv, char **envp, const char **sockets) 
     pthread_create(&hk, NULL, housekeeping, NULL);
     sock_init();
     props_init();
+    bpf_init();
     if (path) proc_start(path, argv, envp, sockets);
     else {
         char table[1200];

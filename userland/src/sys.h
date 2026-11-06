@@ -137,6 +137,8 @@ int  gpu_open(struct Proc *p, bool card, int lflags);     // /dev/dri/renderD128
 // ---- binder (binder.c) ----
 int  binder_open(struct Proc *p, const char *context, int lflags);   // guest fd or -errno
 int  goldfish_pipe_open(struct Proc *p, const char *path, int lflags);   // goldfish.c: qemud pipes
+void bpf_init(void);                                                     // bpf.c: pinned maps and programs
+int64_t bpf_syscall(GuestCtx *c, int cmd, uint8_t *attr, uint64_t size);  // host errno
 
 // ---- processes (proc.c) ----
 #define MAX_FDS 1024
