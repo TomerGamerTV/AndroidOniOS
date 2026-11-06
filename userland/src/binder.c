@@ -363,7 +363,9 @@ static void buf_record(BBuf *b, uint32_t type, BNode *n, BRef *r, int fd) {
     b->nobjs++;
 }
 // Undoes the references a buffer's objects took when they were translated in.
-static void buf_release_objs(BProc *p, BBuf *b) {
+// failed: the transaction never reached userspace, so fds installed for it are ours to close; after a
+// delivered transaction the receiver owns them (libbinder closes them), as with the kernel driver.
+static void buf_release_objs(BProc *p, BBuf *b, bool failed) {
     for (int i = 0; i < b->nobjs; i++) {
         uint32_t ty = b->objs[i].type;
         if (ty == T_BINDER || ty == T_WEAK_BINDER) node_dec(b->objs[i].node, ty == T_BINDER, false);
@@ -371,7 +373,7 @@ static void buf_release_objs(BProc *p, BBuf *b) {
             BRef *r = b->objs[i].ref;
             // The ref may already be gone if userspace released it; look it up by node.
             for (BRef *x = p->refs; x; x = x->next_in_proc) if (x == r) { ref_dec(r, ty == T_HANDLE); break; }
-        } else if (ty == T_FDA) {
+        } else if ((ty == T_FDA || ty == T_FD) && failed) {
             fd_close(p->proc, b->objs[i].fd);
         }
     }
@@ -653,7 +655,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
     return;
 
 failed_objs:
-    buf_release_objs(target_proc, b);
+    buf_release_objs(target_proc, b, true);
 failed_buf:
     buf_free(target_proc, b);
 failed:
@@ -702,7 +704,7 @@ static int do_write(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t s
                 if (b->t) b->t->buf = NULL;
                 BNode *an = b->async_node;
                 b->async_node = NULL;
-                buf_release_objs(p, b);
+                buf_release_objs(p, b, false);
                 buf_free(p, b);
                 if (an) {
                     BWork *next = work_pop((WorkList *)&an->async_todo);
