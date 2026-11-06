@@ -308,7 +308,13 @@ int64_t mm_remap(Mm *m, uint64_t old, uint64_t oldsz, uint64_t newsz, int flags,
     int64_t r;
     pthread_mutex_lock(&m->lock);
     Vma *v = vma_find(m, old);
-    if (!v || v->end < old + (oldsz < newsz ? oldsz : newsz)) { r = -EFAULT; goto out; }
+    if (!v) { r = -EFAULT; goto out; }
+    // Linux merges adjacent mappings with identical attributes; here mprotect leaves them split
+    // (bionic's atexit table toggles its protection), so accept a contiguous run of such pieces.
+    uint64_t need = old + (oldsz < newsz ? oldsz : newsz), reach = v->end;
+    for (Vma *w; reach < need && (w = vma_find(m, reach)) && w->start == reach && !w->file && !v->file &&
+                 w->prot == v->prot && w->shared == v->shared;) reach = w->end;
+    if (reach < need) { r = -EFAULT; goto out; }
     Vma attrs = *v;
     if (fixed) {
         int e = move_locked(m, old, oldsz, newsz, newaddr, &attrs);
