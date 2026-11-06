@@ -41,6 +41,7 @@ Android 17's own programs run, as many guest processes inside one host process:
 - multithreaded programs: mutexes, condition variables, thread-directed signals
 - **`servicemanager`**, Android's service directory, unmodified, with the stock `service` tool talking to it over binder from another process. Its SELinux checks run against a permissive policy that onirun serves from `/sys/fs/selinux`.
 - **ART**, Android's Java runtime (`dalvikvm64` from the ART APEX), both interpreting and with its JIT compiler: hand-written dex programs (`tools/mkdex.py`) print, catch a `NullPointerException` that ART detects through our fault delivery, and run a 30-million-iteration loop (1.1 s in total with the JIT, 1.6 s interpreted). The boot class path runs imageless, because the image's boot image was built for a garbage collector that needs `userfaultfd`.
+- **The boot sequence**, with onirun playing init (`onirun --root R --init`, service table in `/oni/init.txt`): servicemanager, hwservicemanager, keystore2, installd, apexd (lazily, when servicemanager asks), the software HALs the emulator image carries (KeyMint, gatekeeper, lights, health, usb, suspend, power, power.stats, thermal, vibrator), then the real **zygote**, which preloads the framework (about 90 s, imageless) and forks **system_server**. system_server starts its bootstrap services (ActivityManager, PowerManager, Thermal, Lights, ...) up to DisplayManagerService, which waits for SurfaceFlinger. Graphics is the next phase.
 
 ### Linux services provided by onirun
 
@@ -54,7 +55,9 @@ Android 17's own programs run, as many guest processes inside one host process:
 | Properties | `/dev/__properties__` areas copied from a device, read by Android's libc unchanged; onirun serves `property_service` and writes updates in bionic's `prop_area` format, waking waiters |
 | Binder | `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`: transactions and replies, object/handle translation, fd passing, scatter-gather buffers, refcounting (`BR_INCREFS`...`BR_DECREFS`), looper management, death notifications, security contexts |
 | SELinux | reported present and permissive: `/sys/fs/selinux/{status,enforce,class/...}` are static files, `access`/`create` answer "allowed" |
-| Logging | liblog's datagrams to `logdw` and writes to `/dev/kmsg` go to stderr (`ONIRUN_LOGCAT=1` shows everything, otherwise errors only) |
+| Logging | liblog's datagrams to `logdw` and writes to `/dev/kmsg` go to stderr (`ONIRUN_LOGCAT=1` shows everything, otherwise errors only); `kill -INFO <onirun pid>` dumps every guest thread |
+| init | a service table with sockets, `oneshot` and lazy-interface mappings; `ctl.start/stop/restart` and `ctl.interface_start` properties; crashed services restart; `init.svc.*` |
+| Processes, more | per-process uid/gid, `waitid`, `mincore`, `process_vm_readv`; netlink sockets that answer every request; `/proc/<pid>` directories |
 
 Speed on an M1 Mac:
 
@@ -76,7 +79,8 @@ Limits:
 - **No networking.** `AF_INET` sockets fail with `EAFNOSUPPORT`.
 
 Not done yet:
-- **The Android framework** (`app_process`, zygote, `system_server`), and eventually SurfaceFlinger with native graphics.
+- **Graphics.** The image's stack is minigbm + ANGLE + the gfxstream guest libraries over a virtio-gpu device (`/dev/dri/renderD128`, address-space graphics). The plan is to emulate that device in onirun on top of the same host gfxstream/rutabaga libraries the QEMU app uses, so SurfaceFlinger and apps draw through Metal.
+- **The rest of system_server and the apps**, which need SurfaceFlinger first.
 - **Sharing translations between processes**, so each new program doesn't translate libc and the linker again.
 - **iOS.** Executable memory there comes from the JIT region StikJIT enables. The window size must also fit iOS's address-space limit.
 
@@ -99,5 +103,8 @@ python3 -I tools/ext4pull.py build/vm-macos/system.img parts                    
 python3 -I tools/ext4pull.py build/vm-macos/system.img -p system pull /system/bin build/userland/rootfs/system/bin
 python3 -I tools/ext4pull.py build/userland/pull/com.android.runtime.apex pull / build/userland/rootfs/apex/com.android.runtime
 python3 -I tools/mkselinuxfs.py userland/data/selinux-classes.txt build/userland/rootfs   # the SELinux class tree
-# /dev/__properties__ and /linkerconfig come from a booted Android (adb), as init generates them.
+# Or all of it at once (plus /dev/__properties__ and /linkerconfig copied from a booted Android via adb):
+python3 -I tools/mkrootfs.py build/vm-macos/system.img build/userland/rootfs --properties-dir PROPS --linkerconfig LDCFG
+# Boot the services (servicemanager ... zygote, system_server):
+build/userland/onirun --root build/userland/rootfs --init
 ```

@@ -36,5 +36,7 @@ start suspend
 start power
 start power.stats
 start thermal
+service gatekeeper /apex/com.android.hardware.gatekeeper/bin/hw/android.hardware.gatekeeper-service.nonsecure
 service vibrator /apex/com.android.hardware.vibrator/bin/hw/android.hardware.vibrator-service.example
 start vibrator
+start gatekeeper
