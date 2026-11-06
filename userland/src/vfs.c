@@ -459,7 +459,7 @@ int64_t vfs_inotify_init(GuestCtx *c, int lflags) {
 
 // ---- /dev ----
 int vfs_open_dev(Proc *p, const char *path, int lflags) {
-    if (!strncmp(path, "/proc/", 6) || !strncmp(path, "/sys/", 5)) return procfs_open(p, path, lflags);
+    if (!strncmp(path, "/proc", 5) || !strncmp(path, "/sys/", 5)) return procfs_open(p, path, lflags);
     if (strncmp(path, "/dev/", 5)) return (int)1;
     const char *n = path + 5;
     if (!strncmp(n, "ashmem", 6)) return ashmem_open(p, lflags);

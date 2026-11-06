@@ -147,6 +147,7 @@ int fd_cloexec(Proc *p, int g, int set) {   // set < 0: query
 }
 
 // ---- process table ----
+Proc *proc_list(void) { return g_procs; }
 Proc *proc_find(int pid) {
     for (Proc *q = g_procs; q; q = q->next) if (q->pid == pid) return q;
     return NULL;
@@ -879,7 +880,13 @@ Proc *proc_start(const char *path, char **argv, char **envp, const char **socket
         if (ls && !sigaction(hs, NULL, &cur) && cur.sa_handler == SIG_IGN) p->sigact[ls][0] = 1;
     }
     if (!(p->mm = mm_new())) die("onirun: cannot reserve an address space");
-    for (int i = 0; i < 3; i++) p->fd[i].host = dup(i);
+    // Standard fds: stdin is /dev/null (Android services never read it, and the host's stdin may
+    // be a socket, which would confuse zygote's fd checks); stdout/stderr are the host's but
+    // claim to be /dev/null, which is what zygote reopens them as in its children.
+    p->fd[0].host = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    p->fd[1].host = dup(1);
+    p->fd[2].host = dup(2);
+    for (int i = 0; i < 3; i++) fd_set_path(p->fd[i].host, "/dev/null");
     // Sockets init would have created for a service (zygote's, for example): listening, bound in
     // the guest namespace, and announced as ANDROID_SOCKET_<name>=<fd>.
     char *env2[256];
@@ -915,14 +922,20 @@ Proc *proc_start(const char *path, char **argv, char **envp, const char **socket
     return p;
 }
 
+static void proc_noop_handler(int sig) { (void)sig; }
+
 void sys_main(const char *path, char **argv, char **envp, const char **sockets) {
     // Terminal and job signals are taken here with sigwait and forwarded to the guest processes;
     // every other thread inherits the blocked mask. SIGUSR1 stays open: it is the kick.
     sigset_t set;
     sigemptyset(&set);
     int fwd[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGALRM, SIGUSR2, SIGWINCH, SIGTSTP, SIGCONT, SIGTTIN, SIGTTOU,
-                 SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGCHLD};
+                 SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGCHLD, SIGINFO};
     for (unsigned i = 0; i < sizeof fwd / sizeof fwd[0]; i++) sigaddset(&set, fwd[i]);
+    // Blocked signals whose disposition is "ignore" are discarded, not queued: give those a handler.
+    struct sigaction keep = { .sa_handler = (void (*)(int))1 /* SIG_IGN placeholder replaced below */ };
+    keep.sa_handler = proc_noop_handler;
+    for (unsigned i = 0; i < sizeof fwd / sizeof fwd[0]; i++) sigaction(fwd[i], &keep, NULL);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     struct rlimit rl;
     if (!getrlimit(RLIMIT_NOFILE, &rl)) {
@@ -937,6 +950,26 @@ void sys_main(const char *path, char **argv, char **envp, const char **sockets) 
     proc_start(path, argv, envp, sockets);
     for (;;) {
         int s;
-        if (sigwait(&set, &s) == 0 && s != SIGCHLD) proc_forward_host_signal(lx_sig(s));
+        if (sigwait(&set, &s) != 0) continue;
+        if (s == SIGINFO) { proc_dump_all(); continue; }
+        if (s != SIGCHLD) proc_forward_host_signal(lx_sig(s));
     }
+}
+
+// SIGINFO (Ctrl-T) to onirun: where is every guest thread? The pc is the last one recorded at a
+// block exit or system call, so for a thread in a tight loop it points near, not at, the loop.
+void proc_dump_all(void) {
+    pthread_mutex_lock(&g_lock);
+    fprintf(stderr, "onirun: --- guest threads ---\n");
+    for (Proc *p = g_procs; p; p = p->next) {
+        fprintf(stderr, "[%d] %s uid %u state %d threads %d\n", p->pid, p->exe, p->uid, p->state, p->nthreads);
+        for (GuestCtx *t = p->threads; t; t = t->next_thread) {
+            char where[1200] = "?", lr[1200] = "?";
+            if (p->mm) { mm_symbolize(p->mm, t->pc, where, sizeof where); mm_symbolize(p->mm, t->x[30], lr, sizeof lr); }
+            fprintf(stderr, "  tid %llu %-16s exit %llu pc %s lr %s x8 %llu x0 %llx x1 %llx x2 %llx\n", (unsigned long long)t->tid,
+                    t->name[0] ? t->name : "-", (unsigned long long)t->exit_kind, where, lr, (unsigned long long)t->x[8],
+                    (unsigned long long)t->x[0], (unsigned long long)t->x[1], (unsigned long long)t->x[2]);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
 }

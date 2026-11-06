@@ -1,11 +1,13 @@
 // /proc and /sys/fs/selinux. Static parts live in the rootfs (the SELinux class tree copied from a
 // device); the rest is generated when opened. SELinux is reported as present but permissive, and
 // every access query is answered "allowed", so Android's own permission checks pass.
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +44,108 @@ static int maps_text(Proc *p, char **out) {
     return (int)n;
 }
 
+// ---- directories: a temporary host directory with the right entry names ----
+// Programs list /proc/self/fd (zygote), /proc/self/task (ART) and /proc (ps). The entries are
+// dummies named right; the files behind them are served by proc_open when opened by full path.
+typedef struct { char dir[256]; } ProcDir;
+static const char *proc_target(Proc *p, const char *path, Proc **out);
+static void rm_tree(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char path[600];
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+            struct stat st;
+            if (!lstat(path, &st) && S_ISDIR(st.st_mode)) rm_tree(path); else unlink(path);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+static void procdir_release(FdObj *o) { ProcDir *pd = o->data; rm_tree(pd->dir); free(pd); }
+static const FdOps procdir_ops = { "procdir", NULL, NULL, NULL, NULL, procdir_release };
+
+static void touch(const char *dir, const char *name, bool isdir) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (isdir) mkdir(path, 0755);
+    else close(open(path, O_WRONLY | O_CREAT, 0644));
+}
+
+// Returns a guest fd for a directory listing, 1 if path isn't a directory we know, or -errno.
+static int proc_dir(Proc *p, const char *path, int lflags) {
+    Proc *t = NULL;
+    const char *rest = "";
+    bool root = !strcmp(path, "/proc") || !strcmp(path, "/proc/");
+    if (!root) {
+        rest = proc_target(p, path, &t);
+        if (!rest || !t) return 1;
+        while (*rest == '/' && rest[1] == '/') rest++;
+    }
+    int kind;                          // what to list
+    long tid = 0;
+    if (root) kind = 0;
+    else if (!*rest || !strcmp(rest, "/")) kind = 1;
+    else if (!strcmp(rest, "/fd") || !strcmp(rest, "/fdinfo")) kind = 2;
+    else if (!strcmp(rest, "/task")) kind = 3;
+    else if (!strcmp(rest, "/attr")) kind = 4;
+    else if (!strncmp(rest, "/task/", 6)) {
+        char *end;
+        tid = strtol(rest + 6, &end, 10);
+        if (*end && strcmp(end, "/")) return 1;
+        kind = 5;
+    } else return 1;
+    const char *tmp = getenv("TMPDIR");
+    ProcDir *pd = calloc(1, sizeof *pd);
+    snprintf(pd->dir, sizeof pd->dir, "%s/onirun-proc.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    if (!mkdtemp(pd->dir)) { free(pd); return -errno; }
+    char name[64];
+    switch (kind) {
+    case 0:
+        for (const char *f = "self\0thread-self\0filesystems\0cpuinfo\0meminfo\0stat\0mounts\0version\0uptime\0loadavg\0"; *f; f += strlen(f) + 1) touch(pd->dir, f, false);
+        touch(pd->dir, "sys", true);
+        pthread_mutex_lock(&g_lock);
+        for (Proc *q = proc_list(); q; q = q->next) { snprintf(name, sizeof name, "%d", q->pid); touch(pd->dir, name, true); }
+        pthread_mutex_unlock(&g_lock);
+        break;
+    case 1:
+        for (const char *f = "cmdline\0comm\0stat\0status\0maps\0smaps\0mounts\0mountinfo\0oom_score_adj\0oom_adj\0timerslack_ns\0"; *f; f += strlen(f) + 1) touch(pd->dir, f, false);
+        touch(pd->dir, "fd", true); touch(pd->dir, "fdinfo", true); touch(pd->dir, "task", true); touch(pd->dir, "attr", true);
+        { char lp[600]; snprintf(lp, sizeof lp, "%s/exe", pd->dir); symlink(t->exe, lp); snprintf(lp, sizeof lp, "%s/cwd", pd->dir); symlink(t->cwd, lp); }
+        break;
+    case 2:
+        for (int i = 0; i < MAX_FDS; i++) {              // racy by design: a snapshot, like procfs
+            int h = t->fd[i].host;
+            if (h < 0) continue;
+            char lp[600], target[1100];
+            snprintf(name, sizeof name, "%d", i);
+            snprintf(lp, sizeof lp, "%s/%s", pd->dir, name);
+            if (!fd_get_path(h, target, sizeof target)) snprintf(target, sizeof target, "anon_inode:[unknown]");
+            symlink(target, lp);
+        }
+        break;
+    case 3:
+        pthread_mutex_lock(&g_lock);
+        for (GuestCtx *x = t->threads; x; x = x->next_thread) { snprintf(name, sizeof name, "%llu", (unsigned long long)x->tid); touch(pd->dir, name, true); }
+        pthread_mutex_unlock(&g_lock);
+        break;
+    case 4:
+        for (const char *f = "current\0exec\0fscreate\0keycreate\0prev\0sockcreate\0"; *f; f += strlen(f) + 1) touch(pd->dir, f, false);
+        break;
+    case 5:
+        for (const char *f = "stat\0status\0comm\0cmdline\0maps\0"; *f; f += strlen(f) + 1) touch(pd->dir, f, false);
+        (void)tid;
+        break;
+    }
+    int fd = open(pd->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) { rm_tree(pd->dir); free(pd); return -errno; }
+    FdObj *o = obj_new(&procdir_ops, pd, false);
+    fd_set_path(fd, path);
+    return fd_install_obj(p, fd, o, lflags & 02000000);
+}
+
 // Resolves "/proc/self" and "/proc/<pid>" to a process; returns the rest of the path.
 static const char *proc_target(Proc *p, const char *path, Proc **out) {
     const char *rest = path + 6;
@@ -71,6 +175,13 @@ static int proc_open(Proc *p, const char *path, int lflags) {
         double up = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
         n = snprintf(buf, sizeof buf, "%.2f %.2f\n", up, up * 2);
     } else if (!strcmp(path, "/proc/loadavg")) n = snprintf(buf, sizeof buf, "0.10 0.10 0.10 1/100 200\n");
+    else if (!strcmp(path, "/proc/mounts")) return proc_open(p, "/proc/self/mounts", lflags);
+    else if (!strcmp(path, "/proc/stat")) {
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        n = snprintf(buf, sizeof buf, "cpu  100 0 100 10000 0 0 0 0 0 0\n");
+        for (int i = 0; i < ncpu && n < (int)sizeof buf - 80; i++) n += snprintf(buf + n, sizeof buf - (size_t)n, "cpu%d 10 0 10 1000 0 0 0 0 0 0\n", i);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "ctxt 1000\nbtime 1700000000\nprocesses 100\nprocs_running 1\nprocs_blocked 0\n");
+    }
     else if (!strcmp(path, "/proc/cpuinfo")) {
         int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
         n = 0;
@@ -88,19 +199,30 @@ static int proc_open(Proc *p, const char *path, int lflags) {
         const char *rest = proc_target(p, path, &t);
         if (!rest) return -ENOENT;
         if (!t) return -ENOENT;
+        GuestCtx *th = NULL;
+        if (!strncmp(rest, "/task/", 6)) {               // /proc/<pid>/task/<tid>/...
+            char *end;
+            long tid = strtol(rest + 6, &end, 10);
+            pthread_mutex_lock(&g_lock);
+            for (GuestCtx *x = t->threads; x; x = x->next_thread) if ((long)x->tid == tid) th = x;
+            pthread_mutex_unlock(&g_lock);
+            if (!th || *end != '/') return -ENOENT;
+            rest = end;
+        }
+        const char *tname = th && th->name[0] ? th->name : (strrchr(t->exe, '/') ? strrchr(t->exe, '/') + 1 : t->exe);
+        int tid = th ? (int)th->tid : t->pid;
         if (!strcmp(rest, "/attr/current")) n = snprintf(buf, sizeof buf, "%s", proc_secontext(t));
         else if (!strcmp(rest, "/cmdline")) { memcpy(buf, t->cmdline, t->cmdline_len); n = (int)t->cmdline_len; }
-        else if (!strcmp(rest, "/comm")) { const char *b = strrchr(t->exe, '/'); n = snprintf(buf, sizeof buf, "%.15s\n", b ? b + 1 : t->exe); }
+        else if (!strcmp(rest, "/comm")) n = snprintf(buf, sizeof buf, "%.15s\n", tname);
         else if (!strcmp(rest, "/exe")) return 1;        // resolved by readlink/stat elsewhere
         else if (!strcmp(rest, "/status")) {
             const char *b = strrchr(t->exe, '/');
             n = snprintf(buf, sizeof buf, "Name:\t%.15s\nUmask:\t%04o\nState:\tR (running)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\nTracerPid:\t0\nUid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\nThreads:\t%d\n",
                          b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, t->uid, t->uid, t->uid, t->uid, t->gid, t->gid, t->gid, t->gid, t->nthreads);
         } else if (!strcmp(rest, "/stat")) {
-            const char *b = strrchr(t->exe, '/');
             // ... num_threads itrealvalue starttime vsize rss rsslim startcode endcode startstack ...
             n = snprintf(buf, sizeof buf, "%d (%.15s) R %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 %d 0 0 %llu 0 18446744073709551615 0 0 %llu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                         t->pid, b ? b + 1 : t->exe, t->ppid, t->pgid, t->sid, t->nthreads, (unsigned long long)WIN_SIZE,
+                         tid, tname, t->ppid, t->pgid, t->sid, t->nthreads, (unsigned long long)WIN_SIZE,
                          (unsigned long long)t->stack_start);
         } else if (!strcmp(rest, "/oom_score_adj") || !strcmp(rest, "/oom_adj")) n = snprintf(buf, sizeof buf, "0\n");
         else if (!strcmp(rest, "/timerslack_ns")) n = snprintf(buf, sizeof buf, "50000\n");
@@ -174,7 +296,12 @@ static int64_t sink_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool
 static const FdOps sink_ops = { "sink", NULL, sink_write, NULL, NULL, NULL };
 
 int procfs_open(Proc *p, const char *path, int lflags) {
-    if (!strncmp(path, "/proc/", 6)) return proc_open(p, path, lflags);
+    if (!strncmp(path, "/proc", 5) && (path[5] == 0 || path[5] == '/')) {
+        int d = proc_dir(p, path, lflags);
+        if (d != 1) return d;
+        if (path[5] == 0) return -ENOENT;
+        return proc_open(p, path, lflags);
+    }
     if (!strcmp(path, "/sys/kernel/tracing/trace_marker") || !strcmp(path, "/sys/kernel/debug/tracing/trace_marker")) {
         FdObj *o = obj_new(&sink_ops, NULL, true);
         if (!o) return -ENFILE;

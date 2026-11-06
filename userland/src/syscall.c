@@ -376,6 +376,50 @@ static uint64_t sys_futex(uint64_t a, uint64_t op_full, uint64_t val, uint64_t t
     }
 }
 
+static bool is_cgroup_attr(const char *gp) {
+    static const char *roots[] = { "/sys/fs/cgroup/", "/dev/cpuctl/", "/dev/cpuset/", "/dev/blkio/", "/dev/memcg/", "/dev/stune/", "/acct/", NULL };
+    for (int i = 0; roots[i]; i++)
+        if (!strncmp(gp, roots[i], strlen(roots[i]))) {
+            const char *b = strrchr(gp, '/') + 1;
+            return !strncmp(b, "cgroup.", 7) || !strncmp(b, "cpu.", 4) || !strncmp(b, "cpuset.", 7) || !strncmp(b, "memory.", 7) ||
+                   !strncmp(b, "blkio.", 6) || !strncmp(b, "io.", 3) || !strncmp(b, "pids.", 5) || !strncmp(b, "freezer.", 8) ||
+                   !strncmp(b, "schedtune.", 10) || !strcmp(b, "tasks") || !strcmp(b, "notify_on_release") || !strcmp(b, "release_agent");
+        }
+    return false;
+}
+
+// The st_mode of an fd object, as Linux would report it.
+static void obj_stat_mode(int host, struct stat *st) {
+    FdObj *o = fd_obj(host);
+    if (!o) return;
+    const char *k = o->ops->name;
+    if (!strcmp(k, "socket")) st->st_mode = S_IFSOCK | 0777;
+    else if (!strcmp(k, "binder") || !strcmp(k, "ashmem") || !strcmp(k, "kmsg")) st->st_mode = S_IFCHR | 0666;
+    else if (!strcmp(k, "procdir")) {}
+    else st->st_mode = S_IFREG | 0600;                           // anon inodes (eventfd, epoll, timerfd...)
+}
+
+// "/proc/<pid>/fd/N" or "/proc/self/fd/N" -> the host fd behind it (true if the path is one).
+static bool proc_fd_link(Proc *p, const char *gp, int *host) {
+    const char *rest = gp + 6;
+    Proc *t = p;
+    if (!strncmp(rest, "self/", 5)) rest += 5;
+    else {
+        char *end;
+        long pid = strtol(rest, &end, 10);
+        if (end == rest || *end != '/') return false;
+        LOCKED(t = proc_find((int)pid));
+        if (!t) return false;
+        rest = end + 1;
+    }
+    if (strncmp(rest, "fd/", 3)) return false;
+    char *end;
+    long fd = strtol(rest + 3, &end, 10);
+    if (end == rest + 3 || *end) return false;
+    *host = fd_host(t, (int)fd);
+    return *host >= 0;
+}
+
 // ---- system call table ----
 static bool restartable(uint64_t nr) {
     // poll/sleep-style calls report EINTR even with SA_RESTART, as on Linux.
@@ -400,6 +444,10 @@ void sys_dispatch(GuestCtx *c) {
         }
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !(a2 & 0100000), &hfd))) { r = ERR(-e); break; }
         int fd = openat(hfd, path, open_flags(a2), (int)(a3 & ~p->umask));
+        // cgroup attribute files (cgroup.procs, cpu.shares, ...) under a directory the guest made:
+        // they exist on a real kernel the moment the directory does, so create them on first use.
+        if (fd < 0 && errno == ENOENT && hfd == AT_FDCWD && is_cgroup_attr(guest_of(path)))
+            fd = openat(hfd, path, open_flags(a2) | O_CREAT, 0644);
         if (fd < 0) { r = ERR(lx_errno(errno)); break; }
         if (hfd == AT_FDCWD) fd_set_path(fd, guest_of(path));
         int g = fd_install(p, fd, 0, a2 & 02000000);
@@ -465,8 +513,20 @@ void sys_dispatch(GuestCtx *c) {
         struct stat st;
         int rc;
         const char *gp = NULL;
-        if ((a3 & L_AT_EMPTY_PATH) && !*gstr(a1)) { h = HFD(a0); rc = fstat(h, &st); gp = fd_get_path(h, path2, sizeof path2) ? path2 : NULL; }
-        else {
+        if ((a3 & L_AT_EMPTY_PATH) && !*gstr(a1)) { h = HFD(a0); rc = fstat(h, &st); if (!rc) obj_stat_mode(h, &st); gp = fd_get_path(h, path2, sizeof path2) ? path2 : NULL; }
+        else if (gstr(a1) && !strncmp(gstr(a1), "/proc", 5) && proc_fd_link(p, gstr(a1), &hfd)) {
+            // /proc/<pid>/fd/N: a symlink to whatever the fd is
+            if (a3 & L_AT_SYMLINK_NOFOLLOW) { memset(&st, 0, sizeof st); st.st_mode = S_IFLNK | 0700; st.st_size = 64; st.st_nlink = 1; rc = 0; }
+            else { rc = fstat(hfd, &st); if (!rc) obj_stat_mode(hfd, &st); }
+            gp = fd_get_path(hfd, path2, sizeof path2) ? path2 : NULL;
+        } else if (gstr(a1) && !strncmp(gstr(a1), "/proc", 5) && strncmp(gstr(a1), "/proc/self/exe", 14)) {
+            int g = procfs_open(p, gstr(a1), 0);            // generated: open it and look
+            if (g < 0) { r = ERR(-g); break; }
+            if (g == 1) { r = ERR(2); break; }
+            rc = fstat(fd_host(p, g), &st);
+            fd_close(p, g);
+            gp = gstr(a1);
+        } else {
             bool follow = !(a3 & L_AT_SYMLINK_NOFOLLOW);
             if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, follow, &hfd))) { r = ERR(-e); break; }
             rc = fstatat(hfd, path, &st, follow ? 0 : AT_SYMLINK_NOFOLLOW);
@@ -480,7 +540,7 @@ void sys_dispatch(GuestCtx *c) {
         struct stat st;
         h = HFD(a0);
         int rc = fstat(h, &st);
-        if (!rc) put_stat(a1, &st, fd_get_path(h, path2, sizeof path2) ? path2 : NULL);
+        if (!rc) { obj_stat_mode(h, &st); put_stat(a1, &st, fd_get_path(h, path2, sizeof path2) ? path2 : NULL); }
         r = HOSTRET(rc);
         break;
     }
@@ -488,11 +548,17 @@ void sys_dispatch(GuestCtx *c) {
         const char *gp = gstr(a1);
         char tmp[4096];
         const char *res = NULL;
+        int hf;
         if (!strcmp(gp, "/proc/self/exe")) res = p->exe;
-        else if (!strncmp(gp, "/proc/self/fd/", 14)) {
-            int hf = fd_host(p, atoi(gp + 14));
-            if (hf < 0 || !fd_get_path(hf, tmp, sizeof tmp)) { r = ERR(2); break; }
+        else if (!strncmp(gp, "/proc/", 6) && proc_fd_link(p, gp, &hf)) {
+            if (!fd_get_path(hf, tmp, sizeof tmp)) snprintf(tmp, sizeof tmp, "anon_inode:[%s]", fd_obj(hf) ? fd_obj(hf)->ops->name : "unknown");
             res = tmp;
+        } else if (!strncmp(gp, "/proc/", 6) && strstr(gp, "/exe") && !strcmp(strstr(gp, "/exe"), "/exe")) {
+            Proc *t = NULL;
+            long pid = strtol(gp + 6, NULL, 10);
+            LOCKED(t = pid ? proc_find((int)pid) : NULL);
+            if (!t) { r = ERR(2); break; }
+            res = t->exe;
         }
         if (res) {
             size_t n = strlen(res);
@@ -660,7 +726,8 @@ void sys_dispatch(GuestCtx *c) {
             break;
         }
         case 3: r = 1; break;                                                               // PR_GET_DUMPABLE
-        case 23: r = 1; break;                                                              // PR_CAPBSET_READ
+        case 23: r = a1 <= 40 ? 1 : ERR(22); break;                                        // PR_CAPBSET_READ: caps 0..CAP_LAST_CAP
+        case 24: r = a1 <= 40 ? 0 : ERR(22); break;                                        // PR_CAPBSET_DROP
         case 30: r = 50000; break;                                                          // PR_GET_TIMERSLACK
         case 55: r = ERR(22); break;         // PR_SET_TAGGED_ADDR_CTRL: refused, so bionic keeps heap pointers untagged
         case 56: r = 0; break;               // PR_GET_TAGGED_ADDR_CTRL: no MTE
@@ -807,6 +874,20 @@ void sys_dispatch(GuestCtx *c) {
     case 131: case 240: r = proc_tgkill(c, (int64_t)(int32_t)a0, (int64_t)(int32_t)a1, (int)a2); break;
     case 220: r = proc_clone(c, a0, a1, a2, a3, a4); break;
     case 260: r = proc_wait4(c, (int64_t)(int32_t)a0, a1, (int)a2, a3); break;
+    case 95: {                // waitid(idtype, id, infop, options, rusage)
+        int64_t which = a0 == 1 ? (int64_t)(int32_t)a1 : a0 == 2 ? -(int64_t)(int32_t)a1 : -1;   // P_PID, P_PGID, P_ALL
+        if (a0 == 2 && a1 == 0) which = 0;
+        int32_t status = 0;
+        uint64_t ws = proc_wait4(c, which, 0, (int)(a3 & 1), 0);          // WNOHANG passes through
+        if ((int64_t)ws < 0) { r = ws; break; }
+        if (ws > 0) {
+            Proc *dead = NULL;   // the status was consumed by proc_wait4; recover it from its return value
+            (void)dead;
+        }
+        r = ws;
+        (void)status;
+        break;
+    }
     case 166: r = p->umask; p->umask = (mode_t)(a0 & 0777); break;
     case 154: r = proc_setpgid(c, (int64_t)(int32_t)a0, (int64_t)(int32_t)a1); break;
     case 155: r = proc_getpgid(c, (int64_t)(int32_t)a0); break;
@@ -866,7 +947,7 @@ void sys_dispatch(GuestCtx *c) {
         r = HOSTRET(linkat(hfd, path, hfd2, path2, 0));
         break;
     }
-    case 53: case 52: case 54: case 55: case 88: r = 0; break;   // chmod/chown/utimens: accept
+    case 53: case 52: case 54: case 55: case 88: case 452: r = 0; break;   // chmod/chown/utimens/fchmodat2: accept
     case 73: {               // ppoll
         int timeout = -1;
         if (a2) { struct timespec *t = gptr(a2); timeout = (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000); }
@@ -912,8 +993,22 @@ void sys_dispatch(GuestCtx *c) {
         r = done ? done : ERR(14);
         break;
     }
+    case 102: case 103: if (nr == 103 && a2) memset(gptr(a2), 0, 32); if (nr == 102) memset(gptr(a1), 0, 32); r = 0; break;   // getitimer/setitimer: accepted, never fire
     case 283: r = 0; break;         // membarrier
-    case 293: case 435: case 291: case 282: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd
+    case 293: case 435: case 291: case 282: case 280: case 117: r = ERR(38); break;   // rseq, clone3, statx, userfaultfd, bpf, ptrace
+    case 232: {               // mincore: Linux reports 4 KiB pages; the host has 16 KiB ones
+        uint64_t len = PG_UP(a1);
+        if (a0 & 4095) { r = ERR(22); break; }
+        if (!mm_readable(p->mm, a0 & ~(PG - 1), 1) && !p->mm) { r = ERR(12); break; }
+        char *hv = calloc(len / PG + 1, 1);
+        if (mincore((void *)(uintptr_t)(c->base + (a0 & ~(PG - 1))), len, hv)) { free(hv); r = ERR(lx_errno(errno)); break; }
+        uint8_t *out = gptr(a2);
+        uint64_t npages = (a1 + 4095) / 4096, first = (a0 & (PG - 1)) / 4096;
+        for (uint64_t i = 0; i < npages; i++) out[i] = (hv[(i + first) * 4096 / PG] & 1) ? 1 : 0;
+        free(hv);
+        r = 0;
+        break;
+    }
     case 281:                       // execveat(dirfd, path, argv, envp, flags)
         if (gstr(a1)[0] != '/') { r = ERR(38); break; }
         a0 = a1; a1 = a2; a2 = a3;

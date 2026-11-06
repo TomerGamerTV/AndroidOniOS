@@ -190,7 +190,9 @@ void proc_backtrace(GuestCtx *c);
 Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets);
 const char *proc_secontext(Proc *p);                 // SELinux context we claim for p
 Proc *proc_find(int pid);                            // g_lock held
+Proc *proc_list(void);                               // g_lock held
 void proc_forward_host_signal(int lsig);
+void proc_dump_all(void);                             // SIGINFO: print every guest thread
 
 // ---- paths and errors (syscall.c) ----
 extern char g_rootfs[1024];
