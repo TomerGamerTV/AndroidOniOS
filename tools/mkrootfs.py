@@ -176,6 +176,12 @@ def main():
         if f.startswith('boot') and f.endswith('.vdex'):
             os.remove(os.path.join(R, 'system/framework', f))
 
+    # 2c. Hardware onirun can't provide: dropping the feature declaration keeps the framework from
+    # starting the stack (UWB's talks to a virtio serial port and panics without its HAL).
+    for feat in ('vendor/etc/permissions/android.hardware.uwb.xml',):
+        if os.path.exists(os.path.join(R, feat)):
+            os.remove(os.path.join(R, feat))
+
     # 3. Directories init, vold and the framework expect
     dirs = '''mnt/user/0 mnt/expand mnt/runtime/default/emulated mnt/runtime/read/emulated mnt/runtime/write/emulated
     mnt/runtime/full/emulated mnt/sdcard mnt/media_rw mnt/pass_through/0/emulated mnt/installer/0/emulated
