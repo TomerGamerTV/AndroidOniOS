@@ -85,11 +85,13 @@ struct FdObj {
     void *data;
     uint64_t ino;             // the readiness pipe's inode: identifies the object behind any dup of rd
     struct FdObj *next_reg;   // registry of live piped objects (obj_by_fd)
+    struct FdObj *next_reap;  // queued for the reaper (obj_put_deferred)
 };
 FdObj *obj_new(const FdOps *ops, void *data, bool piped);   // refs = 1; piped: creates rd/wr
 void obj_get(FdObj *o);
 FdObj *obj_by_fd(int host);                                // the object a passed/dup'd host fd refers to, or NULL (borrowed)
 void obj_put(FdObj *o);
+void obj_put_deferred(FdObj *o);                            // obj_put for callers holding g_lock: release runs on another thread
 void obj_set_ready(FdObj *o, bool ready);                  // o->lock held by the caller
 int  obj_wait(int host, int events, bool nonblock);        // 0, -EAGAIN or -EINTR
 

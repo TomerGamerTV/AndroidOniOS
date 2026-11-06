@@ -61,8 +61,8 @@ bool fd_get_path(int host, char *out, size_t n) {
 }
 FdObj *fd_obj(int host) { return host >= 0 && host < HOST_FDS ? hfd[host].obj : NULL; }
 static void attach_locked(int host, FdObj *o) {
-    if (host < 0 || host >= HOST_FDS) { obj_put(o); return; }
-    if (hfd[host].obj) obj_put(hfd[host].obj);
+    if (host < 0 || host >= HOST_FDS) { obj_put_deferred(o); return; }
+    if (hfd[host].obj) obj_put_deferred(hfd[host].obj);
     hfd[host].obj = o;
 }
 void fd_attach_obj(int host, FdObj *o) { obj_get(o); LOCKED(attach_locked(host, o)); }
@@ -79,7 +79,7 @@ static void host_close_locked(int h) {
     if (h < 0) return;
     dir_forget(h);
     set_path_locked(h, NULL);
-    if (h < HOST_FDS && hfd[h].obj) { FdObj *o = hfd[h].obj; hfd[h].obj = NULL; obj_put(o); }
+    if (h < HOST_FDS && hfd[h].obj) { FdObj *o = hfd[h].obj; hfd[h].obj = NULL; obj_put_deferred(o); }   // g_lock is held
     close(h);
 }
 

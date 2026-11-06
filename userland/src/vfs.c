@@ -53,8 +53,47 @@ FdObj *obj_by_fd(int host) {
 
 void obj_get(FdObj *o) { __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST); }
 
+static void obj_free(FdObj *o);
+
+// Releases that would run while the caller holds g_lock (closing a guest fd) are handed to this
+// thread instead: a release may take its own object's locks (the GPU's, binder's), and those
+// paths take g_lock in turn, so running it under g_lock deadlocks (seen: fd_close vs a KMS ioctl).
+static FdObj *reap_head;
+static pthread_mutex_t reap_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reap_cond = PTHREAD_COND_INITIALIZER;
+static void *reaper(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&reap_lock);
+        while (!reap_head) pthread_cond_wait(&reap_cond, &reap_lock);
+        FdObj *o = reap_head;
+        reap_head = o->next_reap;
+        pthread_mutex_unlock(&reap_lock);
+        obj_free(o);
+    }
+    return NULL;
+}
+static pthread_once_t reaper_once = PTHREAD_ONCE_INIT;
+static void reaper_start(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, reaper, NULL);
+    pthread_detach(t);
+}
+void obj_put_deferred(FdObj *o) {
+    if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST)) return;
+    pthread_once(&reaper_once, reaper_start);
+    pthread_mutex_lock(&reap_lock);
+    o->next_reap = reap_head;
+    reap_head = o;
+    pthread_cond_signal(&reap_cond);
+    pthread_mutex_unlock(&reap_lock);
+}
+
 void obj_put(FdObj *o) {
     if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST)) return;
+    obj_free(o);
+}
+static void obj_free(FdObj *o) {
     if (o->rd >= 0) {
         pthread_mutex_lock(&reg_lock);
         for (FdObj **pp = &reg; *pp; pp = &(*pp)->next_reg) if (*pp == o) { *pp = o->next_reg; break; }
