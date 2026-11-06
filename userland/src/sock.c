@@ -646,8 +646,9 @@ static int64_t do_recvmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
         int32_t level = L_SOL_SOCKET, type = SCM_RIGHTS;
         memcpy(gc + used, &clen, 8); memcpy(gc + used + 8, &level, 4); memcpy(gc + used + 12, &type, 4);
         for (int i = 0; i < nfd; i++) {
+            // shortcut: an object whose sender closed its fd before we received it is gone (plain fd here); count in-flight fds if that ever matters
             FdObj *po = obj_by_fd(fds[i]);                 // a sync_file, eventfd, ... keeps its identity
-            if (po) fd_attach_obj(fds[i], po);
+            if (po) { fd_attach_obj(fds[i], po); obj_put(po); }   // attach took its own reference
             int32_t g = fd_install(c->proc, fds[i], 0, lflags & L_MSG_CMSG_CLOEXEC);
             memcpy(gc + used + 16 + 4 * i, &g, 4);
         }

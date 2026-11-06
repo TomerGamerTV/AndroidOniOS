@@ -41,12 +41,20 @@ FdObj *obj_new(const FdOps *ops, void *data, bool piped) {
 
 // A host fd that arrived by SCM_RIGHTS (or any dup) is a new number for the same pipe; the inode
 // says which object it belongs to.
+// Returns the object with a new reference (or NULL). An object whose count already reached zero is
+// being freed (perhaps queued for the reaper): it must not be revived, so the reference is only
+// taken while the count is still positive.
 FdObj *obj_by_fd(int host) {
     struct stat st;
     if (host < 0 || fstat(host, &st) || !S_ISFIFO(st.st_mode)) return NULL;
     pthread_mutex_lock(&reg_lock);
     FdObj *o = reg;
     while (o && o->ino != st.st_ino) o = o->next_reg;
+    if (o) {
+        int n = __atomic_load_n(&o->refs, __ATOMIC_SEQ_CST);
+        while (n > 0 && !__atomic_compare_exchange_n(&o->refs, &n, n + 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+        if (n <= 0) o = NULL;
+    }
     pthread_mutex_unlock(&reg_lock);
     return o;
 }
@@ -79,8 +87,15 @@ static void reaper_start(void) {
     pthread_create(&t, NULL, reaper, NULL);
     pthread_detach(t);
 }
+static void obj_unregister(FdObj *o) {
+    if (o->rd < 0) return;
+    pthread_mutex_lock(&reg_lock);
+    for (FdObj **pp = &reg; *pp; pp = &(*pp)->next_reg) if (*pp == o) { *pp = o->next_reg; break; }
+    pthread_mutex_unlock(&reg_lock);
+}
 void obj_put_deferred(FdObj *o) {
     if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST)) return;
+    obj_unregister(o);
     pthread_once(&reaper_once, reaper_start);
     pthread_mutex_lock(&reap_lock);
     o->next_reap = reap_head;
@@ -91,6 +106,7 @@ void obj_put_deferred(FdObj *o) {
 
 void obj_put(FdObj *o) {
     if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST)) return;
+    obj_unregister(o);
     obj_free(o);
 }
 static void obj_free(FdObj *o) {

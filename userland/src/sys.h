@@ -89,7 +89,7 @@ struct FdObj {
 };
 FdObj *obj_new(const FdOps *ops, void *data, bool piped);   // refs = 1; piped: creates rd/wr
 void obj_get(FdObj *o);
-FdObj *obj_by_fd(int host);                                // the object a passed/dup'd host fd refers to, or NULL (borrowed)
+FdObj *obj_by_fd(int host);                                // the object a passed/dup'd host fd refers to, with a new reference, or NULL
 void obj_put(FdObj *o);
 void obj_put_deferred(FdObj *o);                            // obj_put for callers holding g_lock: release runs on another thread
 void obj_set_ready(FdObj *o, bool ready);                  // o->lock held by the caller
