@@ -1,0 +1,12 @@
+# Classes zygote must initialize because onirun runs without a boot image (see mkrootfs.py)
+android.app.admin.metadata.AdvancedSecurityOverridesPolicies
+android.app.admin.metadata.ApplicationManagementPolicies
+android.app.admin.metadata.BrandingPolicies
+android.app.admin.metadata.CrossDevicePolicies
+android.app.admin.metadata.DataLeakPreventionPolicies
+android.app.admin.metadata.DateTimePolicies
+android.app.admin.metadata.DeviceConnectivityManagementPolicies
+android.app.admin.metadata.DeviceRadioStatePolicies
+android.app.admin.metadata.ReportingPolicies
+android.app.admin.metadata.SecurityPolicies
+android.app.admin.metadata.SystemPoliciesPolicies

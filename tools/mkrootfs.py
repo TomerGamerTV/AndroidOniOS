@@ -149,6 +149,15 @@ def main():
     dev/binderfs oni sys/fs/cgroup/cgroup.controllers.d'''.split()
     for d in dirs:
         os.makedirs(os.path.join(R, d), exist_ok=True)
+    # Classes whose static initializers the boot image used to pre-run (policy metadata registers
+    # itself that way); without a boot image, zygote's preload initializes them instead.
+    pre = os.path.join(R, 'system/etc/preloaded-classes')
+    extra = [l.strip() for l in open(os.path.join(REPO, 'userland/data/preload-extra.txt')) if l.strip() and not l.startswith('#')]
+    have = open(pre).read() if os.path.exists(pre) else ''
+    with open(pre, 'a') as f:
+        for c in extra:
+            if c not in have:
+                f.write(c + '\n')
     # A fresh fstrim stamp: without vold, PackageManager's periodic fstrim would NPE in system_server.
     open(os.path.join(R, 'data/system/last-fstrim'), 'a').close()
     # cgroup trees (controllers from /system/etc/cgroups.json; the groups from task_profiles.json)
