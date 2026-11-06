@@ -88,9 +88,24 @@ static void host_close_locked(int h) {
 static int fd_host_locked(Proc *p, int g) { return (g >= 0 && g < MAX_FDS) ? p->fd[g].host : -1; }
 int fd_host(Proc *p, int g) { int h; LOCKED(h = fd_host_locked(p, g)); return h; }
 
+// ONIRUN_FDTRACE=<exe substring>: log every guest fd install and close in matching processes.
+static int fdtrace_on(Proc *p) {
+    static const char *want = (const char *)1;
+    if (want == (const char *)1) want = getenv("ONIRUN_FDTRACE");
+    if (!want || !*want) return 0;
+    if (atoi(want) == p->pid) return 1;                      // a pid, or a thread name (system_server names its main thread)
+    for (GuestCtx *t = p->threads; t; t = t->next_thread) if (!strcmp(t->name, want)) return 1;
+    return 0;
+}
+static void fdtrace(Proc *p, const char *what, int g, int host) {
+    if (!fdtrace_on(p)) return;
+    const char *path = host >= 0 && host < HOST_FDS && hfd[host].path ? hfd[host].path : "";
+    fprintf(stderr, "FDT %d/%llu %s %d host %d %s\n", p->pid, (unsigned long long)(tr_cur ? tr_cur->tid : 0), what, g, host, path);
+}
 static int fd_install_locked(Proc *p, int host, int min, bool cloexec) {
     for (int g = min < 0 ? 0 : min; g < MAX_FDS; g++)
-        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec }; return g; }
+        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec }; fdtrace(p, "open", g, host); return g; }
+    fprintf(stderr, "onirun: pid %d: guest fd table full\n", p->pid);
     host_close_locked(host);
     return -EMFILE;
 }
@@ -113,7 +128,7 @@ int fd_close(Proc *p, int g) {
     vfs_fd_closed(p, g);
     pthread_mutex_lock(&g_lock);
     int h = fd_host_locked(p, g);
-    if (h >= 0) { p->fd[g].host = -1; host_close_locked(h); }
+    if (h >= 0) { fdtrace(p, "close", g, h); p->fd[g].host = -1; host_close_locked(h); }
     pthread_mutex_unlock(&g_lock);
     return h < 0 ? -EBADF : 0;
 }
@@ -128,8 +143,9 @@ int fd_dup(Proc *p, int old, int target, bool exact, bool cloexec) {
     if (nh < 0) { r = -lx_errno(errno); goto out; }
     copy_meta_locked(h, nh);
     if (exact) {
-        if (p->fd[target].host >= 0) host_close_locked(p->fd[target].host);
+        if (p->fd[target].host >= 0) { fdtrace(p, "dup-over", target, p->fd[target].host); host_close_locked(p->fd[target].host); }
         p->fd[target] = (FdEnt){ nh, cloexec };
+        fdtrace(p, "dup-to", target, nh);
         r = target;
     } else {
         r = fd_install_locked(p, nh, target, cloexec);
@@ -692,7 +708,9 @@ void sys_abandoned(GuestCtx *c) {
 
 // Notes an abort() or similar so the reason isn't lost when the process dies.
 static void note_self_fatal(GuestCtx *c, Proc *q, int sig) {
-    if (q != c->proc || q->sigact[sig][0] != 0 || sig_default(sig) != D_CORE) return;
+    // SIGABRT to oneself is always reported: abort() callers often log nothing, and debuggerd's
+    // handler (installed in every process) would otherwise hide where it came from.
+    if (q != c->proc || (q->sigact[sig][0] != 0 && sig != 6) || sig_default(sig) != D_CORE) return;
     bool can = false;                                 // only fatal if some thread can take it
     for (GuestCtx *x = q->threads; x && !can; x = x->next_thread) can = !(x->sigmask & (1ull << (sig - 1)));
     if (!can) return;
@@ -798,7 +816,10 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fd[i].host < 0) continue;
         int h = dup(p->fd[i].host);
-        if (h < 0) continue;
+        if (h < 0) {                       // the child would silently lack this fd (fdsan then aborts on reuse)
+            fprintf(stderr, "onirun: fork of pid %d: cannot copy fd %d (host fd %d): %s\n", p->pid, i, p->fd[i].host, strerror(errno));
+            continue;
+        }
         copy_meta_locked(p->fd[i].host, h);
         q->fd[i] = (FdEnt){ h, p->fd[i].cloexec };
     }

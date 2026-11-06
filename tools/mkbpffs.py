@@ -167,6 +167,38 @@ def main():
                     continue
                 seen.add(pin)
                 lines.append(('prog', pin, struct.unpack_from('<I', e, 0)[0], 0, 0, 0, 0, 1000, 0o440))
+
+    # The platform's own objects (/system/etc/bpf, *.bpf) carry no pin records: the platform
+    # loader pins them at /sys/fs/bpf/<subdir/>map_<object>_<map> and prog_<object>_<section>.
+    # libmeminfo aborts system_server if map_gpuMem_gpu_mem_total_map can't be opened.
+    base = os.path.join(R, 'system/etc/bpf')
+    for root, _, files in os.walk(base):
+        for fn in sorted(files):
+            if not fn.endswith(('.bpf', '.o')):
+                continue
+            obj = fn.rsplit('.', 1)[0]
+            sub = os.path.relpath(root, base)
+            prefix = '/sys/fs/bpf/' + ('' if sub == '.' else sub + '/')
+            elf = Elf(open(os.path.join(root, fn), 'rb').read())
+            btf = Btf(elf.section('.BTF')) if elf.section('.BTF') else None
+            for t in (btf.types[1:] if btf else []):
+                if t['kind'] != 15 or t['name'] != '.maps':
+                    continue
+                for vt, _ in t['members']:
+                    name = btf.types[vt]['name']
+                    d = btf.map_desc(name) or {}
+                    pin = f'{prefix}map_{obj}_{name}'
+                    if pin in seen:
+                        continue
+                    seen.add(pin)
+                    lines.append(('map', pin, d.get('type', 1), d.get('key_size', 0), d.get('value_size', 0),
+                                  d.get('max_entries', 0), 0, 1000, 0o440))
+            for sec in elf.names:
+                if '/' in sec and not sec.startswith('.'):
+                    pin = f'{prefix}prog_{obj}_' + sec.split('$')[0].replace('/', '_')
+                    if pin not in seen:
+                        seen.add(pin)
+                        lines.append(('prog', pin, 0, 0, 0, 0, 0, 1000, 0o440))
     with open(os.path.join(R, 'oni/bpf.txt'), 'w') as f:
         for kind, pin, typ, ks, vs, me, uid, gid, mode in lines:
             f.write(f'{kind} {pin} {typ} {ks} {vs} {me} {uid} {gid} {mode:o}\n' if kind == 'map' else f'{kind} {pin} {typ}\n')
