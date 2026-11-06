@@ -541,7 +541,7 @@ static int64_t do_sendmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
         int32_t level, type;
         memcpy(&clen, gc + off, 8); memcpy(&level, gc + off + 8, 4); memcpy(&type, gc + off + 12, 4);
         if (clen < 16 || off + clen > m.controllen) return -EINVAL;
-        if (level == L_SOL_SOCKET && type == SCM_RIGHTS) {
+        if (level == L_SOL_SOCKET && type == SCM_RIGHTS && clen >= 20) {   // an empty SCM_RIGHTS is not passed on
             int nfd = (int)((clen - 16) / 4);
             struct cmsghdr *cm = (struct cmsghdr *)(ctl + cl);
             if (cl + CMSG_SPACE(nfd * sizeof(int)) > sizeof ctl) return -EINVAL;
@@ -608,6 +608,7 @@ static int64_t do_recvmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
     for (struct cmsghdr *cm = hm.msg_controllen ? CMSG_FIRSTHDR(&hm) : NULL; cm; cm = CMSG_NXTHDR(&hm, cm)) {
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
         int nfd = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        if (nfd <= 0) continue;                           // libbase aborts on an SCM_RIGHTS that carries no fds
         int *fds = (int *)CMSG_DATA(cm);
         uint64_t need = 16 + 4 * (uint64_t)nfd, space = (need + 7) & ~7ull;
         if (!gc || used + need > m.controllen) {
