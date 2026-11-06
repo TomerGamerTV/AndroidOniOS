@@ -1,8 +1,9 @@
 // onirun: runs Android (Linux/arm64, bionic) programs on Apple arm64 hosts (macOS now, iOS later)
-// without a virtual machine. Android code is translated in blocks into a JIT cache: most
-// instructions are copied unchanged, while branches, PC-relative loads, system calls, the TLS
-// register (TPIDR_EL0) and x18 are rewritten, because XNU overwrites TPIDR_EL0 with the CPU number
-// and zeroes x18 on every context switch. System calls are served by a Linux personality layer.
+// without a virtual machine. Android code is translated in blocks into a JIT cache. Every guest
+// process lives in its own window of host address space: guest address g is host address
+// base + g, translated code keeps base in x16 and adds it to every memory access, so a fork is a
+// copy-on-write copy of the window into a new one and many Android processes share one host
+// process (iOS has no fork). System calls are served by a Linux personality layer.
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -10,8 +11,8 @@
 
 // Guest CPU state. The assembly in cpu.S uses these offsets.
 typedef struct GuestCtx {
-    uint64_t x[31];        //   0: x0..x30 (x18 lives only here: it is virtualized)
-    uint64_t sp;           // 248
+    uint64_t x[31];        //   0: x0..x30 (x16, x17 and x18 live only here; the host uses them)
+    uint64_t sp;           // 248: guest address
     uint64_t pc;           // 256
     uint64_t nzcv;         // 264
     uint64_t fpcr;         // 272
@@ -19,17 +20,24 @@ typedef struct GuestCtx {
     uint64_t tpidr;        // 288: guest TPIDR_EL0
     uint64_t exit_arg;     // 296
     uint64_t exit_kind;    // 304
-    uint64_t pad0;         // 312
+    uint64_t base;         // 312: host address of guest address 0 (this process's window)
     uint8_t q[32][16];     // 320: v0..v31
     uint64_t host_sp;      // 832
     uint64_t host_x[12];   // 840: x19..x30
     uint64_t host_d[8];    // 936: d8..d15
     // ---- C-only from here ----
+    struct Proc *proc;
+    struct TrSpace *space;         // translations for this address space
     uint64_t tid;
     uint64_t clear_child_tid;
     uint64_t sigmask;
     volatile uint64_t pending;     // signals sent to this thread (tgkill)
+    volatile int kill;             // set by another thread: leave now (exit_group, exec, fatal signal)
+    int fault_sig;                 // Linux signal when translated code faulted
+    uint64_t fault_addr;           // guest address of that fault
     void *host_thread;             // pthread_t
+    void *altstack;
+    char name[16];
     struct GuestCtx *next_thread;
 } GuestCtx;
 
@@ -38,33 +46,42 @@ typedef struct GuestCtx {
 #define CTX_PC 256
 #define CTX_TPIDR 288
 #define CTX_EXIT_ARG 296
+#define CTX_EXIT_KIND 304
+#define CTX_BASE 312
 
-enum { EXIT_DIRECT = 1, EXIT_INDIRECT = 2, EXIT_SYSCALL = 3, EXIT_EMULATE = 4, EXIT_BRK = 5 };
+enum { EXIT_DIRECT = 1, EXIT_INDIRECT = 2, EXIT_SYSCALL = 3, EXIT_EMULATE = 4, EXIT_BRK = 5, EXIT_KILLED = 6 };
+
+// A process window is WIN_SIZE bytes of host address space. Just below it sits the indirect-branch
+// table that translated code probes through x16.
+#define WIN_BITS 36
+#define WIN_SIZE (1ull << WIN_BITS)
+#define IB_BITS 14
+#define IB_SIZE ((1ull << IB_BITS) * 16)
 
 // cpu.S
 void onx_enter(GuestCtx *ctx, void *host_code);
 void onx_exit_common(void);
+void onx_abandon(void);        // x0 = ctx: leave translated code without saving guest state
 extern uint64_t onx_tsd_off;   // byte offset of our context slot in the Darwin TSD
 
 // translate.c
+struct TrSpace;
 void tr_init(void);
-void tr_after_fork(void);
-void tr_run(GuestCtx *ctx);       // runs the guest thread until it exits
-GuestCtx *tr_current(void);
+struct TrSpace *tr_space_new(uint8_t *base);
+void tr_space_free(struct TrSpace *s);
+__attribute__((noreturn)) void tr_run(GuestCtx *ctx);
+void tr_leave(void);                       // the calling thread stops being a guest thread
+extern __thread GuestCtx *tr_cur;
 
-// syscall.c
+// syscall.c / proc.c
 void sys_init(const char *rootfs);
-void sys_register_main_thread(GuestCtx *c);
+__attribute__((noreturn)) void sys_main(const char *path, char **argv, char **envp);
 void sys_dispatch(GuestCtx *c);
-void sys_deliver_signals(GuestCtx *c);
-void sys_note_mapping(uint64_t start, uint64_t len, uint64_t off, const char *path);
+void sys_deliver_signals(GuestCtx *c);          // may not return (thread leaves)
+__attribute__((noreturn)) void sys_abandoned(GuestCtx *c);
 int  sys_emulate(GuestCtx *c, uint64_t pc, uint32_t insn); // 0 = handled
-int  host_path(const char *guest, int dirfd, char *out, size_t outlen, bool follow_last);
-extern char g_rootfs[1024];
-
-// loader.c
-typedef struct ExecImage { uint64_t entry; uint64_t sp; } ExecImage;
-int  load_exec(const char *guest_path, char *const argv[], char *const envp[], ExecImage *out);
+uint64_t sys_code_end(GuestCtx *c, uint64_t pc);           // end of the executable mapping at pc, 0 = none
+void sys_fault(GuestCtx *c, int sig, uint64_t addr);       // a guest fault outside translated code
 
 __attribute__((noreturn, format(printf, 1, 2))) void die(const char *fmt, ...);
 extern int g_verbose;

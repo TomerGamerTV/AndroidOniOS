@@ -75,7 +75,7 @@ You need an Apple Silicon Mac with Xcode, Rust (`rustup`), Python 3, Meson and N
 
 ## Experimental: Android without a virtual machine
 
-`userland/` holds **onirun**, a prototype that runs Android's own arm64 programs directly on the host. There's no virtual machine and no Linux kernel: a block translator copies Android code almost unchanged, and a Linux system-call layer runs on Darwin. It currently runs Android's shell and toybox on macOS. See [userland/README.md](userland/README.md).
+`userland/` holds **onirun**, a prototype that runs Android's own arm64 programs directly on the host. There's no virtual machine and no Linux kernel: a block translator copies Android code almost unchanged, and a Linux system-call layer runs on Darwin. On macOS it currently runs Android's shell and toybox, with threads, and with many Android processes (fork, exec, signals) inside one host process, the way iOS needs it. See [userland/README.md](userland/README.md).
 
 ## Credits and licenses
 

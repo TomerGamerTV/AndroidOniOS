@@ -1,15 +1,16 @@
 // Switching between host C code and translated guest code. Offsets match GuestCtx in onx.h.
 //
-// Guest code runs with the guest's own register values in x0..x30, sp, nzcv and v0..v31 (except
-// x18, which XNU zeroes on context switches, so the guest's x18 lives in the context). Every way
-// out of translated code goes through a stub that first stores guest x16/x17 just below the guest
-// stack pointer (AArch64 has no red zone, so the guest never keeps live data there), puts the exit
-// argument in x16 and the exit kind in x17, and jumps to the code cache's trampoline, which saves
-// x0/x1 below that and comes here.
+// Guest code runs with the guest's own values in x0..x15, x19..x30, nzcv and v0..v31. The host keeps
+// x16 = the process window base (guest address g is host address x16 + g) and uses x17 as scratch;
+// the guest's x16, x17 and x18 (which XNU zeroes on context switches) live in the context. The host
+// sp holds the guest stack pointer as a host address (window base + guest sp). Every way out of
+// translated code puts the exit argument in x16 and the exit kind in x17 and jumps to its code
+// chunk's trampoline, which saves guest x0/x1 just below sp (AArch64 has no red zone) and comes here.
 
     .text
     .globl _onx_enter
     .globl _onx_exit_common
+    .globl _onx_abandon
     .globl _onx_tsd_off
 
     .p2align 2
@@ -28,11 +29,6 @@ _onx_enter:
     stp d10, d11, [x9, #120]
     stp d12, d13, [x9, #136]
     stp d14, d15, [x9, #152]
-    // Guest x16/x17 go below the guest sp; every block's entry instruction reloads them.
-    ldr x9, [x0, #248]
-    ldp x10, x11, [x0, #128]
-    stp x10, x11, [x9, #-16]
-    mov x16, x1
     add x9, x0, #320
     ldp q0, q1, [x9, #0]
     ldp q2, q3, [x9, #32]
@@ -55,8 +51,11 @@ _onx_enter:
     msr fpsr, x11
     ldr x10, [x0, #264]
     msr nzcv, x10
+    ldr x16, [x0, #312]
     ldr x9, [x0, #248]
+    add x9, x9, x16
     mov sp, x9
+    str x1, [sp, #-16]          // the block to run, parked below the guest stack
     mov x17, x0
     ldp x0, x1, [x17, #0]
     ldp x2, x3, [x17, #16]
@@ -72,11 +71,11 @@ _onx_enter:
     ldp x25, x26, [x17, #200]
     ldp x27, x28, [x17, #216]
     ldp x29, x30, [x17, #232]
-    br x16
+    ldr x17, [sp, #-16]
+    br x17
 
     .p2align 2
-// Entered from the code-cache trampoline. [sp-32] = guest x0,x1; [sp-16] = guest x16,x17;
-// x16 = exit argument; x17 = exit kind.
+// Entered from a chunk trampoline. [sp-32] = guest x0,x1; x16 = exit argument; x17 = exit kind.
 _onx_exit_common:
     mrs x0, tpidrro_el0
     and x0, x0, #0xfffffffffffffff8
@@ -86,8 +85,6 @@ _onx_exit_common:
     stp x16, x17, [x0, #296]
     ldp x16, x17, [sp, #-32]
     stp x16, x17, [x0, #0]
-    ldp x16, x17, [sp, #-16]
-    stp x16, x17, [x0, #128]
     stp x2, x3, [x0, #16]
     stp x4, x5, [x0, #32]
     stp x6, x7, [x0, #48]
@@ -101,7 +98,9 @@ _onx_exit_common:
     stp x25, x26, [x0, #200]
     stp x27, x28, [x0, #216]
     stp x29, x30, [x0, #232]
+    ldr x17, [x0, #312]
     mov x16, sp
+    sub x16, x16, x17
     str x16, [x0, #248]
     mrs x16, nzcv
     str x16, [x0, #264]
@@ -125,6 +124,7 @@ _onx_exit_common:
     stp q26, q27, [x9, #416]
     stp q28, q29, [x9, #448]
     stp q30, q31, [x9, #480]
+Lrestore_host:
     add x9, x0, #832
     ldr x10, [x9, #0]
     mov sp, x10
@@ -139,6 +139,14 @@ _onx_exit_common:
     ldp d12, d13, [x9, #136]
     ldp d14, d15, [x9, #152]
     ret
+
+    .p2align 2
+// A signal handler redirects a thread here (x0 = ctx) to pull it out of translated code when its
+// process is going away. Guest registers are not saved.
+_onx_abandon:
+    mov x17, #6
+    str x17, [x0, #304]
+    b Lrestore_host
 
     .data
     .p2align 3

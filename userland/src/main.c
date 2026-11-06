@@ -38,14 +38,5 @@ int main(int argc, char **argv) {
     };
     tr_init();
     sys_init(root);
-    ExecImage img;
-    int e = load_exec(argv[i], argv + i, envp, &img);
-    if (e) die("onirun: cannot load %s (errno %d)", argv[i], -e);
-    GuestCtx *c = calloc(1, sizeof *c);
-    c->pc = img.entry;
-    c->sp = img.sp;
-    c->tid = (uint64_t)getpid();
-    sys_register_main_thread(c);
-    tr_run(c);
-    return 0;
+    sys_main(argv[i], argv + i, envp);
 }
