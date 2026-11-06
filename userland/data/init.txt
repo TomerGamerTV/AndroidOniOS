@@ -22,7 +22,7 @@ service aconfigd /system/bin/aconfigd-system start-socket
 service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
   socket aconfigd_mainline
 # stand-ins for daemons the host can't run (userland/stubs/stubsvc.c)
-service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver vold=android.os.IVold
+service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17 dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold
 service idmap2d /system/bin/idmap2d
 service lmkd /system/bin/lmkd
   socket lmkd

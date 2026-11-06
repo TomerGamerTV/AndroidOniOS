@@ -3,7 +3,9 @@
 // each transaction with "no exception" and no data; Java callers read missing return values as 0,
 // false, null or an empty list, which is what system_server expects from a healthy but idle daemon.
 //
-//   onistub NAME=INTERFACE ...     e.g. onistub netd=android.net.INetd vold=android.os.IVold
+//   onistub NAME=INTERFACE[+EXTENSION_INTERFACE[@CODE]] ...   e.g. onistub netd=android.net.INetd vold=android.os.IVold
+//   +EXT attaches a second stub as the binder's extension (how unstable AIDL companions are published);
+//   @CODE also answers that transaction code with the extension binder (IDnsResolver.getUnstableInterface).
 //
 // Built with the NDK against the image's own libbinder_ndk.so (see userland/Makefile, target stubs).
 #include <android/binder_ibinder.h>
@@ -25,7 +27,7 @@ void ABinderProcess_joinThreadPool(void);
 #define TAG "onistub"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-typedef struct { const char *name, *iface; } Svc;
+typedef struct { const char *name, *iface; AIBinder *ext; int ext_code; } Svc;
 
 static void *on_create(void *args) { return args; }
 static void on_destroy(void *userdata) { (void)userdata; }
@@ -49,6 +51,7 @@ static binder_status_t on_transact(AIBinder *binder, transaction_code_t code, co
     }
     LOGI("%s: transaction %u acknowledged", s->name, (unsigned)code);
     AParcel_writeInt32(out, 0);                   // exception header: none
+    if (s->ext && s->ext_code && (int)code == s->ext_code) AParcel_writeStrongBinder(out, s->ext);
     return STATUS_OK;
 }
 
@@ -62,8 +65,24 @@ int main(int argc, char **argv) {
         *eq = 0;
         s->name = argv[i];
         s->iface = eq + 1;
+        char *plus = strchr(eq + 1, '+');
+        if (plus) *plus = 0;
+        char *at = plus ? strchr(plus + 1, '@') : NULL;
+        if (at) { *at = 0; s->ext_code = atoi(at + 1); }
         AIBinder_Class *cls = AIBinder_Class_define(s->iface, on_create, on_destroy, on_transact);
+        AIBinder_Class_disableInterfaceTokenHeader(cls);   // callers may use variant descriptors (…unstable.descriptor.…)
         AIBinder *b = AIBinder_new(cls, s);
+        if (plus) {
+            Svc *x = calloc(1, sizeof *x);
+            x->name = s->name;
+            x->iface = plus + 1;
+            AIBinder_Class *xcls = AIBinder_Class_define(x->iface, on_create, on_destroy, on_transact);
+            AIBinder_Class_disableInterfaceTokenHeader(xcls);
+            AIBinder *xb = AIBinder_new(xcls, x);
+            AIBinder_setExtension(b, xb);
+            s->ext = xb;
+            LOGI("%s: extension %s attached", s->name, x->iface);
+        }
         binder_exception_t e = AServiceManager_addService(b, s->name);
         LOGI("registered %s (%s): %d", s->name, s->iface, (int)e);
         if (e != EX_NONE) fprintf(stderr, "onistub: addService(%s) failed: %d\n", s->name, (int)e);

@@ -161,7 +161,8 @@ static uint64_t blk_owner;                                  // host thread id ho
 static const char *blk_where;
 #define BLK_LOCK(w) do { pthread_mutex_lock(&blk); pthread_threadid_np(NULL, &blk_owner); blk_where = (w); } while (0)
 static BCtx *ctxs;
-static __thread BThread *cur_th;      // the thread inside the ioctl, for work that belongs to the caller
+static __thread BThread *cur_th;
+static int btrace = -1;             // ONIRUN_BINDERTRACE: print every transaction      // the thread inside the ioctl, for work that belongs to the caller
 
 // ---- work lists ----
 static void work_push(WorkList *l, BWork *w) {
@@ -608,11 +609,14 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
             break;
         }
         default:
-            LOGV("onirun: binder: unknown object type %08x at offset %llu\n", type, (unsigned long long)o);
+            fprintf(stderr, "onirun: binder: pid %d: unknown object type %08x at offset %llu\n", p->pid, type, (unsigned long long)o);
             goto failed_objs;
         }
     }
 
+    if (btrace) fprintf(stderr, "binder: %d/%llu -> %d%s code %u flags %#x data %llu offs %llu%s\n", p->pid, (unsigned long long)th->tid,
+                        target_proc->pid, target_thread ? " (thread)" : "", tr.code, tr.flags, (unsigned long long)tr.data_size,
+                        (unsigned long long)tr.offsets_size, reply ? " REPLY" : "");
     // Deliver.
     if (reply) {
         target_thread->stack = in_reply_to->from_parent;
@@ -642,7 +646,7 @@ failed_objs:
 failed_buf:
     buf_free(target_proc, b);
 failed:
-    LOGV("onirun: binder: transaction from pid %d failed (%s, code %u, data %llu, offsets %llu, sg %llu, ctx %s)\n", p->pid,
+    fprintf(stderr, "onirun: binder: transaction from pid %d failed (%s, code %u, data %llu, offsets %llu, sg %llu, ctx %s)\n", p->pid,
          reply ? "reply" : "call", tr.code, (unsigned long long)tr.data_size, (unsigned long long)tr.offsets_size,
          (unsigned long long)buffers_size, p->ctx->name);
     trans_free(t);
@@ -670,7 +674,7 @@ static int do_write(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t s
         uint32_t cmd;
         memcpy(&cmd, base + pos, 4);
         uint64_t arg = pos + 4, asz = IOC_SIZE(cmd);
-        if (IOC_TYPE(cmd) != 'c' || arg + asz > size) return -EINVAL;
+        if (IOC_TYPE(cmd) != 'c' || arg + asz > size) { fprintf(stderr, "onirun: binder: pid %d: bad command %08x at %llu/%llu\n", p->pid, cmd, (unsigned long long)pos, (unsigned long long)size); return -EINVAL; }
         const uint8_t *a = base + arg;
         switch (IOC_NR(cmd)) {
         case BC_TRANSACTION: case BC_REPLY: case BC_TRANSACTION_SG: case BC_REPLY_SG: {
@@ -894,7 +898,13 @@ out:
 }
 
 // ---- ioctl ----
+static int64_t binder_ioctl_inner(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg);
 static int64_t binder_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
+    int64_t r = binder_ioctl_inner(o, c, req, arg);
+    if (r < 0 && r != -EINTR && r != -EAGAIN) fprintf(stderr, "onirun: binder: pid %d tid %llu ioctl %llx -> %lld\n", c->proc->pid, (unsigned long long)c->tid, (unsigned long long)req, (long long)r);
+    return r;
+}
+static int64_t binder_ioctl_inner(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
     BProc *p = o->data;
     if (IOC_TYPE(req) != 'b') return -ENOTTY;
     int64_t r = 0;
@@ -1078,6 +1088,7 @@ static BCtx *ctx_get(const char *name) {
 }
 
 int binder_open(Proc *proc, const char *context, int lflags) {
+    if (btrace < 0) btrace = getenv("ONIRUN_BINDERTRACE") != NULL;
     BProc *p = calloc(1, sizeof *p);
     p->proc = proc;
     p->pid = proc->pid;
