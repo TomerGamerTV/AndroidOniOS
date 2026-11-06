@@ -20,14 +20,18 @@ void die(const char *fmt, ...) {
 
 int main(int argc, char **argv) {
     const char *root = getenv("ONIRUN_ROOT");
+    const char *sockets[16] = {0};
+    int nsock = 0;
     int i = 1;
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (!strcmp(argv[i], "-v")) g_verbose = 1;
         else if (!strcmp(argv[i], "--root") && i + 1 < argc) root = argv[++i];
+        else if (!strcmp(argv[i], "--socket") && i + 1 < argc && nsock < 15) sockets[nsock++] = argv[++i];
         else break;
     }
     if (i >= argc || !root) {
-        fprintf(stderr, "usage: onirun [-v] --root ROOTFS /guest/program [args...]\n");
+        fprintf(stderr, "usage: onirun [-v] [--socket NAME]... --root ROOTFS /guest/program [args...]\n"
+                        "  --socket NAME  create /dev/socket/NAME listening and pass it as ANDROID_SOCKET_NAME (like init)\n");
         return 2;
     }
     // The guest environment: Android's defaults, plus classpath variables from the host
@@ -51,5 +55,5 @@ int main(int argc, char **argv) {
     envp[ne] = NULL;
     tr_init();
     sys_init(root);
-    sys_main(argv[i], argv + i, envp);
+    sys_main(argv[i], argv + i, envp, sockets);
 }

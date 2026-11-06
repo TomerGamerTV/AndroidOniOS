@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sys.h"
@@ -73,7 +74,73 @@ static Ctx *ctx_get(const char *name) {
     return c;
 }
 
+// ---- property_info: the serialized trie Android's libc uses to find a property's context ----
+// (system/core/property_service/libpropertyinfoserializer). Using the same file as libc means we
+// always write where libc will look.
+static const uint8_t *pinfo;
+static uint32_t pinfo_size;
+static inline uint32_t pu32(uint32_t off) { uint32_t v; memcpy(&v, pinfo + off, 4); return v; }
+static const char *pstr(uint32_t off) { return off < pinfo_size ? (const char *)pinfo + off : ""; }
+// TrieNodeInternal: property_entry, num_child_nodes, child_nodes, num_prefixes, prefix_entries, num_exact_matches, exact_match_entries
+// PropertyEntry: name_offset, namelen, context_index, type_index
+static uint32_t entry_ctx(uint32_t entry) { return entry ? pu32(entry + 8) : ~0u; }
+static const char *entry_name(uint32_t entry) { return pstr(pu32(entry)); }
+
+static bool pinfo_load(void) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/dev/__properties__/property_info", g_rootfs);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) || st.st_size < 32) { close(fd); return false; }
+    pinfo = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (pinfo == MAP_FAILED) { pinfo = NULL; return false; }
+    pinfo_size = (uint32_t)st.st_size;
+    // Header: current_version, minimum_supported_version, size, contexts_offset, types_offset, root_offset
+    return pu32(8) == pinfo_size && pu32(12) < pinfo_size && pu32(20) < pinfo_size;
+}
+
+static const char *pinfo_ctx(const char *name) {
+    if (!pinfo) return NULL;
+    uint32_t node = pu32(20);                          // root
+    uint32_t ctx = entry_ctx(pu32(node));
+    const char *rem = name;
+    for (;;) {
+        const char *sep = strchr(rem, '.');
+        uint32_t len = sep ? (uint32_t)(sep - rem) : (uint32_t)strlen(rem);
+        // prefixes at this node
+        uint32_t np = pu32(node + 12), pe = pu32(node + 16);
+        for (uint32_t i = 0; i < np; i++) {
+            uint32_t e = pu32(pe + 4 * i);
+            if (!strncmp(rem, entry_name(e), pu32(e + 4))) { ctx = entry_ctx(e); break; }
+        }
+        if (!sep) break;
+        // child with this component name (children are sorted; linear is fine here)
+        uint32_t nc = pu32(node + 4), ca = pu32(node + 8), child = 0;
+        for (uint32_t i = 0; i < nc && !child; i++) {
+            uint32_t cn = pu32(ca + 4 * i), ce = pu32(cn);
+            const char *n = entry_name(ce);
+            if (strlen(n) == len && !strncmp(n, rem, len)) child = cn;
+        }
+        if (!child) break;
+        node = child;
+        if (entry_ctx(pu32(node)) != ~0u) ctx = entry_ctx(pu32(node));
+        rem = sep + 1;
+    }
+    uint32_t ne = pu32(node + 20), ea = pu32(node + 24);
+    for (uint32_t i = 0; i < ne; i++) {
+        uint32_t e = pu32(ea + 4 * i);
+        if (!strcmp(name, entry_name(e))) { ctx = entry_ctx(e); break; }
+    }
+    if (ctx == ~0u) return NULL;
+    uint32_t coff = pu32(12), nctx = pu32(coff), carr = coff + 4;   // count, then string offsets
+    return ctx < nctx ? pstr(pu32(carr + 4 * ctx)) : NULL;
+}
+
 static const char *ctx_for(const char *prop) {
+    const char *from_info = pinfo_ctx(prop);
+    if (from_info) return from_info;
     const Rule *best = NULL;
     size_t bl = 0;
     for (Rule *r = rules; r; r = r->next) {
@@ -274,11 +341,41 @@ void props_init(void) {
         "/odm/etc/selinux/odm_property_contexts",
     };
     for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) load_rules(files[i]);
+    if (!pinfo_load()) fprintf(stderr, "onirun: warning: no usable /dev/__properties__/property_info; using text rules\n");
     serial_area = map_area("properties_serial", true);
     // Every context gets a valid (possibly empty) area, so readers never map garbage.
     for (Rule *r = rules; r; r = r->next) ctx_get(r->ctx);
     sock_builtin_stream("/dev/socket/property_service", prop_accept, NULL);
     sock_builtin_stream("/dev/socket/property_service_for_system", prop_accept, NULL);
+    // Defaults for properties whose areas couldn't be copied from the device: name=value lines.
+    char path[1200];
+    snprintf(path, sizeof path, "%s/oni/properties.txt", g_rootfs);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[1024];
+        int added = 0;
+        while (fgets(line, sizeof line, f)) {
+            char *eq = strchr(line, '=');
+            if (line[0] == '#' || !eq) continue;
+            *eq = 0;
+            char *val = eq + 1;
+            val[strcspn(val, "\n")] = 0;
+            pthread_mutex_lock(&props_lock);
+            Ctx *c = ctx_get(ctx_for(line));
+            uint32_t have = c ? find_prop(c->area, line, val, false) : 0;
+            if (c && !have && strlen(val) < PROP_VALUE_MAX) {
+                int rc = prop_set_locked(line, val);
+                if (rc == PROP_SUCCESS) added++;
+                else LOGV("onirun: property %s=%s not set: %d\n", line, val, rc);
+            } else if (getenv("ONIRUN_PROPDEBUG")) {
+                fprintf(stderr, "prop %s: ctx %s have %u value '%s'\n", line, ctx_for(line), have,
+                        have ? (char *)(c->area->data + have + 4) : "");
+            }
+            pthread_mutex_unlock(&props_lock);
+        }
+        fclose(f);
+        LOGV("onirun: %d properties filled in from /oni/properties.txt\n", added);
+    }
     // Properties that describe this environment rather than the Android image they came from.
     props_set("sys.use_memfd", "1");
     props_set("init.svc.zygote", "stopped");

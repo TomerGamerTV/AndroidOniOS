@@ -233,7 +233,7 @@ static bool is_devnode(const char *gpath) {
 }
 
 static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
-    uint32_t owner = shell_owned(gpath) ? g_uid : 0;
+    uint32_t owner = shell_owned(gpath) ? 2000 : 0;
     uint32_t mode = st->st_mode;
     if (is_devnode(gpath) && S_ISREG(st->st_mode)) mode = S_IFCHR | 0666;   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};
@@ -659,9 +659,12 @@ void sys_dispatch(GuestCtx *c) {
             r = 0;
             break;
         }
-        case 0x53564d41: case 4: case 38: case 1: case 23: r = 0; break;
-        case 3: r = 1; break;
-        default: r = ERR(22);
+        case 3: r = 1; break;                                                               // PR_GET_DUMPABLE
+        case 23: r = 1; break;                                                              // PR_CAPBSET_READ
+        case 30: r = 50000; break;                                                          // PR_GET_TIMERSLACK
+        case 55: r = ERR(22); break;         // PR_SET_TAGGED_ADDR_CTRL: refused, so bionic keeps heap pointers untagged
+        case 56: r = 0; break;               // PR_GET_TAGGED_ADDR_CTRL: no MTE
+        default: r = 0;                      // set-style requests: accepted
         }
         break;
     case 278: arc4random_buf(gptr(a0), a1); r = a1; break;   // getrandom
@@ -704,7 +707,29 @@ void sys_dispatch(GuestCtx *c) {
     case 172: r = (uint64_t)p->pid; break;
     case 173: r = (uint64_t)p->ppid; break;
     case 178: r = c->tid; break;
-    case 174: case 175: case 176: case 177: r = g_uid; break;   // the adb shell user
+    case 174: case 175: r = p->uid; break;                     // getuid, geteuid
+    case 176: case 177: r = p->gid; break;                     // getgid, getegid
+    case 146: p->uid = (uint32_t)a0; r = 0; break;             // setuid
+    case 144: p->gid = (uint32_t)a0; r = 0; break;             // setgid
+    case 145: if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; if ((int32_t)a1 != -1) p->uid = (uint32_t)a1; r = 0; break;   // setreuid
+    case 143: if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; if ((int32_t)a1 != -1) p->gid = (uint32_t)a1; r = 0; break;   // setregid
+    case 147: if ((int32_t)a1 != -1) p->uid = (uint32_t)a1; else if ((int32_t)a0 != -1) p->uid = (uint32_t)a0; r = 0; break;   // setresuid
+    case 149: if ((int32_t)a1 != -1) p->gid = (uint32_t)a1; else if ((int32_t)a0 != -1) p->gid = (uint32_t)a0; r = 0; break;   // setresgid
+    case 148: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = p->uid; r = 0; break; }   // getresuid
+    case 150: { uint32_t *o[3] = { gptr(a0), gptr(a1), gptr(a2) }; for (int i = 0; i < 3; i++) if (o[i]) *o[i] = p->gid; r = 0; break; }   // getresgid
+    case 151: case 152: r = 0; break;                          // setfsuid, setfsgid
+    case 159: {                                                // setgroups
+        if (a0 > 32) { r = ERR(22); break; }
+        p->ngroups = (int)a0;
+        if (a0) memcpy(p->groups, gptr(a1), a0 * 4);
+        r = 0;
+        break;
+    }
+    case 97: case 40: case 39: case 41: case 51: case 268: r = 0; break;   // unshare, mount, umount2, pivot_root, chroot, setns: pretend
+    case 277: r = 0; break;                                    // seccomp
+    case 30: case 31: r = 0; break;                            // ioprio_set/get
+    case 92: r = 0; break;                                     // personality
+    case 164: r = 0; break;                                    // setrlimit
     case 19: r = OBJRET(vfs_eventfd(c, a0, (int)a1)); break;
     case 20: r = OBJRET(vfs_epoll_create(c, (int)a0)); break;
     case 21: r = OBJRET(vfs_epoll_ctl(c, (int)a0, (int)a1, (int)a2, a3)); break;
@@ -727,7 +752,12 @@ void sys_dispatch(GuestCtx *c) {
         r = OBJRET(sock_call(c, nr, a0, a1, a2, a3, a4, a5));
         break;
     }
-    case 158: r = 0; break;   // getgroups
+    case 158: {               // getgroups
+        if (a0 && (int)a0 < p->ngroups) { r = ERR(22); break; }
+        if (a0) memcpy(gptr(a1), p->groups, (size_t)p->ngroups * 4);
+        r = (uint64_t)p->ngroups;
+        break;
+    }
     case 165: memset(gptr(a1), 0, 144); r = 0; break;   // getrusage
     case 163: case 261: {     // getrlimit / prlimit64
         uint64_t res = nr == 163 ? a0 : a1, out = nr == 163 ? a1 : a3;

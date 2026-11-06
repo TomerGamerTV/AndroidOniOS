@@ -110,6 +110,7 @@ int64_t sock_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a
 typedef void (*BuiltinAccept)(int host_fd, int peer_pid, void *arg);
 int  sock_builtin_stream(const char *guest_path, BuiltinAccept accept, void *arg);
 int  sock_builtin_dgram(const char *guest_path);           // returns the host fd that receives the datagrams
+int  sock_listen_for(struct Proc *p, const char *name);    // init-style socket for the first process: guest fd
 
 // ---- /proc and /sys (procfs.c) ----
 int  procfs_open(struct Proc *p, const char *guest_path, int lflags);   // guest fd, -errno, or 1 = not ours
@@ -129,6 +130,9 @@ enum { P_RUNNING, P_EXITING, P_ZOMBIE };
 
 typedef struct Proc {
     int pid, ppid, pgid, sid;
+    uint32_t uid, gid;        // real/effective ids (setresuid moves them; no separate saved set)
+    uint32_t groups[32];
+    int ngroups;
     int nepoll;               // epoll fds open, so close() knows whether to scan them
     Mm *mm;
     FdEnt fd[MAX_FDS];        // guest fd -> host fd (-1 = closed)
@@ -183,7 +187,7 @@ uint64_t proc_setpgid(GuestCtx *c, int64_t pid, int64_t pgid);
 uint64_t proc_getpgid(GuestCtx *c, int64_t pid);
 uint64_t proc_setsid(GuestCtx *c);
 void proc_backtrace(GuestCtx *c);
-Proc *proc_start(const char *path, char **argv, char **envp);
+Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets);
 const char *proc_secontext(Proc *p);                 // SELinux context we claim for p
 Proc *proc_find(int pid);                            // g_lock held
 void proc_forward_host_signal(int lsig);
@@ -196,8 +200,10 @@ int lx_sig(int host_sig);
 #define ERR(e) ((uint64_t)(int64_t)-(e))
 #define HOSTRET(expr) ({ __typeof__(expr) _r = (expr); _r < 0 ? ERR(lx_errno(errno)) : (uint64_t)_r; })
 
-// Guest pointers of the calling thread's process.
-static inline void *gptr(uint64_t a) { return a ? (void *)(uintptr_t)(tr_cur->base + a) : NULL; }
+// Guest pointers of the calling thread's process. The top byte is ignored (TBI), as Linux does for
+// addresses passed to system calls.
+#define UNTAG(a) ((a) & 0x00ffffffffffffffull)
+static inline void *gptr(uint64_t a) { return a ? (void *)(uintptr_t)(tr_cur->base + UNTAG(a)) : NULL; }
 static inline const char *gstr(uint64_t a) { return (const char *)gptr(a); }
 
 // ---- loader.c ----

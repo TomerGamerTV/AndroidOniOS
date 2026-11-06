@@ -29,9 +29,10 @@
 #define L_SOL_SOCKET 1
 
 enum { S_NEW, S_BOUND, S_LISTEN, S_CONN };
-typedef struct Pending { int fd, pid; } Pending;
+typedef struct Pending { int fd, pid; uint32_t uid, gid; } Pending;
 typedef struct Sock {
     int type, state, pid, peer_pid;
+    uint32_t peer_uid, peer_gid;
     char key[112];
     int send_fd;              // bound datagram socket: the end senders write to
     bool passcred, netlink;
@@ -79,6 +80,30 @@ static void name_remove(const char *key) {
 }
 
 int sock_builtin_stream(const char *path, BuiltinAccept accept, void *arg) { return name_add(path, NULL, accept, arg, -1); }
+
+static const FdOps sock_ops;
+
+// A listening stream socket handed to a process at startup, the way init passes zygote its
+// socket: bound at /dev/socket/<name>, installed as a guest fd (returned), listening.
+int sock_listen_for(Proc *p, const char *name) {
+    int pf[2];
+    if (pipe(pf)) return -errno;
+    fcntl(pf[1], F_SETFD, FD_CLOEXEC);
+    Sock *s = calloc(1, sizeof *s);
+    s->type = L_SOCK_STREAM;
+    s->pid = p->pid;
+    s->send_fd = -1;
+    snprintf(s->key, sizeof s->key, "/dev/socket/%s", name);
+    FdObj *o = obj_new(&sock_ops, s, false);
+    s->o = o;
+    o->rd = dup(pf[0]);
+    o->wr = pf[1];
+    int e = name_add(s->key, s, NULL, NULL, -1);
+    if (e) { close(pf[0]); close(pf[1]); close(o->rd); free(s); free(o); return e; }
+    s->state = S_LISTEN;
+    fd_set_path(pf[0], s->key);
+    return fd_install_obj(p, pf[0], o, false);
+}
 
 int sock_builtin_dgram(const char *path) {
     int sp[2];
@@ -220,6 +245,8 @@ static int64_t do_socketpair(GuestCtx *c, int domain, int type, uint64_t sv) {
     Sock *a = sock_of(c->proc, g0, NULL), *b = sock_of(c->proc, g1, NULL);
     a->state = b->state = S_CONN;
     a->peer_pid = b->peer_pid = c->proc->pid;
+    a->peer_uid = b->peer_uid = c->proc->uid;
+    a->peer_gid = b->peer_gid = c->proc->gid;
     int32_t *out = gptr(sv);
     out[0] = g0;
     out[1] = g1;
@@ -279,7 +306,9 @@ static int64_t deliver(Name *n, int fd, int pid) {
     pthread_mutex_lock(&o->lock);
     if (l->state != S_LISTEN) { pthread_mutex_unlock(&o->lock); close(fd); return -ECONNREFUSED; }
     if (l->qn == l->qcap) { l->qcap = l->qcap ? l->qcap * 2 : 8; l->q = realloc(l->q, (size_t)l->qcap * sizeof(Pending)); }
-    l->q[l->qn++] = (Pending){ fd, pid };
+    Proc *cp;
+    LOCKED(cp = proc_find(pid));
+    l->q[l->qn++] = (Pending){ fd, pid, cp ? cp->uid : 0, cp ? cp->gid : 0 };
     obj_set_ready(o, true);
     pthread_mutex_unlock(&o->lock);
     return 0;
@@ -313,6 +342,7 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     if (socketpair(AF_UNIX, host_type(s->type), 0, sp)) { pthread_mutex_unlock(&names_lock); return -errno; }
     fcntl(sp[1], F_SETFD, FD_CLOEXEC);
     s->peer_pid = n->s ? n->s->pid : 0;
+    if (n->s) { Proc *lp; LOCKED(lp = proc_find(n->s->pid)); if (lp) { s->peer_uid = lp->uid; s->peer_gid = lp->gid; } }
     int64_t r = deliver(n, sp[1], c->proc->pid);
     pthread_mutex_unlock(&names_lock);
     if (r) { close(sp[0]); return r; }
@@ -340,6 +370,8 @@ static int64_t do_accept(GuestCtx *c, int gfd, uint64_t addr, uint64_t lenp, int
             Sock *ns = sock_of(c->proc, g, NULL);
             ns->state = S_CONN;
             ns->peer_pid = pe.pid;
+            ns->peer_uid = pe.uid;
+            ns->peer_gid = pe.gid;
             put_addr(addr, lenp, NULL);
             return g;
         }
@@ -501,7 +533,7 @@ static int64_t do_getsockopt(GuestCtx *c, int gfd, int level, int opt, uint64_t 
     case 4: break;                                                            // SO_ERROR
     case 7: case 8: *(int32_t *)out = 212992; break;                          // SO_SNDBUF/RCVBUF
     case 17: {                                                                // SO_PEERCRED
-        uint32_t cred[3] = { (uint32_t)s->peer_pid, g_uid, g_uid };
+        uint32_t cred[3] = { (uint32_t)s->peer_pid, s->peer_uid, s->peer_gid };
         memcpy(out, cred, 12);
         n = 12;
         break;

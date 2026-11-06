@@ -178,6 +178,7 @@ static Proc *proc_alloc_locked(void) {
     Proc *p = calloc(1, sizeof *p);
     for (int i = 0; i < MAX_FDS; i++) p->fd[i].host = -1;
     p->pid = p->pgid = p->sid = g_next_id++;
+    p->uid = p->gid = 0;      // init's children start as root; they drop privileges themselves
     strcpy(p->cwd, "/");
     p->umask = 022;
     p->exit_signal = 17;
@@ -236,7 +237,7 @@ static int thread_spawn_locked(GuestCtx *c) {
 }
 
 static void wake_tid_word(GuestCtx *c, uint64_t addr) {
-    uint32_t *w = (uint32_t *)(uintptr_t)(c->base + addr);
+    uint32_t *w = (uint32_t *)(uintptr_t)(c->base + UNTAG(addr));
     __atomic_store_n(w, 0, __ATOMIC_SEQ_CST);
     os_sync_wake_by_address_all(w, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
     os_sync_wake_by_address_all(w, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
@@ -397,7 +398,7 @@ static void push_signal(GuestCtx *c, int sig, uint64_t saved_mask, int code, uin
     *(int32_t *)f = sig;                                   // siginfo.si_signo
     *(int32_t *)(f + 8) = code;                            // si_code
     if (sig == 11 || sig == 7 || sig == 4 || sig == 8 || sig == 5) *(uint64_t *)(f + 16) = addr;   // si_addr
-    else { *(int32_t *)(f + 16) = p->pid; *(uint32_t *)(f + 20) = g_uid; }                           // si_pid, si_uid
+    else { *(int32_t *)(f + 16) = p->pid; *(uint32_t *)(f + 20) = p->uid; }                          // si_pid, si_uid
     uint8_t *uc = f + 128;
     *(uint64_t *)(uc + 40) = saved_mask;                   // uc_sigmask
     uint8_t *mc = uc + 176;                                // uc_mcontext
@@ -514,7 +515,7 @@ int64_t proc_sigtimedwait(GuestCtx *c, uint64_t set, uint64_t info, const struct
                 *(int32_t *)si = sig;
                 *(int32_t *)(si + 8) = 0;                      // SI_USER
                 *(int32_t *)(si + 16) = p->pid;
-                *(uint32_t *)(si + 20) = g_uid;
+                *(uint32_t *)(si + 20) = p->uid;
             }
             r = sig;
             break;
@@ -687,6 +688,10 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     memcpy(q->cwd, p->cwd, sizeof q->cwd);
     memcpy(q->exe, p->exe, sizeof q->exe);
     q->umask = p->umask;
+    q->uid = p->uid;
+    q->gid = p->gid;
+    memcpy(q->groups, p->groups, sizeof q->groups);
+    q->ngroups = p->ngroups;
     q->nepoll = p->nepoll;
     memcpy(q->sigact, p->sigact, sizeof q->sigact);
     q->exit_signal = (int)(flags & 0xff);
@@ -702,7 +707,7 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->threads = nc;
     q->nthreads = 1;
     if (flags & L_CLONE_PARENT_SETTID) *(uint32_t *)gptr(ptid) = (uint32_t)q->pid;
-    if (flags & L_CLONE_CHILD_SETTID) *(uint32_t *)(void *)(mm->base + ctid) = (uint32_t)q->pid;
+    if (flags & L_CLONE_CHILD_SETTID) *(uint32_t *)(void *)(mm->base + UNTAG(ctid)) = (uint32_t)q->pid;
     if (thread_spawn_locked(nc)) die("onirun: cannot create a host thread");
     uint64_t r = (uint64_t)q->pid;
     if (flags & L_CLONE_VFORK)   // the parent waits until the child execs or exits
@@ -861,7 +866,7 @@ static void *housekeeping(void *arg) {
     return NULL;
 }
 
-Proc *proc_start(const char *path, char **argv, char **envp) {
+Proc *proc_start(const char *path, char **argv, char **envp, const char **sockets) {
     pthread_mutex_lock(&g_lock);
     Proc *p = proc_alloc_locked();
     p->initial = true;
@@ -875,6 +880,20 @@ Proc *proc_start(const char *path, char **argv, char **envp) {
     }
     if (!(p->mm = mm_new())) die("onirun: cannot reserve an address space");
     for (int i = 0; i < 3; i++) p->fd[i].host = dup(i);
+    // Sockets init would have created for a service (zygote's, for example): listening, bound in
+    // the guest namespace, and announced as ANDROID_SOCKET_<name>=<fd>.
+    char *env2[256];
+    int ne = 0;
+    for (; envp[ne] && ne < 200; ne++) env2[ne] = envp[ne];
+    for (int i = 0; sockets && sockets[i] && ne < 250; i++) {
+        int g = sock_listen_for(p, sockets[i]);
+        if (g < 0) die("onirun: cannot create socket %s", sockets[i]);
+        char *kv = malloc(strlen(sockets[i]) + 40);
+        sprintf(kv, "ANDROID_SOCKET_%s=%d", sockets[i], g);
+        env2[ne++] = kv;
+    }
+    env2[ne] = NULL;
+    envp = env2;
     ExecImage img;
     int e = load_exec(p, p->mm, path, argv, envp, &img);
     if (e) die("onirun: cannot load %s (errno %d)", path, -e);
@@ -896,7 +915,7 @@ Proc *proc_start(const char *path, char **argv, char **envp) {
     return p;
 }
 
-void sys_main(const char *path, char **argv, char **envp) {
+void sys_main(const char *path, char **argv, char **envp, const char **sockets) {
     // Terminal and job signals are taken here with sigwait and forwarded to the guest processes;
     // every other thread inherits the blocked mask. SIGUSR1 stays open: it is the kick.
     sigset_t set;
@@ -915,7 +934,7 @@ void sys_main(const char *path, char **argv, char **envp) {
     pthread_create(&hk, NULL, housekeeping, NULL);
     sock_init();
     props_init();
-    proc_start(path, argv, envp);
+    proc_start(path, argv, envp, sockets);
     for (;;) {
         int s;
         if (sigwait(&set, &s) == 0 && s != SIGCHLD) proc_forward_host_signal(lx_sig(s));

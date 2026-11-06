@@ -451,6 +451,8 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
     t->offsets_size = tr.offsets_size;
     uint8_t *dst = target_proc->buf_host + b->off;
     uint64_t dst_g = target_proc->buf_gaddr + b->off;
+    tr.buffer = UNTAG(tr.buffer);
+    tr.offsets = UNTAG(tr.offsets);
     const uint8_t *src = (const uint8_t *)(uintptr_t)(c->base + tr.buffer);
     const uint8_t *src_offs = (const uint8_t *)(uintptr_t)(c->base + tr.offsets);
     if (tr.data_size && !mm_readable(p->proc->mm, tr.buffer, tr.data_size)) goto failed_buf;
@@ -535,7 +537,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
             memcpy(&parent, fp + 24, 8); memcpy(&parent_off, fp + 32, 8);
             if (len & 7 || sg_off + len > sg_end) goto failed_objs;
             if (len && !mm_readable(p->proc->mm, sbuf, len)) goto failed_objs;
-            memcpy(dst + sg_off, (const void *)(uintptr_t)(c->base + sbuf), len);
+            memcpy(dst + sg_off, (const void *)(uintptr_t)(c->base + UNTAG(sbuf)), len);
             uint64_t nb = dst_g + sg_off;
             memcpy(fp + 8, &nb, 8);
             if (flags & BUFFER_HAS_PARENT) {
@@ -628,7 +630,7 @@ drop_reply:
 
 // ---- the write side ----
 static int do_write(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t size, uint64_t *consumed) {
-    const uint8_t *base = (const uint8_t *)(uintptr_t)(c->base + buf);
+    const uint8_t *base = (const uint8_t *)(uintptr_t)(c->base + UNTAG(buf));
     uint64_t pos = *consumed;
     while (pos + 4 <= size) {
         uint32_t cmd;
@@ -748,7 +750,7 @@ static void put_tdata(BTrans *t, BProc *p, TData *tr) {
     tr->code = t->code;
     tr->flags = t->flags;
     tr->sender_pid = t->sender_pid;
-    tr->sender_euid = g_uid;
+    tr->sender_euid = t->from_proc ? t->from_proc->proc->uid : 0;
     tr->data_size = t->data_size;
     tr->offsets_size = t->offsets_size;
     tr->buffer = p->buf_gaddr + t->buf->off;
@@ -757,7 +759,7 @@ static void put_tdata(BTrans *t, BProc *p, TData *tr) {
 
 // Returns the number of bytes written, or a negative errno.
 static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t size, uint64_t *consumed, bool nonblock) {
-    uint8_t *out = (uint8_t *)(uintptr_t)(c->base + buf);
+    uint8_t *out = (uint8_t *)(uintptr_t)(c->base + UNTAG(buf));
     uint64_t pos = *consumed;
 #define PUT(ptr, n) do { memcpy(out + pos, (ptr), (n)); pos += (n); } while (0)
 #define PUT32(v) do { uint32_t _v = (v); PUT(&_v, 4); } while (0)

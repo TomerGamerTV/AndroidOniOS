@@ -95,7 +95,7 @@ static int proc_open(Proc *p, const char *path, int lflags) {
         else if (!strcmp(rest, "/status")) {
             const char *b = strrchr(t->exe, '/');
             n = snprintf(buf, sizeof buf, "Name:\t%.15s\nUmask:\t%04o\nState:\tR (running)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\nTracerPid:\t0\nUid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\nThreads:\t%d\n",
-                         b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, g_uid, t->nthreads);
+                         b ? b + 1 : t->exe, t->umask, t->pid, t->pid, t->ppid, t->uid, t->uid, t->uid, t->uid, t->gid, t->gid, t->gid, t->gid, t->nthreads);
         } else if (!strcmp(rest, "/stat")) {
             const char *b = strrchr(t->exe, '/');
             // ... num_threads itrealvalue starttime vsize rss rsslim startcode endcode startstack ...
