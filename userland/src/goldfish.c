@@ -133,6 +133,8 @@ int tun_open(Proc *p, const char *path, int lflags) {
     return fd_install_obj(p, o->rd, o, lflags & 02000000);
 }
 
+FdObj *goldfish_pipe_new(void) { return obj_new(&gp_ops, calloc(1, sizeof(GPipe)), true); }
+
 int goldfish_pipe_open(Proc *p, const char *path, int lflags) {
     FdObj *o = obj_new(&gp_ops, calloc(1, sizeof(GPipe)), true);
     if (!o) return -ENFILE;

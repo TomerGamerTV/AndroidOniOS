@@ -413,12 +413,17 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
         const uint8_t *sa = gptr(addr);
         uint32_t port = len >= 12 && sa ? *(const uint32_t *)(sa + 4) : 0;
         if (port != 5000) return -ECONNREFUSED;
-        bool cloexec = fd_cloexec(c->proc, gfd, -1) > 0;
-        int g = goldfish_pipe_open(c->proc, "/dev/goldfish_pipe", cloexec ? 02000000 : 0);
-        if (g < 0) return g;
-        int r = fd_dup(c->proc, g, gfd, true, cloexec);
-        fd_close(c->proc, g);
-        return r < 0 ? r : 0;
+        // The guest fd's host fd becomes another descriptor for the pipe object's read end; the
+        // object keeps its own o->rd (its readiness fd) open, so nothing it polls is ever recycled.
+        FdObj *o = goldfish_pipe_new();
+        if (!o) return -ENFILE;
+        int nd = dup(o->rd);
+        if (nd < 0) { obj_put(o); return -errno; }
+        swap_host(h, nd);
+        fd_set_path(h, "/dev/goldfish_pipe");
+        fd_attach_obj(h, o);                               // replaces the vsock socket object
+        obj_put(o);                                        // fd_attach_obj took its own reference
+        return 0;
     }
     char key[112];
     int e = addr_key(addr, len, key, sizeof key);
