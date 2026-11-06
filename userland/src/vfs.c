@@ -13,6 +13,8 @@
 #include "sys.h"
 
 // ---- objects ----
+static FdObj *reg;                       // live piped objects, for obj_by_fd
+static pthread_mutex_t reg_lock = PTHREAD_MUTEX_INITIALIZER;
 FdObj *obj_new(const FdOps *ops, void *data, bool piped) {
     FdObj *o = calloc(1, sizeof *o);
     o->ops = ops;
@@ -27,7 +29,25 @@ FdObj *obj_new(const FdOps *ops, void *data, bool piped) {
         o->wr = p[1];
         fcntl(o->wr, F_SETFD, FD_CLOEXEC);
         fcntl(o->rd, F_SETFD, FD_CLOEXEC);
+        struct stat st;
+        if (!fstat(o->rd, &st)) o->ino = st.st_ino;
+        pthread_mutex_lock(&reg_lock);
+        o->next_reg = reg;
+        reg = o;
+        pthread_mutex_unlock(&reg_lock);
     }
+    return o;
+}
+
+// A host fd that arrived by SCM_RIGHTS (or any dup) is a new number for the same pipe; the inode
+// says which object it belongs to.
+FdObj *obj_by_fd(int host) {
+    struct stat st;
+    if (host < 0 || fstat(host, &st) || !S_ISFIFO(st.st_mode)) return NULL;
+    pthread_mutex_lock(&reg_lock);
+    FdObj *o = reg;
+    while (o && o->ino != st.st_ino) o = o->next_reg;
+    pthread_mutex_unlock(&reg_lock);
     return o;
 }
 
@@ -35,6 +55,11 @@ void obj_get(FdObj *o) { __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST); }
 
 void obj_put(FdObj *o) {
     if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST)) return;
+    if (o->rd >= 0) {
+        pthread_mutex_lock(&reg_lock);
+        for (FdObj **pp = &reg; *pp; pp = &(*pp)->next_reg) if (*pp == o) { *pp = o->next_reg; break; }
+        pthread_mutex_unlock(&reg_lock);
+    }
     if (o->ops->release) o->ops->release(o);
     if (o->wr >= 0) close(o->wr);
     if (o->mmap_fd >= 0) close(o->mmap_fd);

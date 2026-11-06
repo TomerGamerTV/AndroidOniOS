@@ -180,7 +180,8 @@ static Proc *proc_alloc_locked(void) {
     Proc *p = calloc(1, sizeof *p);
     for (int i = 0; i < MAX_FDS; i++) p->fd[i].host = -1;
     p->pid = p->pgid = p->sid = g_next_id++;
-    p->uid = p->gid = p->euid = p->egid = 0;      // init's children start as root; they drop privileges themselves
+    p->uid = p->gid = p->euid = p->egid = 0;      // init's children start as root and drop privileges themselves
+    memset(p->caps, 0xff, sizeof p->caps);        // ... with every capability until they drop some
     strcpy(p->cwd, "/");
     p->umask = 022;
     p->exit_signal = 17;
@@ -727,6 +728,7 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->gid = p->gid;
     q->euid = p->euid;
     q->egid = p->egid;
+    memcpy(q->caps, p->caps, sizeof q->caps);
     memcpy(q->groups, p->groups, sizeof q->groups);
     q->ngroups = p->ngroups;
     q->nepoll = p->nepoll;

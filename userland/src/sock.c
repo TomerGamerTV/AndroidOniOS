@@ -105,9 +105,24 @@ int sock_listen_for(Proc *p, const char *name) {
     return fd_install_obj(p, pf[0], o, false);
 }
 
+
+// macOS caps a unix datagram at net.local.dgram.maxdgram (2 KiB) unless the socket buffers are
+// larger; Android sends 4 KiB log records and bigger SEQPACKET messages, so every socket we make
+// gets room (the receive side too, or the sender's buffer size alone doesn't help).
+static void bigbuf(int fd) {
+    int v = 1 << 20;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+}
+static int socketpair_big(int type, int sp[2]) {
+    if (socketpair(AF_UNIX, type, 0, sp)) return -1;
+    bigbuf(sp[0]); bigbuf(sp[1]);
+    return 0;
+}
+
 int sock_builtin_dgram(const char *path) {
     int sp[2];
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp)) return -1;
+    if (socketpair_big(SOCK_DGRAM, sp)) return -1;
     fcntl(sp[0], F_SETFD, FD_CLOEXEC);
     fcntl(sp[1], F_SETFD, FD_CLOEXEC);
     if (name_add(path, NULL, NULL, NULL, sp[1])) { close(sp[0]); close(sp[1]); return -1; }
@@ -258,7 +273,7 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
     (void)protocol;
     if (domain == 16) {                                   // AF_NETLINK: a socket nothing ever arrives on
         int sp[2];
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp)) return -errno;
+        if (socketpair_big(SOCK_DGRAM, sp)) return -errno;
         fcntl(sp[1], F_SETFD, FD_CLOEXEC);
         int g = sock_create(c->proc, L_SOCK_DGRAM | (type & ~0xf), sp[0], type);
         if (g < 0) { close(sp[1]); return g; }
@@ -271,7 +286,7 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
     }
     if (domain == 40) {                                   // AF_VSOCK: exists (libqemupipe probes it), connects to nothing
         int sp[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp)) return -errno;
+        if (socketpair_big(SOCK_STREAM, sp)) return -errno;
         fcntl(sp[1], F_SETFD, FD_CLOEXEC);
         int g = sock_create(c->proc, L_SOCK_STREAM | (type & ~0xf), sp[0], type);
         if (g < 0) { close(sp[1]); return g; }
@@ -284,6 +299,7 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
     int t = type & 0xf;
     if (t != L_SOCK_STREAM && t != L_SOCK_DGRAM && t != L_SOCK_SEQPACKET) return -EPROTONOSUPPORT;
     int h = socket(AF_UNIX, host_type(t), 0);
+    if (h >= 0) bigbuf(h);
     if (h < 0) return -errno;
     return sock_create(c->proc, type, h, type);
 }
@@ -291,7 +307,7 @@ static int64_t do_socket(GuestCtx *c, int domain, int type, int protocol) {
 static int64_t do_socketpair(GuestCtx *c, int domain, int type, uint64_t sv) {
     if (domain != L_AF_UNIX) return -EAFNOSUPPORT;
     int sp[2];
-    if (socketpair(AF_UNIX, host_type(type & 0xf), 0, sp)) return -errno;
+    if (socketpair_big(host_type(type & 0xf), sp)) return -errno;
     int g0 = sock_create(c->proc, type, sp[0], type);
     if (g0 < 0) { close(sp[1]); return g0; }
     int g1 = sock_create(c->proc, type, sp[1], type);
@@ -320,7 +336,7 @@ static int64_t do_bind(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     if (!key[0]) return -EINVAL;
     if (s->type == L_SOCK_DGRAM) {
         int sp[2];
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp)) return -errno;
+        if (socketpair_big(SOCK_DGRAM, sp)) return -errno;
         fcntl(sp[1], F_SETFD, FD_CLOEXEC);
         if ((e = name_add(key, s, NULL, NULL, -1))) { close(sp[0]); close(sp[1]); return e; }
         swap_host(h, sp[0]);
@@ -407,7 +423,7 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
     }
     if (s->state == S_CONN) { pthread_mutex_unlock(&names_lock); return -EISCONN; }
     int sp[2];
-    if (socketpair(AF_UNIX, host_type(s->type), 0, sp)) { pthread_mutex_unlock(&names_lock); return -errno; }
+    if (socketpair_big(host_type(s->type), sp)) { pthread_mutex_unlock(&names_lock); return -errno; }
     fcntl(sp[1], F_SETFD, FD_CLOEXEC);
     s->peer_pid = n->s ? n->s->pid : 0;
     if (n->s) { Proc *lp; LOCKED(lp = proc_find(n->s->pid)); if (lp) { s->peer_uid = lp->euid; s->peer_gid = lp->egid; } }
@@ -587,6 +603,8 @@ static int64_t do_recvmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
         int32_t level = L_SOL_SOCKET, type = SCM_RIGHTS;
         memcpy(gc + used, &clen, 8); memcpy(gc + used + 8, &level, 4); memcpy(gc + used + 12, &type, 4);
         for (int i = 0; i < nfd; i++) {
+            FdObj *po = obj_by_fd(fds[i]);                 // a sync_file, eventfd, ... keeps its identity
+            if (po) fd_attach_obj(fds[i], po);
             int32_t g = fd_install(c->proc, fds[i], 0, lflags & L_MSG_CMSG_CLOEXEC);
             memcpy(gc + used + 16 + 4 * i, &g, 4);
         }

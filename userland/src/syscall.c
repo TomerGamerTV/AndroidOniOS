@@ -1001,11 +1001,17 @@ void sys_dispatch(GuestCtx *c) {
         r = HOSTRET(rc);
         break;
     }
-    case 90:                        // capget: no capabilities
-        if (a1) memset(gptr(a1), 0, 24);
+    case 90: case 91: {             // capget / capset: a process has whatever it hasn't dropped
+        uint32_t *hdr = gptr(a0);
+        if (!hdr) { r = ERR(14); break; }
+        uint32_t ver = hdr[0];
+        if (ver != 0x19980330 && ver != 0x20071026 && ver != 0x20080522) { hdr[0] = 0x20080522; r = ERR(22); break; }
+        size_t n = ver == 0x19980330 ? 12 : 24;
+        if (nr == 90) { if (a1) memcpy(gptr(a1), p->caps, n); }
+        else if (a1) memcpy(p->caps, gptr(a1), n);
         r = 0;
         break;
-    case 91: r = 0; break;          // capset
+    }
     case 270: case 271: {           // process_vm_readv / writev: only within this process
         if ((int64_t)(int32_t)a0 != p->pid) { r = ERR(1); break; }
         struct iovec *lv = iov_in(a1, a2), *rv = iov_in(a3, a4);
