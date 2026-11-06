@@ -40,26 +40,44 @@ void post_signal_locked(Proc *p, GuestCtx *t, int sig);
 
 // ---- host fd metadata (indexed by host fd) ----
 #define HOST_FDS 16384
-static char *fd_path[HOST_FDS];   // guest path, for /proc/self/fd/N
+typedef struct HostFd { char *path; FdObj *obj; } HostFd;   // guest path (for /proc/self/fd/N), object
+static HostFd hfd[HOST_FDS];
+uint32_t g_uid = 2000;
 
 static void set_path_locked(int host, const char *p) {
     if (host < 0 || host >= HOST_FDS) return;
-    free(fd_path[host]);
-    fd_path[host] = p ? strdup(p) : NULL;
+    free(hfd[host].path);
+    hfd[host].path = p ? strdup(p) : NULL;
 }
 void fd_set_path(int host, const char *p) { LOCKED(set_path_locked(host, p)); }
 bool fd_get_path(int host, char *out, size_t n) {
     bool ok = false;
     pthread_mutex_lock(&g_lock);
-    if (host >= 0 && host < HOST_FDS && fd_path[host]) { snprintf(out, n, "%s", fd_path[host]); ok = true; }
+    if (host >= 0 && host < HOST_FDS && hfd[host].path) { snprintf(out, n, "%s", hfd[host].path); ok = true; }
     pthread_mutex_unlock(&g_lock);
     return ok;
+}
+FdObj *fd_obj(int host) { return host >= 0 && host < HOST_FDS ? hfd[host].obj : NULL; }
+static void attach_locked(int host, FdObj *o) {
+    if (host < 0 || host >= HOST_FDS) { obj_put(o); return; }
+    if (hfd[host].obj) obj_put(hfd[host].obj);
+    hfd[host].obj = o;
+}
+void fd_attach_obj(int host, FdObj *o) { obj_get(o); LOCKED(attach_locked(host, o)); }
+
+// A dup of host fd `from` as `to`: same path and object.
+static void copy_meta_locked(int from, int to) {
+    if (from < 0 || from >= HOST_FDS || to < 0 || to >= HOST_FDS) return;
+    set_path_locked(to, hfd[from].path);
+    if (hfd[from].obj) obj_get(hfd[from].obj);
+    attach_locked(to, hfd[from].obj);
 }
 
 static void host_close_locked(int h) {
     if (h < 0) return;
     dir_forget(h);
     set_path_locked(h, NULL);
+    if (h < HOST_FDS && hfd[h].obj) { FdObj *o = hfd[h].obj; hfd[h].obj = NULL; obj_put(o); }
     close(h);
 }
 
@@ -78,7 +96,17 @@ int fd_install(Proc *p, int host, int min, bool cloexec) {
     return g;
 }
 
+int fd_install_obj(Proc *p, int host, FdObj *o, bool cloexec) {
+    int g;
+    pthread_mutex_lock(&g_lock);
+    attach_locked(host, o);
+    g = fd_install_locked(p, host, 0, cloexec);
+    pthread_mutex_unlock(&g_lock);
+    return g;
+}
+
 int fd_close(Proc *p, int g) {
+    vfs_fd_closed(p, g);
     pthread_mutex_lock(&g_lock);
     int h = fd_host_locked(p, g);
     if (h >= 0) { p->fd[g].host = -1; host_close_locked(h); }
@@ -94,7 +122,7 @@ int fd_dup(Proc *p, int old, int target, bool exact, bool cloexec) {
     if (target < 0 || target >= MAX_FDS) { r = -EINVAL; goto out; }
     int nh = dup(h);
     if (nh < 0) { r = -lx_errno(errno); goto out; }
-    if (h < HOST_FDS) set_path_locked(nh, fd_path[h]);
+    copy_meta_locked(h, nh);
     if (exact) {
         if (p->fd[target].host >= 0) host_close_locked(p->fd[target].host);
         p->fd[target] = (FdEnt){ nh, cloexec };
@@ -118,6 +146,33 @@ int fd_cloexec(Proc *p, int g, int set) {   // set < 0: query
 }
 
 // ---- process table ----
+Proc *proc_find(int pid) {
+    for (Proc *q = g_procs; q; q = q->next) if (q->pid == pid) return q;
+    return NULL;
+}
+
+// The SELinux domain a process would have on a real device, by program name.
+const char *proc_secontext(Proc *p) {
+    const char *b = strrchr(p->exe, '/');
+    b = b ? b + 1 : p->exe;
+    if (!strcmp(b, "servicemanager")) return "u:r:servicemanager:s0";
+    if (!strcmp(b, "hwservicemanager")) return "u:r:hwservicemanager:s0";
+    if (!strcmp(b, "system_server")) return "u:r:system_server:s0";
+    if (!strcmp(b, "surfaceflinger")) return "u:r:surfaceflinger:s0";
+    if (!strcmp(b, "app_process64") || !strcmp(b, "zygote64")) return "u:r:zygote:s0";
+    return "u:r:shell:s0";
+}
+
+static void set_cmdline(Proc *p, char **argv) {
+    p->cmdline_len = 0;
+    for (int i = 0; argv && argv[i]; i++) {
+        size_t n = strlen(argv[i]) + 1;
+        if (p->cmdline_len + n > sizeof p->cmdline) break;
+        memcpy(p->cmdline + p->cmdline_len, argv[i], n);
+        p->cmdline_len += n;
+    }
+}
+
 static Proc *proc_alloc_locked(void) {
     Proc *p = calloc(1, sizeof *p);
     for (int i = 0; i < MAX_FDS; i++) p->fd[i].host = -1;
@@ -556,13 +611,14 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     memcpy(q->cwd, p->cwd, sizeof q->cwd);
     memcpy(q->exe, p->exe, sizeof q->exe);
     q->umask = p->umask;
+    q->nepoll = p->nepoll;
     memcpy(q->sigact, p->sigact, sizeof q->sigact);
     q->exit_signal = (int)(flags & 0xff);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fd[i].host < 0) continue;
         int h = dup(p->fd[i].host);
         if (h < 0) continue;
-        if (p->fd[i].host < HOST_FDS) set_path_locked(h, fd_path[p->fd[i].host]);
+        copy_meta_locked(p->fd[i].host, h);
         q->fd[i] = (FdEnt){ h, p->fd[i].cloexec };
     }
     nc->proc = q;
@@ -631,6 +687,7 @@ uint64_t proc_execve(GuestCtx *c, const char *gpath, uint64_t argv_g, uint64_t e
     for (int s = 1; s <= 64; s++)
         if (p->sigact[s][0] > 1) memset(p->sigact[s], 0, sizeof p->sigact[s]);
     snprintf(p->exe, sizeof p->exe, "%s", path);
+    set_cmdline(p, argv);
     p->vfork_done = true;
     pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);
@@ -745,6 +802,7 @@ Proc *proc_start(const char *path, char **argv, char **envp) {
     int e = load_exec(p, p->mm, path, argv, envp, &img);
     if (e) die("onirun: cannot load %s (errno %d)", path, -e);
     snprintf(p->exe, sizeof p->exe, "%s", path);
+    set_cmdline(p, argv);
     GuestCtx *c = calloc(1, sizeof *c);
     c->proc = p;
     c->base = (uint64_t)(uintptr_t)p->mm->base;
@@ -777,6 +835,8 @@ void sys_main(const char *path, char **argv, char **envp) {
     umask(0);   // guest umasks are applied by the syscall layer
     pthread_t hk;
     pthread_create(&hk, NULL, housekeeping, NULL);
+    sock_init();
+    props_init();
     proc_start(path, argv, envp);
     for (;;) {
         int s;

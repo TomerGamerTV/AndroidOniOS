@@ -219,14 +219,30 @@ static uint64_t lx_fl(int f) {
 }
 
 // ---- structs ----
-static void put_stat(uint64_t addr, const struct stat *st) {
+// Android files belong to root except the shell user's own directories; bionic checks the owner of
+// files it maps (property areas), so the answer matters.
+static bool shell_owned(const char *gpath) {
+    return gpath && (!strncmp(gpath, "/data/local/tmp", 15) || !strncmp(gpath, "/sdcard", 7) ||
+                     !strncmp(gpath, "/storage", 8) || !strncmp(gpath, "/memfd:", 7) || !strcmp(gpath, "/dev/ashmem"));
+}
+
+static bool is_devnode(const char *gpath) {
+    return gpath && !strncmp(gpath, "/dev/", 5) && strncmp(gpath, "/dev/__properties__", 19) &&
+           strncmp(gpath, "/dev/socket", 11) && !strchr(gpath + 5, '/') ? true :
+           gpath && !strncmp(gpath, "/dev/binderfs/", 14);
+}
+
+static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
+    uint32_t owner = shell_owned(gpath) ? g_uid : 0;
+    uint32_t mode = st->st_mode;
+    if (is_devnode(gpath) && S_ISREG(st->st_mode)) mode = S_IFCHR | 0666;   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};
     *(uint64_t *)(b + 0) = (uint64_t)st->st_dev;
     *(uint64_t *)(b + 8) = st->st_ino;
-    *(uint32_t *)(b + 16) = st->st_mode;
+    *(uint32_t *)(b + 16) = mode;
     *(uint32_t *)(b + 20) = st->st_nlink;
-    *(uint32_t *)(b + 24) = 2000;            // files appear owned by the shell user
-    *(uint32_t *)(b + 28) = 2000;
+    *(uint32_t *)(b + 24) = owner;
+    *(uint32_t *)(b + 28) = owner;
     *(uint64_t *)(b + 32) = (uint64_t)st->st_rdev;
     *(int64_t *)(b + 48) = st->st_size;
     *(int32_t *)(b + 56) = st->st_blksize;
@@ -363,7 +379,7 @@ static uint64_t sys_futex(uint64_t a, uint64_t op_full, uint64_t val, uint64_t t
 // ---- system call table ----
 static bool restartable(uint64_t nr) {
     // poll/sleep-style calls report EINTR even with SA_RESTART, as on Linux.
-    return nr != 73 && nr != 72 && nr != 101 && nr != 115 && nr != 22;
+    return nr != 73 && nr != 72 && nr != 101 && nr != 115 && nr != 22 && nr != 441;
 }
 
 void sys_dispatch(GuestCtx *c) {
@@ -372,10 +388,16 @@ void sys_dispatch(GuestCtx *c) {
     uint64_t r = ERR(38);
     char path[4096], path2[4096];
     int hfd, hfd2, e, h;
+    // Results of the object layers (vfs, sockets, binder) carry host errnos.
+#define OBJRET(v) ({ int64_t _v = (v); _v < 0 ? ERR(lx_errno((int)-_v)) : (uint64_t)_v; })
     // Host fd for a guest fd argument, or fail the call with EBADF.
 #define HFD(g) ({ int _h = fd_host(p, (int)(g)); if (_h < 0) { r = ERR(9); break; } _h; })
     switch (nr) {
     case 56: {   // openat
+        if (gstr(a1) && gstr(a1)[0] == '/') {
+            int d = vfs_open_dev(p, gstr(a1), (int)a2);
+            if (d != 1) { r = OBJRET(d); break; }
+        }
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !(a2 & 0100000), &hfd))) { r = ERR(-e); break; }
         int fd = openat(hfd, path, open_flags(a2), (int)(a3 & ~p->umask));
         if (fd < 0) { r = ERR(lx_errno(errno)); break; }
@@ -386,11 +408,20 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 57: e = fd_close(p, (int)a0); r = e ? ERR(-e) : 0; break;
-    case 63: h = HFD(a0); r = HOSTRET(read(h, gptr(a1), a2)); break;
+    case 63: {
+        h = HFD(a0);
+        int64_t v = vfs_read(c, h, gptr(a1), a2);
+        r = v == VFS_PASS ? HOSTRET(read(h, gptr(a1), a2)) : OBJRET(v);
+        break;
+    }
     case 64: case 66: {   // write, writev
         h = HFD(a0);
         ssize_t n;
-        if (nr == 64) n = write(h, gptr(a1), a2);
+        if (nr == 64) {
+            int64_t v = vfs_write(c, h, gptr(a1), a2);
+            if (v != VFS_PASS) { r = OBJRET(v); break; }
+            n = write(h, gptr(a1), a2);
+        }
         else {
             struct iovec *v = iov_in(a1, a2);
             if (!v) { r = ERR(22); break; }
@@ -433,17 +464,26 @@ void sys_dispatch(GuestCtx *c) {
     case 79: {   // newfstatat
         struct stat st;
         int rc;
-        if ((a3 & L_AT_EMPTY_PATH) && !*gstr(a1)) { h = HFD(a0); rc = fstat(h, &st); }
+        const char *gp = NULL;
+        if ((a3 & L_AT_EMPTY_PATH) && !*gstr(a1)) { h = HFD(a0); rc = fstat(h, &st); gp = fd_get_path(h, path2, sizeof path2) ? path2 : NULL; }
         else {
             bool follow = !(a3 & L_AT_SYMLINK_NOFOLLOW);
             if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, follow, &hfd))) { r = ERR(-e); break; }
             rc = fstatat(hfd, path, &st, follow ? 0 : AT_SYMLINK_NOFOLLOW);
+            gp = hfd == AT_FDCWD ? guest_of(path) : gstr(a1);
         }
-        if (rc == 0) put_stat(a2, &st);
+        if (rc == 0) put_stat(a2, &st, gp);
         r = HOSTRET(rc);
         break;
     }
-    case 80: { struct stat st; h = HFD(a0); int rc = fstat(h, &st); if (!rc) put_stat(a1, &st); r = HOSTRET(rc); break; }
+    case 80: {
+        struct stat st;
+        h = HFD(a0);
+        int rc = fstat(h, &st);
+        if (!rc) put_stat(a1, &st, fd_get_path(h, path2, sizeof path2) ? path2 : NULL);
+        r = HOSTRET(rc);
+        break;
+    }
     case 78: {   // readlinkat
         const char *gp = gstr(a1);
         char tmp[4096];
@@ -517,6 +557,8 @@ void sys_dispatch(GuestCtx *c) {
         break;
     case 29: {   // ioctl
         h = HFD(a0);
+        int64_t v = vfs_ioctl(c, h, a1, a2);
+        if (v != VFS_PASS) { r = OBJRET(v); break; }
         if (a1 == 0x5413) { struct winsize ws; int rc = ioctl(h, TIOCGWINSZ, &ws); if (!rc) memcpy(gptr(a2), &ws, sizeof ws); r = HOSTRET(rc); }
         else if (a1 == 0x5421) { int on = *(int *)gptr(a2); r = HOSTRET(ioctl(h, FIONBIO, &on)); }
         else if (a1 == 0x5451 || a1 == 0x5450) { fd_cloexec(p, (int)a0, a1 == 0x5451); r = 0; }
@@ -541,8 +583,13 @@ void sys_dispatch(GuestCtx *c) {
         if (a3 & 0x20) m = mm_map(p->mm, a0, a1, (int)(a2 & 7), (int)a3, -1, 0, NULL);
         else {
             h = HFD(a4);
+            FdObj *o = fd_obj(h);
+            if (o && o->mmap_fd < 0) { r = ERR(19); break; }          // ENODEV: not mappable
+            int mfd = o ? o->mmap_fd : h;
+            int fl = (int)a3 | (o && o->map_shared ? LX_MAP_SHARED : 0);
             bool known = fd_get_path(h, path2, sizeof path2);
-            m = mm_map(p->mm, a0, a1, (int)(a2 & 7), (int)a3, h, a5, known ? path2 : NULL);
+            m = mm_map(p->mm, a0, a1, (int)(a2 & 7), fl, mfd, a5, known ? path2 : NULL);
+            if (m >= 0 && o && o->ops->mapped) o->ops->mapped(o, c, (uint64_t)m, a1, (int)(a2 & 7), a5);
         }
         r = m < 0 ? ERR(-m) : (uint64_t)m;
         break;
@@ -635,7 +682,29 @@ void sys_dispatch(GuestCtx *c) {
     case 172: r = (uint64_t)p->pid; break;
     case 173: r = (uint64_t)p->ppid; break;
     case 178: r = c->tid; break;
-    case 174: case 175: case 176: case 177: r = 2000; break;   // the adb shell user
+    case 174: case 175: case 176: case 177: r = g_uid; break;   // the adb shell user
+    case 19: r = OBJRET(vfs_eventfd(c, a0, (int)a1)); break;
+    case 20: r = OBJRET(vfs_epoll_create(c, (int)a0)); break;
+    case 21: r = OBJRET(vfs_epoll_ctl(c, (int)a0, (int)a1, (int)a2, a3)); break;
+    case 22: r = OBJRET(vfs_epoll_wait(c, (int)a0, a1, (int)a2, (int64_t)(int32_t)a3, a4)); break;
+    case 441: {               // epoll_pwait2: timespec timeout
+        int64_t ms = -1;
+        if (a3) { const struct timespec *t = gptr(a3); ms = t->tv_sec * 1000 + (t->tv_nsec + 999999) / 1000000; }
+        r = OBJRET(vfs_epoll_wait(c, (int)a0, a1, (int)a2, ms, a4));
+        break;
+    }
+    case 279: r = OBJRET(vfs_memfd(c, gstr(a0), (int)a1)); break;
+    case 85: r = OBJRET(vfs_timerfd_create(c, (int)a0, (int)a1)); break;
+    case 86: r = OBJRET(vfs_timerfd_settime(c, (int)a0, (int)a1, a2, a3)); break;
+    case 87: r = OBJRET(vfs_timerfd_gettime(c, (int)a0, a1)); break;
+    case 26: r = OBJRET(vfs_inotify_init(c, (int)a0)); break;        // inotify_init1
+    case 27: r = 1; break;                                              // inotify_add_watch: a watch that never fires
+    case 28: r = 0; break;                                              // inotify_rm_watch
+    case 198: case 199: case 200: case 201: case 202: case 203: case 204: case 205: case 206: case 207:
+    case 208: case 209: case 210: case 211: case 212: case 242: {
+        r = OBJRET(sock_call(c, nr, a0, a1, a2, a3, a4, a5));
+        break;
+    }
     case 158: r = 0; break;   // getgroups
     case 165: memset(gptr(a1), 0, 144); r = 0; break;   // getrusage
     case 163: case 261: {     // getrlimit / prlimit64
@@ -691,10 +760,25 @@ void sys_dispatch(GuestCtx *c) {
     case 155: r = proc_getpgid(c, (int64_t)(int32_t)a0); break;
     case 156: r = (uint64_t)p->sid; break;
     case 157: r = proc_setsid(c); break;
-    case 43: case 44: {       // statfs / fstatfs
+    case 43: case 44: {       // statfs / fstatfs: the filesystem type depends on where the path is
+        const char *gp = NULL;
+        if (nr == 43) {
+            if ((e = host_path(p, gstr(a0), path, sizeof path, true))) { r = ERR(-e); break; }
+            struct stat st;
+            if (stat(path, &st)) { r = ERR(lx_errno(errno)); break; }
+            gp = guest_of(path);
+        } else {
+            h = HFD(a0);
+            gp = fd_get_path(h, path2, sizeof path2) ? path2 : "/";
+        }
+        uint64_t type = 0xEF53;                                   // ext4
+        if (!strncmp(gp, "/sys/fs/selinux", 15)) type = 0xf97cff8c;
+        else if (!strncmp(gp, "/proc", 5)) type = 0x9fa0;
+        else if (!strncmp(gp, "/sys", 4)) type = 0x62656572;
+        else if (!strncmp(gp, "/dev", 4)) type = 0x01021994;      // tmpfs
         uint64_t *s = gptr(a1);
         memset(s, 0, 120);
-        s[0] = 0xEF53; s[1] = 4096; s[2] = 1 << 20; s[3] = 1 << 19; s[4] = 1 << 19;
+        s[0] = type; s[1] = 4096; s[2] = 1 << 20; s[3] = 1 << 19; s[4] = 1 << 19;
         s[5] = 1 << 20; s[6] = 1 << 19; s[8] = 255; s[9] = 4096;
         r = 0;
         break;
@@ -754,7 +838,7 @@ void sys_dispatch(GuestCtx *c) {
         break;
     case 91: r = 0; break;          // capset
     case 283: r = 0; break;         // membarrier
-    case 293: case 435: case 291: case 198: r = ERR(38); break;   // rseq, clone3, statx, socket
+    case 293: case 435: case 291: r = ERR(38); break;   // rseq, clone3, statx
     case 281:                       // execveat(dirfd, path, argv, envp, flags)
         if (gstr(a1)[0] != '/') { r = ERR(38); break; }
         a0 = a1; a1 = a2; a2 = a3;

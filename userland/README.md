@@ -25,21 +25,35 @@
   - **Per-process state:** each process has its own pid, file-descriptor table, signal actions, working directory and translation cache.
   - **Lifecycle:** `exec` replaces the window, and `wait`, `kill`, `exit_group` and `vfork` are implemented here.
   - **Stopping threads:** a thread that must stop is pulled out of translated code with a signal, even if it's in a tight loop.
-- **Linux system calls** (`src/syscall.c`).
-  - **Paths:** a guest filesystem rooted at `--root`, with Android's absolute symlinks resolved inside it, plus `/proc/self/exe` and `/proc/self/fd`.
+- **Linux system calls** (`src/syscall.c`, `src/vfs.c`, `src/sock.c`, `src/procfs.c`, `src/props.c`, `src/binder.c`).
+  - **Paths:** a guest filesystem rooted at `--root`, with Android's absolute symlinks resolved inside it; `/proc` and `/sys/fs/selinux` are generated or served from static files.
   - **Signals:** Linux arm64 signal frames and `rt_sigreturn`.
   - **Futexes:** built on `os_sync_wait_on_address`, which iOS also has.
+  - **Kernel objects** that aren't plain files (eventfd, epoll, timerfd, sockets, ashmem, binder) hang off a host fd, usually a pipe end so the host's `poll` reports their readiness.
+  - **Binder** is a userspace port of the kernel driver's model: nodes, refs, per-thread work lists, transaction stacks, buffers in the receiver's mapped area.
   - **Translation:** Linux flags, errno values and structs are converted to and from Darwin's.
 - **Loader** (`src/loader.c`). It maps the program and Android's dynamic linker (`linker64`) into the window the way Linux `execve` does, with the same stack layout and auxv.
 
 ## Status
 
-Android 17's `/system/bin/sh` (mksh) and toybox work:
-- scripts, pipes, subshells, command substitution, background jobs, `wait`, `trap`
-- external commands using Android's libc, libcrypto and libselinux
+Android 17's own programs run, as many guest processes inside one host process:
+- `/system/bin/sh` (mksh) and toybox: scripts, pipes, subshells, command substitution, background jobs, `wait`, `trap`
 - multithreaded programs: mutexes, condition variables, thread-directed signals
+- **`servicemanager`**, Android's service directory, unmodified, with the stock `service` tool talking to it over binder from another process. Its SELinux checks run against a permissive policy that onirun serves from `/sys/fs/selinux`.
 
-They all run as many guest processes inside one host process.
+### Linux services provided by onirun
+
+| Area | What's there |
+|---|---|
+| Processes | fork (copy-on-write), vfork, exec, wait, kill, process groups, exit_group; threads; futexes (`os_sync_wait_on_address`, also on iOS) |
+| Memory | mmap/munmap/mprotect/mremap (incl. `MREMAP_FIXED`), `MADV_DONTNEED`, memfd, ashmem (`/dev/ashmem`) |
+| Files | the rootfs with Android's symlinks, `/proc/self/{exe,fd,maps,cmdline,status,attr/current}`, `/proc/{filesystems,cpuinfo,meminfo,...}`, `/dev/kmsg` |
+| Events | eventfd, epoll, timerfd (on libdispatch), inotify (never fires), ppoll |
+| Sockets | unix domain stream/dgram/seqpacket in a private namespace, `socketpair`, `SCM_RIGHTS` fd passing, `SO_PEERCRED`; a netlink socket that stays quiet |
+| Properties | `/dev/__properties__` areas copied from a device, read by Android's libc unchanged; onirun serves `property_service` and writes updates in bionic's `prop_area` format, waking waiters |
+| Binder | `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`: transactions and replies, object/handle translation, fd passing, scatter-gather buffers, refcounting (`BR_INCREFS`...`BR_DECREFS`), looper management, death notifications, security contexts |
+| SELinux | reported present and permissive: `/sys/fs/selinux/{status,enforce,class/...}` are static files, `access`/`create` answer "allowed" |
+| Logging | liblog's datagrams to `logdw` and writes to `/dev/kmsg` go to stderr (`ONIRUN_LOGCAT=1` shows everything, otherwise errors only) |
 
 Speed on an M1 Mac:
 
@@ -49,7 +63,7 @@ Speed on an M1 Mac:
 | Shell loop, 200k iterations | 0.82 s | 0.43 s |
 | 1,000 × `$(echo \| cat)` (2,000 processes) | 13.3 s | — |
 
-Rebasing every memory access costs about 8% on the branch-heavy shell loop. Process creation is faster than the earlier version that used the host's `fork()` (13.3 s vs 20.8 s for the last test). Most of the remaining process cost is translating `linker64` and libc again in every new program.
+Rebasing every memory access costs about 8% on the branch-heavy shell loop. Most of the process-creation cost is translating `linker64` and libc again in every new program.
 
 Under QEMU TCG (how the iPhone runs Android today), the first two tests used 2.3 s and 61 s of CPU time. Android was still busy after booting during that measurement, so treat it as approximate; the gap is still 20–60×.
 
@@ -58,9 +72,11 @@ Limits:
 - **Signals and faults:**
   - A signal with a handler reaches a thread at its next system call or block exit. A thread that never makes another call won't get it. Default-fatal signals and `SIGKILL` work regardless.
   - Guest `SIGSEGV` handlers aren't called yet: a crashing process is killed. ART will need this.
+- **Binder** uses one lock for everything and copies transaction data once into the receiver's buffer; it isn't tuned yet. Freezing and oneway spam detection are accepted and ignored.
+- **No networking.** `AF_INET` sockets fail with `EAFNOSUPPORT`.
 
 Not done yet:
-- **Binder, ashmem and properties**, then ART and the Android framework.
+- **ART and the Android framework** (`app_process`, zygote, `system_server`), which also need `SIGSEGV` handlers and `/proc/<pid>` directories.
 - **Sharing translations between processes**, so each new program doesn't translate libc and the linker again.
 - **iOS.** Executable memory there comes from the JIT region StikJIT enables. The window size must also fit iOS's address-space limit.
 
@@ -74,4 +90,14 @@ make -C userland
 build/userland/onirun --root build/userland/rootfs /system/bin/sh -c 'uname -a; ls /system/bin | wc -l'
 # Tests (needs the Android NDK in build/ndk-dl): each prints one "... OK" line
 make -C userland check
+```
+
+The rootfs is read straight out of the emulator image, no device needed:
+
+```sh
+python3 -I tools/ext4pull.py build/vm-macos/system.img parts                      # the super partition's contents
+python3 -I tools/ext4pull.py build/vm-macos/system.img -p system pull /system/bin build/userland/rootfs/system/bin
+python3 -I tools/ext4pull.py build/userland/pull/com.android.runtime.apex pull / build/userland/rootfs/apex/com.android.runtime
+python3 -I tools/mkselinuxfs.py userland/data/selinux-classes.txt build/userland/rootfs   # the SELinux class tree
+# /dev/__properties__ and /linkerconfig come from a booted Android (adb), as init generates them.
 ```

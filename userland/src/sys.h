@@ -57,6 +57,70 @@ uint64_t mm_exec_end(Mm *m, uint64_t pc);
 void mm_symbolize(Mm *m, uint64_t addr, char *out, size_t n);
 bool mm_readable(Mm *m, uint64_t addr, uint64_t len);
 
+// ---- file-descriptor objects (vfs.c) ----
+// Things that aren't plain host files: eventfds, epoll sets, sockets, ashmem, binder. Each is
+// attached to a host fd (usually a pipe's read end, so poll() works on it; obj_set_ready() puts a
+// byte in the pipe or drains it) and the host fd's dups share the object.
+typedef struct FdObj FdObj;
+typedef struct FdOps {
+    const char *name;
+    int64_t (*read)(FdObj *o, GuestCtx *c, void *buf, size_t n, bool nonblock);
+    int64_t (*write)(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool nonblock);
+    int64_t (*ioctl)(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg);
+    void (*mapped)(FdObj *o, GuestCtx *c, uint64_t gaddr, uint64_t len, int prot, uint64_t off);
+    void (*release)(FdObj *o);
+} FdOps;
+struct FdObj {
+    const FdOps *ops;
+    int refs;
+    int rd, wr;               // readiness pipe (-1 if the host fd is something else)
+    int mmap_fd;              // host fd to mmap for this object, -1 = not mappable
+    bool map_shared;          // map it MAP_SHARED even if the guest asked for private
+    bool ready;
+    pthread_mutex_t lock;
+    void *data;
+};
+FdObj *obj_new(const FdOps *ops, void *data, bool piped);   // refs = 1; piped: creates rd/wr
+void obj_get(FdObj *o);
+void obj_put(FdObj *o);
+void obj_set_ready(FdObj *o, bool ready);                  // o->lock held by the caller
+int  obj_wait(int host, int events, bool nonblock);        // 0, -EAGAIN or -EINTR
+
+int  vfs_open_dev(struct Proc *p, const char *guest_path, int lflags);   // guest fd, -errno, or VFS_PASS
+#define VFS_PASS INT64_MIN                                 // "not an object: use the host fd"
+int64_t vfs_read(GuestCtx *c, int host, void *buf, size_t n);
+int64_t vfs_write(GuestCtx *c, int host, const void *buf, size_t n);
+int64_t vfs_ioctl(GuestCtx *c, int host, uint64_t req, uint64_t arg);
+int64_t vfs_eventfd(GuestCtx *c, uint64_t count, int lflags);
+int64_t vfs_memfd(GuestCtx *c, const char *name, int lflags);
+int64_t vfs_inotify_init(GuestCtx *c, int lflags);
+int64_t vfs_timerfd_create(GuestCtx *c, int clockid, int lflags);
+int64_t vfs_timerfd_settime(GuestCtx *c, int gfd, int lflags, uint64_t newv, uint64_t oldv);
+int64_t vfs_timerfd_gettime(GuestCtx *c, int gfd, uint64_t curv);
+int64_t vfs_epoll_create(GuestCtx *c, int lflags);
+int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event);
+int64_t vfs_epoll_wait(GuestCtx *c, int epfd, uint64_t events, int maxevents, int64_t timeout_ms, uint64_t sigmask);
+void vfs_fd_closed(struct Proc *p, int gfd);               // drops the fd from the process's epoll sets
+int  host_tmpfile(void);                                   // unlinked temporary file
+
+// ---- unix sockets (sock.c) ----
+void sock_init(void);
+int64_t sock_call(GuestCtx *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
+// A service implemented by onirun itself, reachable at a guest socket path.
+typedef void (*BuiltinAccept)(int host_fd, int peer_pid, void *arg);
+int  sock_builtin_stream(const char *guest_path, BuiltinAccept accept, void *arg);
+int  sock_builtin_dgram(const char *guest_path);           // returns the host fd that receives the datagrams
+
+// ---- /proc and /sys (procfs.c) ----
+int  procfs_open(struct Proc *p, const char *guest_path, int lflags);   // guest fd, -errno, or 1 = not ours
+
+// ---- system properties (props.c) ----
+void props_init(void);
+int  props_set(const char *name, const char *value);     // 0 or a PROP_ERROR_* code
+
+// ---- binder (binder.c) ----
+int  binder_open(struct Proc *p, const char *context, int lflags);   // guest fd or -errno
+
 // ---- processes (proc.c) ----
 #define MAX_FDS 1024
 typedef struct FdEnt { int host; bool cloexec; } FdEnt;
@@ -65,10 +129,13 @@ enum { P_RUNNING, P_EXITING, P_ZOMBIE };
 
 typedef struct Proc {
     int pid, ppid, pgid, sid;
+    int nepoll;               // epoll fds open, so close() knows whether to scan them
     Mm *mm;
     FdEnt fd[MAX_FDS];        // guest fd -> host fd (-1 = closed)
     char cwd[1024];           // guest path
     char exe[1024];
+    char cmdline[512];        // argv, NUL-separated, for /proc/<pid>/cmdline
+    size_t cmdline_len;
     mode_t umask;
     uint64_t sigact[65][4];   // Linux struct sigaction: handler, flags, restorer, mask
     volatile uint64_t pending;   // process-directed signals
@@ -88,12 +155,16 @@ extern pthread_mutex_t g_lock;    // processes, threads, fd tables
 
 int  fd_host(Proc *p, int gfd);                       // -1 if not open
 int  fd_install(Proc *p, int host, int min, bool cloexec);   // guest fd or -EMFILE (closes host)
+int  fd_install_obj(Proc *p, int host, FdObj *o, bool cloexec);   // takes the caller's reference to o
 int  fd_close(Proc *p, int gfd);
 int  fd_dup(Proc *p, int old, int target, bool exact, bool cloexec);
 int  fd_cloexec(Proc *p, int gfd, int set);           // set < 0: query
 void fd_set_path(int host, const char *guest_path);
 bool fd_get_path(int host, char *out, size_t n);
+FdObj *fd_obj(int host);                              // borrowed; NULL for plain files
+void fd_attach_obj(int host, FdObj *o);               // takes a reference
 void dir_forget(int host);
+extern uint32_t g_uid;                                // the guest's uid/gid (the shell user)
 
 uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid);
 uint64_t proc_execve(GuestCtx *c, const char *path, uint64_t argv, uint64_t envp);
@@ -111,6 +182,8 @@ uint64_t proc_getpgid(GuestCtx *c, int64_t pid);
 uint64_t proc_setsid(GuestCtx *c);
 void proc_backtrace(GuestCtx *c);
 Proc *proc_start(const char *path, char **argv, char **envp);
+const char *proc_secontext(Proc *p);                 // SELinux context we claim for p
+Proc *proc_find(int pid);                            // g_lock held
 void proc_forward_host_signal(int lsig);
 
 // ---- paths and errors (syscall.c) ----
