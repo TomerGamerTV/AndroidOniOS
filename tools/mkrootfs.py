@@ -251,6 +251,17 @@ def main():
                 subprocess.run(['xattr', '-w', k, v, path], check=True)
     print(made, 'directories from the init scripts')
 
+    # /data_mirror: init bind-mounts these (zygote's app-data isolation opens them); symlinks here.
+    for link, target in (('data_ce/null', '/data/user'), ('data_de/null', '/data/user_de'), ('misc_ce/null', '/data/misc_ce'),
+                         ('misc_de/null', '/data/misc_de'), ('storage_area', '/data/storage_area'),
+                         ('cur_profiles', '/data/misc/profiles/cur'), ('ref_profiles', '/data/misc/profiles/ref')):
+        path = os.path.join(R, 'data_mirror', link)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.join(R, target.lstrip('/')), exist_ok=True)
+        if os.path.isdir(path) and not os.path.islink(path) and not os.listdir(path):
+            os.rmdir(path)
+        symlink(target, path)
+
     # As init does: /data/user/0 is the primary user's view of /data/data
     u0 = os.path.join(R, 'data/user/0')
     if os.path.isdir(u0) and not os.path.islink(u0) and not os.listdir(u0):
