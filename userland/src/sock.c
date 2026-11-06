@@ -261,7 +261,8 @@ static int host_msg_flags(uint64_t lf) {
     if (lf & L_MSG_PEEK) f |= MSG_PEEK;
     if (lf & L_MSG_DONTWAIT) f |= MSG_DONTWAIT;
     if (lf & L_MSG_WAITALL) f |= MSG_WAITALL;
-    if (lf & L_MSG_TRUNC) f |= MSG_TRUNC;
+    // MSG_TRUNC as an input flag (report a datagram's real length) has no host equivalent; callers
+    // such as libbase pass it on stream sockets too, so it is not forwarded.
     return f;
 }
 
@@ -602,7 +603,7 @@ static int64_t do_recvmsg(GuestCtx *c, int gfd, uint64_t msg, uint64_t lflags) {
     ssize_t r = recvmsg(h, &hm, host_msg_flags(lflags));
     if (r < 0) return -errno;
     int32_t oflags = 0;
-    if (hm.msg_flags & MSG_TRUNC) oflags |= L_MSG_TRUNC;
+    if ((hm.msg_flags & MSG_TRUNC) && s->type != L_SOCK_STREAM) oflags |= L_MSG_TRUNC;   // streams never truncate
     uint64_t used = 0;
     uint8_t *gc = gptr(m.control);
     for (struct cmsghdr *cm = hm.msg_controllen ? CMSG_FIRSTHDR(&hm) : NULL; cm; cm = CMSG_NXTHDR(&hm, cm)) {
