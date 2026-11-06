@@ -374,7 +374,7 @@ static void buf_release_objs(BProc *p, BBuf *b, bool failed) {
             // The ref may already be gone if userspace released it; look it up by node.
             for (BRef *x = p->refs; x; x = x->next_in_proc) if (x == r) { ref_dec(r, ty == T_HANDLE); break; }
         } else if ((ty == T_FDA || ty == T_FD) && failed) {
-            fd_close(p->proc, b->objs[i].fd);
+            fd_close_internal(p->proc, b->objs[i].fd, 'b');
         }
     }
 }

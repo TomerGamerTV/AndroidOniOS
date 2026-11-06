@@ -30,6 +30,7 @@ void post_signal_locked(Proc *p, GuestCtx *t, int sig);
 
 #define ALTSTACK_SIZE (64 << 10)
 #define L_CLONE_VM 0x100
+#define L_CLONE_FILES 0x400
 #define L_CLONE_VFORK 0x4000
 #define L_CLONE_THREAD 0x10000
 #define L_CLONE_SETTLS 0x80000
@@ -100,11 +101,11 @@ static int fdtrace_on(Proc *p) {
 static void fdtrace(Proc *p, const char *what, int g, int host) {
     if (!fdtrace_on(p)) return;
     const char *path = host >= 0 && host < HOST_FDS && hfd[host].path ? hfd[host].path : "";
-    fprintf(stderr, "FDT %d/%llu %s %d host %d %s\n", p->pid, (unsigned long long)(tr_cur ? tr_cur->tid : 0), what, g, host, path);
+    fprintf(stderr, "FDT %d/%llu(%s) %s %d host %d %s\n", p->pid, (unsigned long long)(tr_cur ? tr_cur->tid : 0), tr_cur ? tr_cur->name : "-", what, g, host, path);
 }
 static int fd_install_locked(Proc *p, int host, int min, bool cloexec) {
     for (int g = min < 0 ? 0 : min; g < MAX_FDS; g++)
-        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec }; fdtrace(p, "open", g, host); return g; }
+        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec, 0, 0, 0 }; fdtrace(p, "open", g, host); return g; }
     fprintf(stderr, "onirun: pid %d: guest fd table full\n", p->pid);
     host_close_locked(host);
     return -EMFILE;
@@ -124,11 +125,29 @@ int fd_install_obj(Proc *p, int host, FdObj *o, bool cloexec) {
     return g;
 }
 
+static void note_closer(Proc *p, int g, char how) {
+    p->fd[g].closed_by = how;
+    p->fd[g].closer_pid = tr_cur ? tr_cur->proc->pid : 0;
+    p->fd[g].closer_tid = tr_cur ? (int)tr_cur->tid : 0;
+}
+// Closing a guest fd from onirun itself (not the guest's close()) is marked so a later
+// double close can say who freed the slot.
+int fd_close_internal(Proc *p, int g, char how) {
+    vfs_fd_closed(p, g);
+    pthread_mutex_lock(&g_lock);
+    int h = fd_host_locked(p, g);
+    if (h >= 0) { fdtrace(p, "close", g, h); p->fd[g].host = -1; note_closer(p, g, how); host_close_locked(h); }
+    pthread_mutex_unlock(&g_lock);
+    return h < 0 ? -EBADF : 0;
+}
 int fd_close(Proc *p, int g) {
     vfs_fd_closed(p, g);
     pthread_mutex_lock(&g_lock);
     int h = fd_host_locked(p, g);
-    if (h >= 0) { fdtrace(p, "close", g, h); p->fd[g].host = -1; host_close_locked(h); }
+    if (h >= 0) { fdtrace(p, "close", g, h); p->fd[g].host = -1; note_closer(p, g, 'c'); host_close_locked(h); }
+    else if (g >= 0 && g < MAX_FDS && p->fd[g].closed_by && getenv("ONIRUN_FDTRACE"))   // close-all loops make many; opt-in
+        fprintf(stderr, "onirun: pid %d tid %llu: close(%d) of a closed fd; last freed by '%c' from pid %d tid %d\n", p->pid,
+                (unsigned long long)(tr_cur ? tr_cur->tid : 0), g, p->fd[g].closed_by, p->fd[g].closer_pid, p->fd[g].closer_tid);
     pthread_mutex_unlock(&g_lock);
     return h < 0 ? -EBADF : 0;
 }
@@ -143,8 +162,8 @@ int fd_dup(Proc *p, int old, int target, bool exact, bool cloexec) {
     if (nh < 0) { r = -lx_errno(errno); goto out; }
     copy_meta_locked(h, nh);
     if (exact) {
-        if (p->fd[target].host >= 0) { fdtrace(p, "dup-over", target, p->fd[target].host); host_close_locked(p->fd[target].host); }
-        p->fd[target] = (FdEnt){ nh, cloexec };
+        if (p->fd[target].host >= 0) { fdtrace(p, "dup-over", target, p->fd[target].host); note_closer(p, target, 'd'); host_close_locked(p->fd[target].host); }
+        p->fd[target] = (FdEnt){ nh, cloexec, 0, 0, 0 };
         fdtrace(p, "dup-to", target, nh);
         r = target;
     } else {
@@ -345,6 +364,17 @@ void proc_exit_group(GuestCtx *c, int status) {
 
 // ---- process exit ----
 static void finish_proc_locked(Proc *p) {
+    if (p->shadow_of) {                    // a CLONE_FILES-less thread's private table: close it, share nothing else
+        for (int i = 0; i < MAX_FDS; i++)
+            if (p->fd[i].host >= 0) { host_close_locked(p->fd[i].host); p->fd[i].host = -1; }
+        for (Proc *q = g_procs, *n; q; q = n) {     // its children (crash_dump's helpers) lose their parent
+            n = q->next;
+            if (q->parent == p) { q->parent = NULL; q->ppid = 1; if (q->state == P_ZOMBIE) proc_free_locked(q); }
+        }
+        mm_put(p->mm);
+        free(p);
+        return;
+    }
     if (p->state == P_RUNNING) { p->state = P_EXITING; p->wstatus = 0; }
     for (int i = 0; i < MAX_FDS; i++)
         if (p->fd[i].host >= 0) { host_close_locked(p->fd[i].host); p->fd[i].host = -1; }
@@ -752,6 +782,7 @@ uint64_t proc_tgkill(GuestCtx *c, int64_t tgid, int64_t tid, int sig) {
 // ---- clone: threads and processes ----
 uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid) {
     Proc *p = c->proc;
+    LOCKED(if (fdtrace_on(p)) fprintf(stderr, "FDT %d/%llu(%s) clone flags %#llx sp %#llx\n", p->pid, (unsigned long long)c->tid, c->name, (unsigned long long)flags, (unsigned long long)newsp));
     GuestCtx *nc = malloc(sizeof *nc);
     memcpy(nc, c, sizeof *nc);
     nc->x[0] = 0;
@@ -769,6 +800,28 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
 
     if (flags & L_CLONE_THREAD) {   // a guest thread on a new host thread
         pthread_mutex_lock(&g_lock);
+        if (!(flags & L_CLONE_FILES)) {
+            // Linux gives such a thread a private copy of the fd table. debuggerd's pseudothread
+            // relies on it: it raw-closes fds 0..1023, which must not touch the process's own.
+            // It runs in a shadow Proc: same pid and address space, its own fd copies, not on
+            // the process list (pid lookups, signals and wait still reach the real process).
+            Proc *sh = malloc(sizeof *sh);
+            memcpy(sh, p, sizeof *sh);
+            sh->shadow_of = p;
+            sh->next = NULL;
+            sh->threads = NULL;
+            sh->nthreads = 0;
+            sh->exit_signal = 0;
+            mm_get(sh->mm);
+            for (int i = 0; i < MAX_FDS; i++) {
+                if (p->fd[i].host < 0) continue;
+                int h = dup(p->fd[i].host);
+                sh->fd[i].host = h;
+                if (h >= 0) copy_meta_locked(p->fd[i].host, h);
+            }
+            nc->proc = sh;
+            p = sh;
+        }
         nc->tid = (uint64_t)g_next_id++;
         nc->next_thread = p->threads;
         p->threads = nc;
@@ -885,7 +938,7 @@ uint64_t proc_execve(GuestCtx *c, const char *gpath, uint64_t argv_g, uint64_t e
     c->space = nm->tr;
     c->tid = (uint64_t)p->pid;
     for (int i = 0; i < MAX_FDS; i++)
-        if (p->fd[i].host >= 0 && p->fd[i].cloexec) { host_close_locked(p->fd[i].host); p->fd[i].host = -1; }
+        if (p->fd[i].host >= 0 && p->fd[i].cloexec) { host_close_locked(p->fd[i].host); p->fd[i].host = -1; note_closer(p, i, 'e'); }
     for (int s = 1; s <= 64; s++)
         if (p->sigact[s][0] > 1) memset(p->sigact[s], 0, sizeof p->sigact[s]);
     snprintf(p->exe, sizeof p->exe, "%s", path);

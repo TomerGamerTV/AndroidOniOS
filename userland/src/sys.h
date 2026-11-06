@@ -147,7 +147,7 @@ int64_t bpf_syscall(GuestCtx *c, int cmd, uint8_t *attr, uint64_t size);  // hos
 
 // ---- processes (proc.c) ----
 #define MAX_FDS 1024
-typedef struct FdEnt { int host; bool cloexec; } FdEnt;
+typedef struct FdEnt { int host; bool cloexec; int closer_pid, closer_tid; char closed_by; } FdEnt;   // closer_*: who freed the slot last (diagnostics)
 
 enum { P_RUNNING, P_EXITING, P_ZOMBIE };
 
@@ -179,6 +179,7 @@ typedef struct Proc {
     bool vfork_done;          // a vfork child has exec'd or exited
     bool initial;             // the first process: when it exits, onirun exits
     struct Proc *next;
+    struct Proc *shadow_of;   // a thread cloned without CLONE_FILES: own fd table, everything else is shadow_of's
 } Proc;
 
 extern pthread_mutex_t g_lock;    // processes, threads, fd tables
@@ -188,6 +189,7 @@ int  fd_host(Proc *p, int gfd);                       // -1 if not open
 int  fd_install(Proc *p, int host, int min, bool cloexec);   // guest fd or -EMFILE (closes host)
 int  fd_install_obj(Proc *p, int host, FdObj *o, bool cloexec);   // takes the caller's reference to o
 int  fd_close(Proc *p, int gfd);
+int  fd_close_internal(Proc *p, int gfd, char how);   // onirun closing a guest fd itself (recorded for diagnostics)
 int  fd_dup(Proc *p, int old, int target, bool exact, bool cloexec);
 int  fd_cloexec(Proc *p, int gfd, int set);           // set < 0: query
 void fd_set_path(int host, const char *guest_path);
