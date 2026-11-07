@@ -30,7 +30,10 @@ _Static_assert(offsetof(GuestCtx, host_sp) == 832, "ctx layout");
 _Static_assert(offsetof(GuestCtx, host_d) == 936, "ctx layout");
 _Static_assert(IB_SIZE == (0x40u << 12), "the inline probe subtracts #0x40, lsl #12");
 
-#define CACHE_SIZE (512u << 20)
+// Address space only: chunks are committed as they fill and given back when their process exits.
+// shortcut: each process translates its own copy of shared code (boot.oat after a zygote fork);
+// sharing translations across forks would cut this and the memory a lot (needed for iOS).
+#define CACHE_SIZE ((size_t)3 << 30)
 #define CHUNK_WORDS ((1u << 20) / 4)
 #define NCHUNKS (CACHE_SIZE / (CHUNK_WORDS * 4))
 #define TRAMP_WORDS 12            // two trampolines: exit stubs (x0/x1 in ctx) and the branch probe miss (x0/x1 at [sp-32])
@@ -107,7 +110,10 @@ void tr_space_free(TrSpace *s) {
         for (Block *b = s->htab[i]; b;) { Block *n = b->next; free(b->imap); free(b->borrows); free(b); b = n; }
     while (s->exits) { ExitRec *n = s->exits->next; free(s->exits); s->exits = n; }
     while (s->emus) { EmuRec *n = s->emus->next; free(s->emus); s->emus = n; }
-    for (int i = 0; i < s->nchunks; i++) chunk_used[s->chunks[i]] = false;
+    for (int i = 0; i < s->nchunks; i++) {
+        chunk_used[s->chunks[i]] = false;
+        madvise(cache + (size_t)s->chunks[i] * CHUNK_WORDS, CHUNK_WORDS * 4, MADV_FREE);
+    }
     free(s->chunks);
     for (TrSpace **pp = &spaces; *pp; pp = &(*pp)->next)
         if (*pp == s) { *pp = s->next; break; }
@@ -123,6 +129,8 @@ static void space_grow(TrSpace *s) {
     while (i < (int)NCHUNKS && chunk_used[i]) i++;
     if (i == (int)NCHUNKS) die("onirun: code cache full");
     chunk_used[i] = true;
+    static int high;
+    if (i + 1 > high) { high = i + 1; if (high % 256 == 0 && getenv("ONIRUN_FAULTS")) fprintf(stderr, "onirun: code cache: %d MiB in use\n", high); }
     s->chunks = realloc(s->chunks, (size_t)(s->nchunks + 1) * sizeof(int));
     s->chunks[s->nchunks++] = i;
     uint32_t *c = cache + (size_t)i * CHUNK_WORDS;

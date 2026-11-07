@@ -474,8 +474,13 @@ int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event) {
     return r;
 }
 
+// Linux drops an epoll registration when the registered file is closed, not when some other fd
+// with the same number is: copies of the table (fork, or debuggerd's pseudothread, which closes
+// every fd in its private table) dup the host fds, so the entry's host fd tells them apart.
 void vfs_fd_closed(Proc *p, int gfd) {
     if (!p->nepoll) return;
+    int closing = fd_host(p, gfd);
+    if (closing < 0) return;
     for (int i = 0; i < MAX_FDS; i++) {
         int h = p->fd[i].host;
         FdObj *o = h >= 0 ? fd_obj(h) : NULL;
@@ -483,7 +488,7 @@ void vfs_fd_closed(Proc *p, int gfd) {
         Epoll *ep = o->data;
         pthread_mutex_lock(&o->lock);
         for (int k = 0; k < ep->n; k++)
-            if (ep->e[k].gfd == gfd) { ep->e[k] = ep->e[--ep->n]; break; }
+            if (ep->e[k].gfd == gfd && ep->e[k].host == closing) { ep->e[k] = ep->e[--ep->n]; break; }
         pthread_mutex_unlock(&o->lock);
     }
 }

@@ -386,4 +386,8 @@ void props_init(void) {
     props_set("bpf.progs_loaded", "1");       // no bpfloader; HALs that wait for it may go on
     props_set("init.svc.zygote", "stopped");
     props_set("sys.boot_completed", "0");
+    props_set("init.svc.adbd", "stopped");    // no adbd (the copied "running" made AdbDebuggingManager poll its socket)
+    // Translated code under load can keep a thread from its suspend point for a while: ART's 10 s
+    // SuspendAll timeout aborted system_server while ANR stack dumps ran next to dex2oat.
+    props_set("dalvik.vm.extra-opts", "-XX:ThreadSuspendTimeout=60000");
 }
