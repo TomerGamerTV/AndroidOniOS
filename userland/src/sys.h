@@ -111,6 +111,9 @@ int64_t vfs_timerfd_gettime(GuestCtx *c, int gfd, uint64_t curv);
 int64_t vfs_epoll_create(GuestCtx *c, int lflags);
 int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event);
 int64_t vfs_epoll_wait(GuestCtx *c, int epfd, uint64_t events, int maxevents, int64_t timeout_ms, uint64_t sigmask);
+int  fd_open_pooled(struct Proc *p, const char *gpath, const char *hpath, bool cloexec);   // -1: not pooled yet
+void fd_pool_add(struct Proc *p, int g);                  // share this read-only file with later opens
+int64_t *fd_pooled_off(struct Proc *p, int g);            // the fd's own position if pooled, else NULL
 int  fd_host_refs(int host);                               // guest fd-table entries sharing a host fd
 void vfs_fd_closed(struct Proc *p, int gfd);               // drops the fd from the process's epoll sets
 int  host_tmpfile(void);                                   // unlinked temporary file
@@ -155,7 +158,8 @@ int64_t bpf_syscall(GuestCtx *c, int cmd, uint8_t *attr, uint64_t size);  // hos
 
 // ---- processes (proc.c) ----
 #define MAX_FDS 1024
-typedef struct FdEnt { int host; bool cloexec; int closer_pid, closer_tid; char closed_by; } FdEnt;   // closer_*: who freed the slot last (diagnostics)
+typedef struct FdEnt { int host; bool cloexec; int closer_pid, closer_tid; char closed_by;   // closer_*: who freed the slot last (diagnostics)
+                       bool ro_shared; int64_t off; } FdEnt;   // ro_shared: pooled read-only file, off is this fd's position
 
 enum { P_RUNNING, P_EXITING, P_ZOMBIE };
 

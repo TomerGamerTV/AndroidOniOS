@@ -198,6 +198,16 @@ static int resolve_at(Proc *p, int dirfd, const char *path, char *out, size_t ou
     return host_path(p, path, out, outlen, follow);
 }
 
+// Read-only opens that can share a host fd (proc.c, fd_open_pooled): files that are only mapped
+// and pread. shortcut: sendfile/splice from such an fd use the host offset, not the fd's own.
+static bool pool_candidate(const char *path, uint64_t f) {
+    if (f & (3 | 0100 | 01000 | 020000000 | 010000000 | 040000)) return false;   // write, CREAT, TRUNC, TMPFILE, PATH, DIRECTORY
+    static const char *ext[] = { ".apk", ".jar", ".odex", ".vdex", ".oat", ".art", ".idmap", ".dm", ".prof", NULL };
+    size_t n = strlen(path);
+    for (int i = 0; ext[i]; i++) { size_t k = strlen(ext[i]); if (n > k && !strcmp(path + n - k, ext[i])) return true; }
+    return false;
+}
+
 // ---- flags ----
 static int open_flags(uint64_t f) {
     int r = (int)(f & 3);
@@ -576,6 +586,11 @@ void sys_dispatch(GuestCtx *c) {
             r = g < 0 ? ERR(-g) : (uint64_t)g;
             break;
         }
+        bool poolable = hfd == AT_FDCWD && pool_candidate(path, a2);
+        if (poolable) {
+            int g = fd_open_pooled(p, guest_of(path), path, a2 & 02000000);
+            if (g >= 0) { r = (uint64_t)g; break; }
+        }
         int fd = openat(hfd, path, open_flags(a2), (int)(a3 & ~p->umask));
         // cgroup attribute files (cgroup.procs, cpu.shares, ...) under a directory the guest made:
         // they exist on a real kernel the moment the directory does, so create them on first use.
@@ -584,6 +599,7 @@ void sys_dispatch(GuestCtx *c) {
         if (fd < 0) { r = ERR(lx_errno(errno)); break; }
         if (hfd == AT_FDCWD) fd_set_path(fd, guest_of(path));
         int g = fd_install(p, fd, 0, a2 & 02000000);
+        if (g >= 0 && poolable) fd_pool_add(p, g);
         r = g < 0 ? ERR(-g) : (uint64_t)g;
         LOGV("  openat(%s) -> %lld\n", gstr(a1), (long long)r);
         break;
@@ -591,6 +607,8 @@ void sys_dispatch(GuestCtx *c) {
     case 57: e = fd_close(p, (int)a0); r = e ? ERR(-e) : 0; break;
     case 63: {
         h = HFD(a0);
+        int64_t *off = fd_pooled_off(p, (int)a0);
+        if (off) { ssize_t n = pread(h, gptr(a1), a2, *off); if (n > 0) *off += n; r = HOSTRET(n); break; }
         int64_t v = vfs_read(c, h, gptr(a1), a2);
         r = v == VFS_PASS ? HOSTRET(read(h, gptr(a1), a2)) : OBJRET(v);
         break;
@@ -617,7 +635,9 @@ void sys_dispatch(GuestCtx *c) {
         h = HFD(a0);
         struct iovec *v = iov_in(a1, a2);
         if (!v) { r = ERR(22); break; }
-        r = HOSTRET(readv(h, v, (int)a2));
+        int64_t *off = fd_pooled_off(p, (int)a0);
+        if (off) { ssize_t n = preadv(h, v, (int)a2, *off); if (n > 0) *off += n; r = HOSTRET(n); }
+        else r = HOSTRET(readv(h, v, (int)a2));
         free(v);
         break;
     }
@@ -627,6 +647,14 @@ void sys_dispatch(GuestCtx *c) {
         h = HFD(a0);
         FdObj *o = fd_obj(h);
         if (o && o->size) { r = a2 == 2 ? o->size + a1 : a2 == 0 ? a1 : 0; break; }   // objects with a size: SEEK_END/SET
+        int64_t *off = fd_pooled_off(p, (int)a0);
+        if (off) {
+            struct stat st;
+            int64_t base = a2 == 0 ? 0 : a2 == 1 ? *off : !fstat(h, &st) ? st.st_size : -1;
+            if (a2 > 2 || base < 0 || base + (int64_t)a1 < 0) { r = ERR(22); break; }   // SEEK_DATA/HOLE: not needed here
+            r = (uint64_t)(*off = base + (int64_t)a1);
+            break;
+        }
         r = HOSTRET(lseek(h, (off_t)a1, (int)a2));
         break;
     }

@@ -49,7 +49,7 @@ void post_signal_locked(Proc *p, GuestCtx *t, int sig);
 // refs counts the entries naming a host fd, which is closed when the last one goes. (Copying them
 // with dup() made every app process hold its own copy of everything zygote had open, and Android
 // ran into the host's per-process fd limit.)
-typedef struct HostFd { char *path; FdObj *obj; int refs; } HostFd;   // guest path (for /proc/self/fd/N), object
+typedef struct HostFd { char *path; FdObj *obj; int refs; bool pooled; } HostFd;   // guest path (for /proc/self/fd/N), object
 static HostFd hfd[HOST_FDS];
 uint32_t g_uid = 2000;
 
@@ -84,10 +84,11 @@ static void copy_meta_locked(int from, int to) {
 
 static void host_ref_locked(int h) { if (h >= 0 && h < HOST_FDS) hfd[h].refs++; }
 int fd_host_refs(int h) { int r; LOCKED(r = h >= 0 && h < HOST_FDS ? hfd[h].refs : 0); return r; }
+static void pool_forget_locked(int h);
 static void host_close_locked(int h) {
     if (h < 0) return;
     if (h < HOST_FDS && hfd[h].refs > 1) { hfd[h].refs--; return; }   // still in another table
-    if (h < HOST_FDS) hfd[h].refs = 0;
+    if (h < HOST_FDS) { hfd[h].refs = 0; if (hfd[h].pooled) pool_forget_locked(h); }
     dir_forget(h);
     set_path_locked(h, NULL);
     if (h < HOST_FDS && hfd[h].obj) { FdObj *o = hfd[h].obj; hfd[h].obj = NULL; obj_put_deferred(o); }   // g_lock is held
@@ -95,6 +96,41 @@ static void host_close_locked(int h) {
 }
 
 static int fd_host_locked(Proc *p, int g) { return (g >= 0 && g < MAX_FDS) ? p->fd[g].host : -1; }
+
+// Read-only opens of APKs, jars, compiled code and idmaps share one host fd per file. Every app
+// reopens the framework's (zygote's fd sanitizer does, and cheaply on Linux); separate host fds
+// cost ~80 descriptors per app against macOS's 10,240 per process. These files are mmapped and
+// pread; the rare read()/lseek() use the guest fd's own position (FdEnt.off), so sharing the host
+// file's offset doesn't leak between fds.
+static int fd_install_locked(Proc *p, int host, int min, bool cloexec);
+static int pool[HOST_FDS], npool;
+static void pool_forget_locked(int h) {
+    hfd[h].pooled = false;
+    for (int i = 0; i < npool; i++) if (pool[i] == h) { pool[i] = pool[--npool]; break; }
+}
+int fd_open_pooled(Proc *p, const char *gpath, const char *hpath, bool cloexec) {
+    struct stat st, hs;
+    if (stat(hpath, &st)) return -1;
+    pthread_mutex_lock(&g_lock);
+    int g = -1;
+    for (int i = 0; i < npool; i++) {
+        int h = pool[i];
+        if (!hfd[h].path || strcmp(hfd[h].path, gpath)) continue;
+        if (fstat(h, &hs) || hs.st_ino != st.st_ino || hs.st_dev != st.st_dev) { pool_forget_locked(h); break; }   // replaced since
+        g = fd_install_locked(p, h, 0, cloexec);    // takes a reference to h
+        if (g >= 0) { p->fd[g].ro_shared = true; p->fd[g].off = 0; }
+        break;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return g;
+}
+void fd_pool_add(Proc *p, int g) {
+    pthread_mutex_lock(&g_lock);
+    int h = fd_host_locked(p, g);
+    if (h >= 0 && h < HOST_FDS && !hfd[h].pooled) { hfd[h].pooled = true; pool[npool++] = h; p->fd[g].ro_shared = true; p->fd[g].off = 0; }
+    pthread_mutex_unlock(&g_lock);
+}
+int64_t *fd_pooled_off(Proc *p, int g) { return g >= 0 && g < MAX_FDS && p->fd[g].host >= 0 && p->fd[g].ro_shared ? &p->fd[g].off : NULL; }
 int fd_host(Proc *p, int g) { int h; LOCKED(h = fd_host_locked(p, g)); return h; }
 
 // ONIRUN_FDTRACE=<exe substring>: log every guest fd install and close in matching processes.
@@ -166,17 +202,21 @@ int fd_dup(Proc *p, int old, int target, bool exact, bool cloexec) {
     int r, h = fd_host_locked(p, old);
     if (h < 0 || (exact && (target < 0 || target >= MAX_FDS))) { r = -EBADF; goto out; }
     if (target < 0 || target >= MAX_FDS) { r = -EINVAL; goto out; }
-    int nh = dup(h);
+    if (exact && target == old) { r = target; goto out; }   // dup2(fd, fd)
+    bool pooled = p->fd[old].ro_shared;
+    int64_t off = p->fd[old].off;
+    int nh = pooled ? h : dup(h);                       // a pooled file is shared again, keeping its position
     if (nh < 0) { r = -lx_errno(errno); goto out; }
-    copy_meta_locked(h, nh);
+    if (!pooled) copy_meta_locked(h, nh);
     if (exact) {
         if (p->fd[target].host >= 0) { fdtrace(p, "dup-over", target, p->fd[target].host); note_closer(p, target, 'd'); host_close_locked(p->fd[target].host); }
-        p->fd[target] = (FdEnt){ nh, cloexec, 0, 0, 0 };
+        p->fd[target] = (FdEnt){ nh, cloexec, 0, 0, 0, pooled, off };
         host_ref_locked(nh);
         fdtrace(p, "dup-to", target, nh);
         r = target;
     } else {
         r = fd_install_locked(p, nh, target, cloexec);
+        if (r >= 0 && pooled) { p->fd[r].ro_shared = true; p->fd[r].off = off; }
     }
 out:
     pthread_mutex_unlock(&g_lock);
@@ -824,7 +864,7 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
             mm_get(sh->mm);
             for (int i = 0; i < MAX_FDS; i++) {
                 if (p->fd[i].host < 0) continue;
-                sh->fd[i].host = p->fd[i].host;     // shared, as after fork
+                sh->fd[i] = (FdEnt){ p->fd[i].host, p->fd[i].cloexec, 0, 0, 0, p->fd[i].ro_shared, p->fd[i].off };   // shared, as after fork
                 host_ref_locked(p->fd[i].host);
             }
             nc->proc = sh;
@@ -876,7 +916,7 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->exit_signal = (int)(flags & 0xff);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fd[i].host < 0) continue;
-        q->fd[i] = (FdEnt){ p->fd[i].host, p->fd[i].cloexec };   // the child shares the open file
+        q->fd[i] = (FdEnt){ p->fd[i].host, p->fd[i].cloexec, 0, 0, 0, p->fd[i].ro_shared, p->fd[i].off };   // the child shares the open file
         host_ref_locked(p->fd[i].host);
     }
     nc->proc = q;
