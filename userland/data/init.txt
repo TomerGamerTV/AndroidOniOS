@@ -22,7 +22,7 @@ service aconfigd /system/bin/aconfigd-system start-socket
 service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
   socket aconfigd_mainline
 # stand-ins for daemons the host can't run (userland/stubs/stubsvc.c)
-service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17:b dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold media.audio_policy=android.media.IAudioPolicyService+android.media.IAudioPolicyService@106:i1 media.audio_flinger=android.media.IAudioFlingerService
+service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17:b dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold
 service idmap2d /system/bin/idmap2d
 service lmkd /system/bin/lmkd
   socket lmkd
@@ -81,6 +81,12 @@ start contexthub
 start statsd
 service gatekeeperd /system/bin/gatekeeperd /data/misc/gatekeeper
 start gatekeeperd
+
+# audio: the emulator's HIDL HAL (falls back to null sinks/sources without /dev/snd) and audioserver
+service audio-hal /vendor/bin/hw/android.hardware.audio.service
+service audioserver /system/bin/audioserver
+start audio-hal
+start audioserver
 
 # graphics: gralloc (minigbm over virtio-gpu), the composer, SurfaceFlinger
 service allocator /vendor/bin/hw/android.hardware.graphics.allocator-service.minigbm

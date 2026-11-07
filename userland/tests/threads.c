@@ -37,6 +37,18 @@ static void *worker(void *arg) {
     return (void *)(long)(id + 100);
 }
 
+static pthread_mutex_t pi_mu;
+static long pi_counter;
+static void *pi_worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 20000; i++) {
+        pthread_mutex_lock(&pi_mu);
+        pi_counter++;
+        pthread_mutex_unlock(&pi_mu);
+    }
+    return NULL;
+}
+
 static void on_usr1(int sig) { (void)sig; atomic_store(&got_signal_tid, gettid()); }
 
 static void *sleeper(void *arg) {
@@ -64,6 +76,17 @@ int main(void) {
     printf("mutex counter %ld/%ld, atomic counter %ld/%ld\n", locked_counter, want,
            (long)atomic_load(&atomic_counter), want);
     if (locked_counter != want || atomic_load(&atomic_counter) != want) ok = 0;
+
+    // Priority-inheritance mutex (FUTEX_LOCK_PI/UNLOCK_PI, as audioserver uses).
+    pthread_mutexattr_t pa;
+    pthread_mutexattr_init(&pa);
+    pthread_mutexattr_setprotocol(&pa, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(&pi_mu, &pa);
+    for (long i = 0; i < 4; i++) pthread_create(&t[i], NULL, pi_worker, NULL);
+    for (int i = 0; i < 4; i++) pthread_join(t[i], NULL);
+    int trc = pthread_mutex_trylock(&pi_mu);
+    printf("PI mutex counter %ld/80000, trylock %d\n", pi_counter, trc);
+    if (pi_counter != 80000 || trc != 0 || pthread_mutex_unlock(&pi_mu) != 0) ok = 0;
 
     // Timed wait must time out (~50 ms).
     struct timespec ts, t0, t1;

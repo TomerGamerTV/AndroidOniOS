@@ -398,7 +398,44 @@ static uint64_t futex_wake(void *addr, uint64_t n, bool shared) {
     return woken;
 }
 
-static uint64_t sys_futex(uint64_t a, uint64_t op_full, uint64_t val, uint64_t ts, uint64_t a2, uint64_t val3) {
+// Priority-inheritance futexes (FUTEX_LOCK_PI/UNLOCK_PI/TRYLOCK_PI/LOCK_PI2) without the priority
+// part: the word holds the owner's tid plus FUTEX_WAITERS. A thread that had to wait takes the lock
+// with FUTEX_WAITERS set, so the unlock always comes back here and wakes the next sleeper.
+// shortcut: no FUTEX_OWNER_DIED on thread death (robust lists), add if a robust PI mutex shows up.
+#define FUTEX_WAITERS 0x80000000u
+#define FUTEX_TID_MASK 0x3fffffffu
+static uint64_t futex_lock_pi(uint32_t *addr, uint32_t tid, bool try, uint64_t ts, bool realtime, bool shared) {
+    os_sync_wait_on_address_flags_t f = shared ? OS_SYNC_WAIT_ON_ADDRESS_SHARED : OS_SYNC_WAIT_ON_ADDRESS_NONE;
+    bool waited = false;
+    for (;;) {
+        uint32_t v = __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+        if (!(v & FUTEX_TID_MASK)) {
+            uint32_t nv = tid | (waited ? FUTEX_WAITERS : (v & FUTEX_WAITERS));
+            if (__atomic_compare_exchange_n(addr, &v, nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 0;
+            continue;
+        }
+        if ((v & FUTEX_TID_MASK) == tid) return ERR(35);              // EDEADLK
+        if (try) return ERR(11);
+        if (!(v & FUTEX_WAITERS) &&
+            !__atomic_compare_exchange_n(addr, &v, v | FUTEX_WAITERS, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
+        v |= FUTEX_WAITERS;
+        int rc;
+        if (ts) {                                                      // absolute deadline
+            const struct timespec *t = gptr(ts);
+            struct timespec now;
+            clock_gettime(realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+            int64_t ns = ((int64_t)t->tv_sec - now.tv_sec) * 1000000000 + t->tv_nsec - now.tv_nsec;
+            if (ns <= 0) return ERR(110);
+            rc = os_sync_wait_on_address_with_timeout(addr, v, 4, f, OS_CLOCK_MACH_ABSOLUTE_TIME, (uint64_t)ns);
+        } else {
+            rc = os_sync_wait_on_address(addr, v, 4, f);
+        }
+        if (rc < 0 && errno == ETIMEDOUT) return ERR(110);
+        waited = true;                                                 // EINTR: Linux restarts LOCK_PI
+    }
+}
+
+static uint64_t sys_futex(uint64_t a, uint64_t op_full, uint64_t val, uint64_t ts, uint64_t a2, uint64_t val3, uint32_t tid) {
     int op = (int)(op_full & 0x7f);
     bool shared = !(op_full & 128), realtime = op_full & 256;
     uint32_t *addr = gptr(a);
@@ -433,6 +470,15 @@ static uint64_t sys_futex(uint64_t a, uint64_t op_full, uint64_t val, uint64_t t
     }
     case 5:                    // FUTEX_WAKE_OP: approximate as wake both
         return futex_wake(addr, val, shared) + futex_wake(gptr(a2), ts, shared);
+    case 6: case 13:           // FUTEX_LOCK_PI (CLOCK_REALTIME deadline), FUTEX_LOCK_PI2 (monotonic unless FUTEX_CLOCK_REALTIME)
+        return futex_lock_pi(addr, tid, false, ts, op == 6 || realtime, shared);
+    case 8:                    // FUTEX_TRYLOCK_PI
+        return futex_lock_pi(addr, tid, true, 0, false, shared);
+    case 7:                    // FUTEX_UNLOCK_PI
+        if ((__atomic_load_n(addr, __ATOMIC_SEQ_CST) & FUTEX_TID_MASK) != tid) return ERR(1);
+        __atomic_store_n(addr, 0, __ATOMIC_SEQ_CST);
+        futex_wake(addr, 1, shared);
+        return 0;
     default:
         return ERR(38);
     }
@@ -951,7 +997,7 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 168: if (a0) *(uint32_t *)gptr(a0) = 0; if (a1) *(uint32_t *)gptr(a1) = 0; r = 0; break;   // getcpu
-    case 98: r = sys_futex(a0, a1, a2, a3, a4, a5); break;
+    case 98: r = sys_futex(a0, a1, a2, a3, a4, a5, (uint32_t)c->tid); break;
     case 93: proc_exit_thread(c, (int)a0);
     case 94: proc_exit_group(c, (int)a0);
     case 129: r = proc_kill(c, (int64_t)(int32_t)a0, (int)a1); break;
