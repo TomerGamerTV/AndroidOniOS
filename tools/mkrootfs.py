@@ -317,7 +317,7 @@ def main():
         open(os.path.join(R, 'sys/devices/system/cpu', name), 'w').write(f'0-{cpus - 1}\n')
     shutil.copy(os.path.join(REPO, 'userland/data/android-properties.txt'), os.path.join(R, 'oni/properties.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/init.txt'), os.path.join(R, 'oni/init.txt'))
-    shutil.copy(os.path.join(REPO, 'userland/data/dexopt.sh'), os.path.join(R, 'oni/dexopt.sh'))
+    shutil.copy(os.path.join(REPO, 'userland/data/boot-tasks.sh'), os.path.join(R, 'oni/boot-tasks.sh'))
     shutil.copy(os.path.join(REPO, 'userland/data/android-env.sh'), os.path.join(R, 'data/local/tmp/android-env.sh'))
 
     # 6. From a booted device: property areas and linker configs

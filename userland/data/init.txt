@@ -47,13 +47,13 @@ start keystore2
 start installd
 start zygote
 
-# dexopt: artd is started on demand; the job compiles the apps once (userland/data/dexopt.sh)
+# artd is started on demand (dexopt); boot-tasks caps cached apps and compiles the apps once
 service artd /apex/com.android.art/bin/artd
   oneshot
 interface aidl/artd artd
-service dexopt /system/bin/sh /oni/dexopt.sh
+service boot-tasks /system/bin/sh /oni/boot-tasks.sh
   oneshot
-start dexopt
+start boot-tasks
 
 # HALs the emulator image provides in software
 service keymint /vendor/bin/hw/android.hardware.security.keymint-service

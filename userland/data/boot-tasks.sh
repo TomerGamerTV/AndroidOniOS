@@ -1,10 +1,16 @@
-# Compiles the apps once, after the first boot under onirun (installed as /oni/dexopt.sh, run by
-# init-lite). The image's prebuilt app odex files are rejected (built for the userfaultfd GC; ART
-# here runs the read-barrier collector), so apps start interpreted and miss their startup
-# deadlines (ANRs). bg-dexopt verifies everything; the packages that run from boot are compiled
+# Tasks for after boot under onirun (installed as /oni/boot-tasks.sh, run by init-lite).
+#
+# Every boot: keep at most 8 cached background processes. A phone's lmkd trims them under memory
+# pressure; under onirun every app process costs ~100 host descriptors (macOS allows 10,240 per
+# process) and translated CPU time, and Android otherwise keeps 32 or more.
+#
+# Once: compile the apps. The image's prebuilt app odex files are rejected (built for the
+# userfaultfd GC; ART here runs the read-barrier collector), so apps start interpreted and miss
+# their startup deadlines (ANRs). bg-dexopt verifies everything; the packages that run from boot are compiled
 # fully ("speed": no profiles exist yet, and speed-profile without one only verifies). The
 # results live in /data and survive later boots; the marker keeps this from running twice.
 until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 10; done
+settings put global activity_manager_constants max_cached_processes=8
 [ -e /data/misc/oni-dexopt-done ] && exit 0
 sleep 60                                    # let the first round of app starts settle
 pm art dexopt-packages -r bg-dexopt
