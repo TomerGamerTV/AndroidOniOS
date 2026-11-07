@@ -915,7 +915,9 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
         }
         case W_COMPLETE: PUT32(BR_TRANSACTION_COMPLETE); free(w); break;
         case W_ERROR: PUT32(w->error); free(w); break;
-        case W_DEAD_BINDER: PUT32(BR_DEAD_BINDER); PUT(&w->cookie, 8); free(w); break;
+        // Like the driver, a read ends after a death notice: handling it can make calls, and libbinder
+        // would run a second notice still in its buffer nested inside them (re-entering locks).
+        case W_DEAD_BINDER: PUT32(BR_DEAD_BINDER); PUT(&w->cookie, 8); free(w); goto out;
         case W_CLEAR_DEATH_DONE: PUT32(BR_CLEAR_DEATH_NOTIFICATION_DONE); PUT(&w->cookie, 8); free(w); break;
         case W_FROZEN: { uint64_t info[2] = { w->cookie, 0 }; PUT32(BR_FROZEN_BINDER); PUT(info, 16); free(w); break; }   // is_frozen = 0
         case W_CLEAR_FREEZE_DONE: PUT32(BR_CLEAR_FREEZE_NOTIFICATION_DONE); PUT(&w->cookie, 8); free(w); break;

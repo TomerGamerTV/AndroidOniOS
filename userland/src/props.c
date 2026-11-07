@@ -390,4 +390,7 @@ void props_init(void) {
     // Translated code under load can keep a thread from its suspend point for a while: ART's 10 s
     // SuspendAll timeout aborted system_server while ANR stack dumps ran next to dex2oat.
     props_set("dalvik.vm.extra-opts", "-XX:ThreadSuspendTimeout=60000");
+    // The framework's knob for slow (emulated) hardware: scales process-start, broadcast, service
+    // and input-dispatch ANR timeouts. The emulator image says 3; translated code needs more.
+    props_set("ro.hw_timeout_multiplier", "10");
 }
