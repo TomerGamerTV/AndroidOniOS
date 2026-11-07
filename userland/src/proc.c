@@ -1194,7 +1194,10 @@ static Proc *spawn(const char *path, char **argv, char **envp, const char **sock
     return p;
 }
 
-static void proc_noop_handler(int sig) { (void)sig; }
+// A process-directed signal can land on a host thread that doesn't block it (libdispatch's workers,
+// which run the guest's POSIX timers, are created with signals open): hand it to the sigwait thread.
+static pthread_t sig_thread;
+static void proc_noop_handler(int sig) { if (!pthread_equal(pthread_self(), sig_thread)) pthread_kill(sig_thread, sig); }
 
 void sys_main(const char *path, char **argv, char **envp, const char **sockets) {
     // Terminal and job signals are taken here with sigwait and forwarded to the guest processes;
@@ -1208,6 +1211,7 @@ void sys_main(const char *path, char **argv, char **envp, const char **sockets) 
     struct sigaction keep = { .sa_handler = (void (*)(int))1 /* SIG_IGN placeholder replaced below */ };
     keep.sa_handler = proc_noop_handler;
     for (unsigned i = 0; i < sizeof fwd / sizeof fwd[0]; i++) sigaction(fwd[i], &keep, NULL);
+    sig_thread = pthread_self();
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     struct rlimit rl;
     if (!getrlimit(RLIMIT_NOFILE, &rl)) {
