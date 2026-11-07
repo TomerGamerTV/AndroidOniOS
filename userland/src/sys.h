@@ -139,6 +139,7 @@ int  gpu_open(struct Proc *p, bool card, int lflags);     // /dev/dri/renderD128
 int  input_open(struct Proc *p, const char *path, int lflags);   // /dev/input/event0 (input.c)
 void input_touch(int phase, int x, int y);                // 0 down, 1 move, 2 up, screen pixels
 void input_key(int code, bool down);                      // Linux KEY_* code
+void input_init(void);                                    // ONIRUN_INPUT_FIFO scripted input
 bool gpu_frame_copy(uint8_t *dst, size_t cap, uint32_t *w, uint32_t *h, uint64_t *seq);
 void gpu_display_size(uint32_t *w, uint32_t *h);
 

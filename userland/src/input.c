@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "sys.h"
@@ -52,6 +53,7 @@ void input_touch(int phase, int x, int y) {
     if (y < 0) y = 0;
     if ((uint32_t)x >= scr_w) x = (int)scr_w - 1;
     if ((uint32_t)y >= scr_h) y = (int)scr_h - 1;
+    if (phase != 1 && getenv("ONIRUN_FAULTS")) fprintf(stderr, "onirun: touch %s at %d,%d\n", phase ? "up" : "down", x, y);
     InputEvent ev[6];
     int n = 0;
     ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_SLOT, .value = 0 };
@@ -69,6 +71,34 @@ void input_touch(int phase, int x, int y) {
 void input_key(int code, bool down) {
     InputEvent ev[2] = { { .type = EV_KEY, .code = (uint16_t)code, .value = down }, { .type = EV_SYN, .code = SYN_REPORT } };
     emit(ev, 2);
+}
+
+// ONIRUN_INPUT_FIFO=path: scripted input for automation (like adb shell input). Lines:
+//   down X Y | move X Y | up X Y | key CODE 1|0      (screen pixels, Linux KEY_* codes)
+static void *fifo_thread(void *a) {
+    const char *path = a;
+    for (;;) {
+        FILE *f = fopen(path, "r");                   // blocks until a writer opens it
+        if (!f) return NULL;
+        char line[128], cmd[16];
+        int x, y;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "%15s %d %d", cmd, &x, &y) != 3) continue;
+            if (!strcmp(cmd, "down")) input_touch(0, x, y);
+            else if (!strcmp(cmd, "move")) input_touch(1, x, y);
+            else if (!strcmp(cmd, "up")) input_touch(2, x, y);
+            else if (!strcmp(cmd, "key")) input_key(x, y != 0);
+        }
+        fclose(f);
+    }
+}
+void input_init(void) {
+    const char *fifo = getenv("ONIRUN_INPUT_FIFO");
+    if (!fifo) return;
+    mkfifo(fifo, 0600);
+    pthread_t t;
+    pthread_create(&t, NULL, fifo_thread, (void *)fifo);
+    pthread_detach(t);
 }
 
 static int64_t in_read(FdObj *o, GuestCtx *c, void *buf, size_t n, bool nonblock) {

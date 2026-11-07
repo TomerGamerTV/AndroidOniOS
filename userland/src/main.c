@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
     envp[ne] = NULL;
     tr_init();
     sys_init(root);
+    input_init();
     run.path = init_mode ? NULL : argv[i]; run.argv = argv + i; run.envp = envp; run.sockets = sockets;
     if (window) display_main(run_guest, NULL);
     else run_guest(NULL);
