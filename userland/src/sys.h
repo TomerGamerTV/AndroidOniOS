@@ -45,6 +45,7 @@ typedef struct Mm {
 } Mm;
 
 Mm *mm_new(void);
+void mm_choose_window(void);   // sets g_win_size (WIN_SIZE)
 Mm *mm_fork(Mm *parent);
 void mm_get(Mm *m);
 void mm_put(Mm *m);

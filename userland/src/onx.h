@@ -60,8 +60,10 @@ enum { EXIT_DIRECT = 1, EXIT_INDIRECT = 2, EXIT_SYSCALL = 3, EXIT_EMULATE = 4, E
 
 // A process window is WIN_SIZE bytes of host address space. Just below it sits the indirect-branch
 // table that translated code probes through x16.
-#define WIN_BITS 36
-#define WIN_SIZE (1ull << WIN_BITS)
+// 64 GiB on macOS. iOS gives a process far less address space, so there it is sized at startup
+// (mm_choose_window); ONIRUN_WIN_GB overrides it.
+extern uint64_t g_win_size;
+#define WIN_SIZE g_win_size
 #define IB_BITS 14
 #define IB_SIZE ((1ull << IB_BITS) * 16)
 

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <os/os_sync_wait_on_address.h>
+#include <TargetConditionals.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -1387,4 +1388,9 @@ uint64_t sys_code_end(GuestCtx *c, uint64_t pc) { return mm_exec_end(c->proc->mm
 void sys_init(const char *rootfs) {
     if (!realpath(rootfs, g_rootfs)) die("onirun: rootfs %s: %s", rootfs, strerror(errno));
     if ((uint64_t)getpagesize() != PG) die("onirun: expected 16 KiB host pages");
+#if TARGET_OS_IPHONE
+    mm_choose_window();
+#else
+    if (getenv("ONIRUN_WIN_GB")) mm_choose_window();
+#endif
 }

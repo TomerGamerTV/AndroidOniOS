@@ -1140,7 +1140,7 @@ static Proc *spawn(const char *path, char **argv, char **envp, const char **sock
         int ls = lx_sig(hs);
         if (ls && !sigaction(hs, NULL, &cur) && cur.sa_handler == SIG_IGN) p->sigact[ls][0] = 1;
     }
-    if (!(p->mm = mm_new())) die("onirun: cannot reserve an address space");
+    if (!(p->mm = mm_new())) die("onirun: cannot reserve %llu GiB of address space: %s", (unsigned long long)(WIN_SIZE >> 30), strerror(errno));
     // Standard fds: stdin is /dev/null (Android services never read it, and the host's stdin may
     // be a socket, which would confuse zygote's fd checks); stdout/stderr are the host's but
     // claim to be /dev/null, which is what zygote reopens them as in its children.

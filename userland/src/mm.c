@@ -112,6 +112,41 @@ static uint64_t vma_gap(Mm *m, uint64_t len) {
     return 0;
 }
 
+uint64_t g_win_size = 1ull << 36;
+
+// How much address space can this process reserve? Reserves 1 GiB pieces (PROT_NONE costs no
+// memory) until the kernel refuses, then gives them back.
+static uint64_t probe_va(uint64_t *largest) {
+    enum { MAXP = 4096 };
+    static void *got[MAXP];
+    int n = 0;
+    uint64_t big = 0;
+    for (uint64_t sz = 1ull << 40; sz >= (1ull << 30); sz >>= 1) {   // the largest single piece
+        void *r = mmap(NULL, sz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (r != MAP_FAILED) { munmap(r, sz); big = sz; break; }
+    }
+    while (n < MAXP) {
+        void *r = mmap(NULL, 1ull << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (r == MAP_FAILED) break;
+        got[n++] = r;
+    }
+    for (int i = 0; i < n; i++) munmap(got[i], 1ull << 30);
+    *largest = big;
+    return (uint64_t)n << 30;
+}
+
+// Picks the window size: room for about 48 processes, between 16 and 64 GiB.
+void mm_choose_window(void) {
+    const char *e = getenv("ONIRUN_WIN_GB");
+    uint64_t largest, total = probe_va(&largest);
+    uint64_t w = 1ull << 36;
+    if (e && atoi(e) > 0) w = (uint64_t)atoi(e) << 30;
+    else while (w > (16ull << 30) && (w * 48 > total || w + (1ull << 30) > largest)) w >>= 1;   // scudo alone reserves ~10 GiB
+    g_win_size = w;
+    fprintf(stderr, "onirun: address space: %llu GiB reservable (largest piece %llu GiB); %llu GiB per process\n",
+            (unsigned long long)(total >> 30), (unsigned long long)(largest >> 30), (unsigned long long)(w >> 30));
+}
+
 // ---- lifetime ----
 Mm *mm_new(void) {
     size_t len = IB_SIZE + WIN_SIZE + RESV_ALIGN;
