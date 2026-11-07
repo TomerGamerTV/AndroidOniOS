@@ -8,6 +8,7 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 10; done
 [ -e /data/misc/oni-dexopt-done ] && exit 0
 sleep 60                                    # let the first round of app starts settle
 pm art dexopt-packages -r bg-dexopt
+ok=1
 # Smaller apps first; GMS, the Google app and the Play Store are huge (tens of minutes each).
 for p in com.android.systemui com.google.android.apps.nexuslauncher com.android.phone \
          com.google.android.inputmethod.latin com.google.android.permissioncontroller com.google.android.ext.services \
@@ -15,6 +16,10 @@ for p in com.android.systemui com.google.android.apps.nexuslauncher com.android.
          com.android.providers.contacts com.google.android.bluetooth com.google.android.apps.wellbeing \
          com.android.se com.android.keychain com.android.printspooler com.android.localtransport \
          com.google.android.gms com.google.android.googlequicksearchbox com.android.vending; do
-    pm compile -m speed "$p"          # already-compiled packages are skipped (no -f)
+    out=$(pm compile -m speed "$p" 2>&1)   # already-compiled packages are skipped (no -f)
+    case "$out" in
+        *Success*|*"not found"*|*"Unknown package"*) ;;
+        *) ok=0; echo "dexopt: $p: $out" > /dev/kmsg ;;
+    esac
 done
-touch /data/misc/oni-dexopt-done
+[ "$ok" = 1 ] && touch /data/misc/oni-dexopt-done   # otherwise the next boot retries

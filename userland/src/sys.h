@@ -81,6 +81,7 @@ struct FdObj {
     bool map_shared;          // map it MAP_SHARED even if the guest asked for private
     uint64_t size;            // reported by fstat/lseek(SEEK_END) when nonzero (dma-bufs)
     bool ready;
+    bool owns_rd;             // rd is the object's own descriptor, not a guest fd: closed with the object
     pthread_mutex_t lock;
     void *data;
     uint64_t ino;             // the readiness pipe's inode: identifies the object behind any dup of rd

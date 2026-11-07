@@ -436,6 +436,7 @@ static int64_t do_connect(GuestCtx *c, int gfd, uint64_t addr, uint64_t len) {
         if (!o) return -ENFILE;
         int nd = dup(o->rd);
         if (nd < 0) { obj_put(o); return -errno; }
+        o->owns_rd = true;
         swap_host(h, nd);
         fd_set_path(h, "/dev/goldfish_pipe");
         fd_attach_obj(h, o);                               // replaces the vsock socket object

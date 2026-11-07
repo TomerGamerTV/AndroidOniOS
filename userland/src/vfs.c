@@ -117,6 +117,7 @@ static void obj_free(FdObj *o) {
     }
     if (o->ops->release) o->ops->release(o);
     if (o->wr >= 0) close(o->wr);
+    if (o->owns_rd && o->rd >= 0) close(o->rd);
     if (o->mmap_fd >= 0) close(o->mmap_fd);
     pthread_mutex_destroy(&o->lock);
     free(o);
