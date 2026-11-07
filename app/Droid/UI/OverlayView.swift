@@ -213,11 +213,18 @@ struct SettingsView: View {
                     Toggle("Use JIT when available", isOn: $s.preferJIT)
                     Toggle("Android navigation buttons", isOn: $s.navButtons)
                 }
+                Section(footer: Text("Native runs Android's own programs directly, translated, without a virtual machine. It needs JIT and its Android copied in (onirun-rootfs.tar). Experimental.")) {
+                    Picker("Engine", selection: $s.engine) {
+                        Text("Virtual machine").tag("qemu")
+                        Text("Native (experimental)").tag("native")
+                    }
+                }
                 Section(footer: Text("Saves Android when you leave the app, so it opens where you left off instead of starting again. Each save writes about as much as Android's memory size to storage.")) {
                     Toggle("Quick resume", isOn: $s.saveState)
                 }
                 Section("Status") {
-                    LabeledContent("Acceleration", value: state.jitEnabled ? "JIT (TCG)" : "Interpreter (TCTI)")
+                    LabeledContent("Engine", value: VMSettings.current.native ? "Native (onirun)" : "Virtual machine (QEMU)")
+                    LabeledContent("Acceleration", value: state.jitEnabled ? "JIT" : "Interpreter (TCTI)")
                     LabeledContent("ADB", value: ADBClient.shared.isConnected ? "Connected" : "Waiting")
                     LabeledContent("Shared folder", value: "Files › On My iPhone › Oni › Android Storage")
                 }

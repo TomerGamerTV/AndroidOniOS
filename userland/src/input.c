@@ -13,8 +13,10 @@
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3, SYN_REPORT = 0, BTN_TOUCH = 0x14a,
        ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36, ABS_MT_TRACKING_ID = 0x39 };
-static const int nav_keys[] = { 1 /* ESC */, 102 /* HOME */, 116 /* POWER */, 114 /* VOLUMEDOWN */, 115 /* VOLUMEUP */,
-                                139 /* MENU */, 158 /* BACK */, 172 /* HOMEPAGE */, 580 /* APPSELECT */ };
+// Keys it reports: the whole keyboard range (1..255, so EventHub also treats it as a keyboard) plus
+// the Android navigation keys.
+static const int extra_keys[] = { 580 /* APPSELECT */ };
+#define SLOTS 10
 
 typedef struct { int64_t sec, usec; uint16_t type, code; int32_t value; } InputEvent;   // 24 bytes on 64-bit
 _Static_assert(sizeof(InputEvent) == 24, "input_event");
@@ -23,7 +25,7 @@ typedef struct Reader { FdObj *o; InputEvent *q; size_t n, cap; struct Reader *n
 static pthread_mutex_t in_lock = PTHREAD_MUTEX_INITIALIZER;
 static Reader *readers;
 static uint32_t scr_w = 1080, scr_h = 2400;
-static int next_tracking_id;
+static int next_tracking_id, cur_slot = -1;
 
 static void bit(uint8_t *m, size_t len, int b) { if ((size_t)(b / 8) < len) m[b / 8] |= (uint8_t)(1 << (b % 8)); }
 
@@ -47,8 +49,9 @@ static void emit(const InputEvent *ev, int n) {
     pthread_mutex_unlock(&in_lock);
 }
 
-// phase: 0 down, 1 move, 2 up; x/y in screen pixels.
-void input_touch(int phase, int x, int y) {
+// slot: finger 0..9; phase: 0 down, 1 move, 2 up; x/y in screen pixels.
+void input_touch_slot(int slot, int phase, int x, int y) {
+    if (slot < 0 || slot >= SLOTS) return;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if ((uint32_t)x >= scr_w) x = (int)scr_w - 1;
@@ -56,17 +59,23 @@ void input_touch(int phase, int x, int y) {
     if (phase != 1 && getenv("ONIRUN_FAULTS")) fprintf(stderr, "onirun: touch %s at %d,%d\n", phase ? "up" : "down", x, y);
     InputEvent ev[6];
     int n = 0;
-    ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_SLOT, .value = 0 };
+    if (slot != cur_slot) { ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_SLOT, .value = slot }; cur_slot = slot; }
     if (phase == 0) ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_TRACKING_ID, .value = next_tracking_id++ & 0xffff };
     if (phase == 2) ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_TRACKING_ID, .value = -1 };
     else {
         ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_POSITION_X, .value = x };
         ev[n++] = (InputEvent){ .type = EV_ABS, .code = ABS_MT_POSITION_Y, .value = y };
     }
-    if (phase != 1) ev[n++] = (InputEvent){ .type = EV_KEY, .code = BTN_TOUCH, .value = phase == 0 };
+    static unsigned down_mask;
+    unsigned was = down_mask;
+    if (phase == 0) down_mask |= 1u << slot;
+    if (phase == 2) down_mask &= ~(1u << slot);
+    if (!was != !down_mask) ev[n++] = (InputEvent){ .type = EV_KEY, .code = BTN_TOUCH, .value = down_mask != 0 };   // first finger down / last up
     ev[n++] = (InputEvent){ .type = EV_SYN, .code = SYN_REPORT };
     emit(ev, n);
 }
+
+void input_touch(int phase, int x, int y) { input_touch_slot(0, phase, x, y); }
 
 void input_key(int code, bool down) {
     InputEvent ev[2] = { { .type = EV_KEY, .code = (uint16_t)code, .value = down }, { .type = EV_SYN, .code = SYN_REPORT } };
@@ -148,7 +157,11 @@ static int64_t in_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
         memset(p, 0, len);
         int ev = (int)nr - 0x20;
         if (ev == 0) { bit(p, len, EV_SYN); bit(p, len, EV_KEY); bit(p, len, EV_ABS); }
-        else if (ev == EV_KEY) { bit(p, len, BTN_TOUCH); for (unsigned i = 0; i < sizeof nav_keys / sizeof *nav_keys; i++) bit(p, len, nav_keys[i]); }
+        else if (ev == EV_KEY) {
+            bit(p, len, BTN_TOUCH);
+            for (int k = 1; k < 256; k++) bit(p, len, k);
+            for (unsigned i = 0; i < sizeof extra_keys / sizeof *extra_keys; i++) bit(p, len, extra_keys[i]);
+        }
         else if (ev == EV_ABS) { bit(p, len, ABS_MT_SLOT); bit(p, len, ABS_MT_POSITION_X); bit(p, len, ABS_MT_POSITION_Y); bit(p, len, ABS_MT_TRACKING_ID); }
         return len;
     }
@@ -158,7 +171,7 @@ static int64_t in_ioctl(FdObj *o, GuestCtx *c, uint64_t req, uint64_t arg) {
         if (axis == ABS_MT_POSITION_X) ai[2] = (int32_t)scr_w - 1;
         else if (axis == ABS_MT_POSITION_Y) ai[2] = (int32_t)scr_h - 1;
         else if (axis == ABS_MT_TRACKING_ID) ai[2] = 0xffff;
-        else if (axis == ABS_MT_SLOT) ai[2] = 0;                                  // one finger
+        else if (axis == ABS_MT_SLOT) ai[2] = SLOTS - 1;
         else return -EINVAL;
         memcpy(p, ai, sizeof ai);
         return 0;

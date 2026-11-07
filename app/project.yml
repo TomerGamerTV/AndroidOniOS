@@ -56,6 +56,10 @@ targets:
         embed: true
         link: false
         codeSign: true
+      - framework: ../build/frameworks/Onirun.framework
+        embed: true
+        link: false
+        codeSign: true
       - target: DroidShare
       - target: DroidJIT
       - target: DroidTunnel

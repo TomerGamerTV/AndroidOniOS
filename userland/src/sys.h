@@ -142,9 +142,11 @@ int  props_set(const char *name, const char *value);     // 0 or a PROP_ERROR_* 
 // ---- virtio-gpu over rutabaga/gfxstream (virtgpu.c) ----
 int  gpu_open(struct Proc *p, bool card, int lflags);     // /dev/dri/renderD128 (render) or card0 (KMS)
 int  input_open(struct Proc *p, const char *path, int lflags);   // /dev/input/event0 (input.c)
-void input_touch(int phase, int x, int y);                // 0 down, 1 move, 2 up, screen pixels
+void input_touch(int phase, int x, int y);                // 0 down, 1 move, 2 up, screen pixels (finger 0)
+void input_touch_slot(int slot, int phase, int x, int y); // finger 0..9
 void input_key(int code, bool down);                      // Linux KEY_* code
 void input_init(void);                                    // ONIRUN_INPUT_FIFO scripted input
+void gpu_display_attach(void *opaque, void (*surface)(void *, void *, int, int, int, bool), void (*update)(void *, int, int, int, int));
 bool gpu_frame_copy(uint8_t *dst, size_t cap, uint32_t *w, uint32_t *h, uint64_t *seq);
 void gpu_display_size(uint32_t *w, uint32_t *h);
 

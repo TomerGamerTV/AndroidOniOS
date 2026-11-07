@@ -72,6 +72,12 @@ static struct {
     const char *frames_dir;
 } G = { .lock = PTHREAD_MUTEX_INITIALIZER, .flock = PTHREAD_MUTEX_INITIALIZER, .next_res = 1, .next_ctx = 1, .next_fence = 1 };
 
+// An embedding app's display (ios_api.c): told about the frame buffer once, then after every frame.
+static void *disp_opaque;
+static void (*disp_surface)(void *, void *, int, int, int, bool);
+static void (*disp_update)(void *, int, int, int, int);
+static bool disp_told;
+
 #define LOCK() pthread_mutex_lock(&G.lock)
 #define UNLOCK() pthread_mutex_unlock(&G.lock)
 
@@ -344,6 +350,10 @@ static void present_locked(GpuRes *r, uint32_t w, uint32_t h) {
     if (faults && r->res_id != last_res) fprintf(stderr, "onirun: frame %llu now from res %u (blob_mem %u, %ux%u, rc %d)\n", (unsigned long long)G.frames, r->res_id, r->blob_mem, w, h, rc);
     last_res = r->res_id;
     if (faults && (G.frames == 1 || G.frames % 300 == 0)) fprintf(stderr, "onirun: frame %llu (%ux%u, res %u)\n", (unsigned long long)G.frames, w, h, r->res_id);
+    if (disp_surface) {
+        if (!disp_told) { disp_surface(disp_opaque, G.frame, (int)G.width, (int)G.height, (int)G.width * 4, false); disp_told = true; }
+        else if (disp_update) disp_update(disp_opaque, 0, 0, (int)G.width, (int)G.height);
+    }
     if (G.frames == 1 || G.frames % 60 == 0) LOGV("onirun: frame %llu (%ux%u, res %u)\n", (unsigned long long)G.frames, w, h, r->res_id);
     if (G.frames_dir && (G.frames <= 3 || G.frames % 120 == 0)) {
         char path[512];
@@ -356,6 +366,13 @@ static void present_locked(GpuRes *r, uint32_t w, uint32_t h) {
             fclose(fp);
         }
     }
+}
+
+// An embedding app's display (ios_api.c; state declared with G above).
+void gpu_display_attach(void *opaque, void (*surface)(void *, void *, int, int, int, bool), void (*update)(void *, int, int, int, int)) {
+    LOCK();
+    disp_opaque = opaque; disp_surface = surface; disp_update = update; disp_told = false;
+    UNLOCK();
 }
 
 // For the --window display (display.m): the last presented frame (RGBX, width*4 stride). With dst

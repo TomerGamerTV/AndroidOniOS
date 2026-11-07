@@ -16,7 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <mach/mach.h>
+kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t *, mach_vm_size_t, mach_vm_offset_t, int, vm_map_t,
+                            mach_vm_address_t, boolean_t, vm_prot_t *, vm_prot_t *, vm_inherit_t);
+#endif
 
 #include "onx.h"
 
@@ -34,8 +41,14 @@ _Static_assert(IB_SIZE == (0x40u << 12), "the inline probe subtracts #0x40, lsl 
 // shortcut: each process translates its own copy of shared code (boot.oat after a zygote fork);
 // sharing translations across forks would cut this and the memory a lot (needed for iOS).
 #define CACHE_SIZE ((size_t)3 << 30)
+// macOS: one MAP_JIT mapping, made writable per thread with pthread_jit_write_protect_np.
+// iOS (TXM, iOS 26+): the code runs from an RX alias in the low range the app reserves at launch
+// and is written through an RW alias of the same pages; cache_rw is the RW alias's offset.
+static intptr_t cache_rw;
+#define W(p) ((uint32_t *)((char *)(p) + cache_rw))
+static size_t cache_size = CACHE_SIZE;
 #define CHUNK_WORDS ((1u << 20) / 4)
-#define NCHUNKS (CACHE_SIZE / (CHUNK_WORDS * 4))
+#define NCHUNKS (CACHE_SIZE / (CHUNK_WORDS * 4))   // upper bound; cache_size may be smaller (iOS)
 #define TRAMP_WORDS 12            // two trampolines: exit stubs (x0/x1 in ctx) and the branch probe miss (x0/x1 at [sp-32])
 #define MAX_BLOCK_INSNS 256
 #define BLOCK_RESERVE (MAX_BLOCK_INSNS * 32 + 64)
@@ -112,7 +125,7 @@ void tr_space_free(TrSpace *s) {
     while (s->emus) { EmuRec *n = s->emus->next; free(s->emus); s->emus = n; }
     for (int i = 0; i < s->nchunks; i++) {
         chunk_used[s->chunks[i]] = false;
-        madvise(cache + (size_t)s->chunks[i] * CHUNK_WORDS, CHUNK_WORDS * 4, MADV_FREE);
+        madvise(W(cache + (size_t)s->chunks[i] * CHUNK_WORDS), CHUNK_WORDS * 4, MADV_FREE);
     }
     free(s->chunks);
     for (TrSpace **pp = &spaces; *pp; pp = &(*pp)->next)
@@ -121,27 +134,32 @@ void tr_space_free(TrSpace *s) {
     free(s);
 }
 
+#if TARGET_OS_IPHONE
+static void jit_write(bool on) { (void)on; }       // writes go through the RW alias
+#else
 static void jit_write(bool on) { pthread_jit_write_protect_np(!on); }
+#endif
 
 // Each 1 MiB chunk starts with a trampoline to onx_exit_common, so exit stubs always reach one.
 static void space_grow(TrSpace *s) {
     int i = 0;
-    while (i < (int)NCHUNKS && chunk_used[i]) i++;
-    if (i == (int)NCHUNKS) die("onirun: code cache full");
+    int nchunks = (int)(cache_size / (CHUNK_WORDS * 4));
+    while (i < nchunks && chunk_used[i]) i++;
+    if (i == nchunks) die("onirun: code cache full");
     chunk_used[i] = true;
     static int high;
     if (i + 1 > high) { high = i + 1; if (high % 256 == 0 && getenv("ONIRUN_FAULTS")) fprintf(stderr, "onirun: code cache: %d MiB in use\n", high); }
     s->chunks = realloc(s->chunks, (size_t)(s->nchunks + 1) * sizeof(int));
     s->chunks[s->nchunks++] = i;
-    uint32_t *c = cache + (size_t)i * CHUNK_WORDS;
-    c[0] = 0x58000040;                                 // ldr x0, c+8
-    c[1] = 0xd61f0000;                                 // br x0
-    c[2] = (uint32_t)(uintptr_t)onx_exit_common;
-    c[3] = (uint32_t)((uintptr_t)onx_exit_common >> 32);
-    c[4] = 0x58000040;                                 // ldr x0, c+24
-    c[5] = 0xd61f0000;                                 // br x0
-    c[6] = (uint32_t)(uintptr_t)onx_exit_spilled;
-    c[7] = (uint32_t)((uintptr_t)onx_exit_spilled >> 32);
+    uint32_t *c = cache + (size_t)i * CHUNK_WORDS, *cw = W(c);
+    cw[0] = 0x58000040;                                // ldr x0, c+8
+    cw[1] = 0xd61f0000;                                // br x0
+    cw[2] = (uint32_t)(uintptr_t)onx_exit_common;
+    cw[3] = (uint32_t)((uintptr_t)onx_exit_common >> 32);
+    cw[4] = 0x58000040;                                // ldr x0, c+24
+    cw[5] = 0xd61f0000;                                // br x0
+    cw[6] = (uint32_t)(uintptr_t)onx_exit_spilled;
+    cw[7] = (uint32_t)((uintptr_t)onx_exit_spilled >> 32);
     sys_icache_invalidate(c, TRAMP_WORDS * 4);
     s->tramp = c;
     s->tramp_spilled = c + 4;
@@ -150,7 +168,7 @@ static void space_grow(TrSpace *s) {
 }
 
 // ---- instruction encoders ----
-static inline void emit(uint32_t w) { *ts->ptr++ = w; }
+static inline void emit(uint32_t w) { *W(ts->ptr) = w; ts->ptr++; }
 static inline uint32_t movz(int rd, int hw, unsigned imm) { return 0xd2800000u | (hw << 21) | ((imm & 0xffff) << 5) | rd; }
 static inline uint32_t movk(int rd, int hw, unsigned imm) { return 0xf2800000u | (hw << 21) | ((imm & 0xffff) << 5) | rd; }
 static inline uint32_t b_to(uint32_t *from, uint32_t *to) { return 0x14000000u | ((uint32_t)(to - from) & 0x3ffffff); }
@@ -702,10 +720,11 @@ static void retire_blocks(TrSpace *s, uint64_t start, uint64_t len) {
             emit_exit((uint64_t)(uintptr_t)r, EXIT_DIRECT);
             sys_icache_invalidate(stub, (size_t)(s->ptr - stub) * 4);
             // ldr x17, [pc, #8]; br x17; .quad stub  -- every block is at least one exit stub long
-            b->host[2] = (uint32_t)(uintptr_t)stub;
-            b->host[3] = (uint32_t)((uintptr_t)stub >> 32);
-            b->host[1] = 0xd61f0220;
-            __atomic_store_n(&b->host[0], 0x58000051u, __ATOMIC_RELEASE);
+            uint32_t *hw = W(b->host);
+            hw[2] = (uint32_t)(uintptr_t)stub;
+            hw[3] = (uint32_t)((uintptr_t)stub >> 32);
+            hw[1] = 0xd61f0220;
+            __atomic_store_n(&hw[0], 0x58000051u, __ATOMIC_RELEASE);
             sys_icache_invalidate(b->host, 16);
             IbEntry *e = (IbEntry *)(uintptr_t)(s->base - IB_SIZE) + ((b->pc >> 2) & ((1u << IB_BITS) - 1));
             if (e->host == b->host) { uint64_t one = 1, zero = 0; __asm__ volatile("stp %0, %1, [%2]" :: "r"(one), "r"(zero), "r"(e) : "memory"); }
@@ -753,7 +772,7 @@ static void chain(ExitRec *r, uint32_t *dest) {
     int64_t d = dest - r->patch;
     if (d < -(1 << 25) || d >= (1 << 25)) return;
     jit_write(true);
-    *r->patch = b_to(r->patch, dest);
+    *W(r->patch) = b_to(r->patch, dest);
     jit_write(false);
     sys_icache_invalidate(r->patch, 4);
 }
@@ -917,9 +936,54 @@ static void fault_handler(int sig, siginfo_t *si, void *uc_) {
     _exit(128 + sig);
 }
 
-void tr_init(void) {
+#if TARGET_OS_IPHONE
+// The StikJIT "universal" protocol (TXM devices): the attached debugger script makes a range
+// executable on `brk #0xf00d` with x16 = 1, and lets go of the process with x16 = 0.
+__attribute__((noinline, optnone, naked)) static void *jit26_prepare_region(void *addr, size_t len) {
+    __asm__ volatile("mov x16, #1\n brk #0xf00d\n ret");
+}
+__attribute__((noinline, optnone, naked)) static void jit26_detach(void) {
+    __asm__ volatile("mov x16, #0\n brk #0xf00d\n ret");
+}
+static bool debugger_attached(void) {
+    struct kinfo_proc info = {0};
+    size_t n = sizeof info;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    return sysctl(mib, 4, &info, &n, NULL, 0) == 0 && (info.kp_proc.p_flag & P_TRACED);
+}
+// Like QEMU's split-wx buffer in the app: RW pages anywhere, their RX alias in the low range the app
+// reserved at launch (DROID_JIT_RESERVE=0xADDR:0xSIZE; code run from high addresses hangs on TXM).
+static void cache_alloc(void) {
+    unsigned long long ra = 0, rs = 0;
+    const char *res = getenv("DROID_JIT_RESERVE");
+    if (!res || sscanf(res, "0x%llx:0x%llx", &ra, &rs) != 2 || rs < (64u << 20)) die("onirun: no low JIT reservation (DROID_JIT_RESERVE)");
+    cache_size = rs < CACHE_SIZE ? (size_t)rs & ~((size_t)(CHUNK_WORDS * 4) - 1) : CACHE_SIZE;
+    void *rw = mmap(NULL, cache_size, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (rw == MAP_FAILED) die("onirun: cannot allocate the code cache: %s", strerror(errno));
+    mach_vm_address_t rx = ra;
+    vm_prot_t cur, max;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &rx, cache_size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                     mach_task_self(), (mach_vm_address_t)rw, false, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) die("onirun: code cache alias failed (%d)", kr);
+    if (mprotect((void *)rx, cache_size, PROT_READ | PROT_EXEC)) die("onirun: code cache: mprotect rx: %s", strerror(errno));
+    if (debugger_attached()) {
+        fprintf(stderr, "onirun: preparing %zu MiB of JIT memory at %#llx\n", cache_size >> 20, (unsigned long long)rx);
+        jit26_prepare_region((void *)rx, cache_size);
+        jit26_detach();
+    } else fprintf(stderr, "onirun: warning: no debugger attached; JIT memory not prepared\n");
+    if (mprotect(rw, cache_size, PROT_READ | PROT_WRITE)) die("onirun: code cache: mprotect rw: %s", strerror(errno));
+    cache = (uint32_t *)rx;
+    cache_rw = (intptr_t)rw - (intptr_t)rx;
+}
+#else
+static void cache_alloc(void) {
     cache = mmap(NULL, CACHE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (cache == MAP_FAILED) die("onirun: cannot allocate the code cache: %s", strerror(errno));
+}
+#endif
+
+void tr_init(void) {
+    cache_alloc();
     if (pthread_key_create(&ctx_key, NULL)) die("onirun: pthread_key_create failed");
     onx_tsd_off = (uint64_t)ctx_key * 8;
     // Check that our TSD slot is where translated code looks for it.

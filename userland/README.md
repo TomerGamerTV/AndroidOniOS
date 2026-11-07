@@ -111,3 +111,21 @@ userland/run-init.sh --window
 #   ONIRUN_INPUT_FIFO=/path/fifo: scripted input, lines "down|move|up X Y" or "key CODE 1|0"
 #   ONIRUN_LOGCAT=1 shows the whole log, ONIRUN_FAULTS=1 adds onirun's own diagnostics
 ```
+
+### On the iPhone (experimental)
+
+`make -C userland ios` builds `build/frameworks/Onirun.framework`, which the Droid app embeds and
+loads like its QEMU engines (Settings › Engine › Native, or `{"engine":"native"}` in
+Library/Android/debug.json). It needs JIT (StikJIT, as for QEMU): the translator's code cache is an RW
+mapping plus an RX alias in the low range the app reserves at launch, prepared by the debugger and
+then detached. Android's files come from the Mac:
+
+```sh
+python3 -I tools/mkrootfs-tar.py build/userland/rootfs build/userland/rootfs.tar   # keeps the xattrs
+xcrun devicectl device copy to --device <UDID> --domain-type appDataContainer \
+    --domain-identifier com.tomergamertv.oni --source build/userland/rootfs.tar \
+    --destination Library/Android/onirun-rootfs.tar
+```
+
+The app unpacks it on its next launch (Library/Android/onirun/rootfs); onirun's log is
+Library/Android/logs/onirun.log.

@@ -12,6 +12,10 @@ struct VMSettings {
     var preferJIT: Bool
     var navButtons: Bool
     var saveState: Bool
+    /// "qemu": the virtual machine; "native": onirun, Android's own programs translated in-process
+    /// (no VM; needs JIT and the onirun rootfs).
+    var engine: String
+    var native: Bool { engine == "native" }
 
     static var current: VMSettings {
         let d = UserDefaults.standard
@@ -28,7 +32,14 @@ struct VMSettings {
             density: d.object(forKey: "density") as? Int ?? 420,
             preferJIT: d.object(forKey: "preferJIT") as? Bool ?? true,
             navButtons: d.object(forKey: "navButtons") as? Bool ?? true,
-            saveState: SaveState.enabled)
+            saveState: SaveState.enabled,
+            engine: VMSettings.debugEngine ?? d.string(forKey: "engine") ?? "qemu")
+    }
+
+    /// debug.json {"engine": "native"} overrides the setting (developer use).
+    static var debugEngine: String? {
+        (try? Data(contentsOf: Paths.android.appendingPathComponent("debug.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["engine"] as? String
     }
 
     func save() {
@@ -41,6 +52,7 @@ struct VMSettings {
         d.set(navButtons, forKey: "navButtons")
         d.set(preferJIT, forKey: "preferJIT")
         d.set(saveState, forKey: "saveState")
+        d.set(engine, forKey: "engine")
     }
 }
 
@@ -237,6 +249,88 @@ final class VirtualMachine {
         if restoring { waitForRestore() }
     }
 
+    // MARK: - Native engine (onirun)
+
+    /// Where the native engine's Android lives, and the archive it is installed from
+    /// (tools/mkrootfs-tar.py on a Mac, copied into Library/Android).
+    static var nativeRoot: URL { Paths.android.appendingPathComponent("onirun/rootfs", isDirectory: true) }
+    static var nativeArchive: URL { Paths.android.appendingPathComponent("onirun-rootfs.tar") }
+
+    private func loadNative() throws {
+        guard qemu.handle == nil else { return }
+        let fw = Bundle.main.privateFrameworksURL!.appendingPathComponent("Onirun.framework/Onirun")
+        var err = [CChar](repeating: 0, count: 512)
+        guard droid_qemu_load(fw.path, &qemu, &err, err.count) == 0 else {
+            throw NSError(domain: "Droid", code: 20, userInfo: [NSLocalizedDescriptionKey: "Could not load Onirun: \(String(cString: err))"])
+        }
+    }
+
+    /// Unpacks the rootfs archive (once). progress gets 0...1 on a background thread.
+    func installNative(progress: @escaping (Double) -> Void) throws {
+        try loadNative()
+        guard let sym = dlsym(qemu.handle, "onirun_install_rootfs") else {
+            throw NSError(domain: "Droid", code: 21, userInfo: [NSLocalizedDescriptionKey: "Onirun has no installer"])
+        }
+        typealias Install = @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, (@convention(c) (UInt64, UInt64, UnsafeMutableRawPointer?) -> Void)?, UnsafeMutableRawPointer?) -> Int32
+        let install = unsafeBitCast(sym, to: Install.self)
+        try? FileManager.default.createDirectory(at: Self.nativeRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let box = Unmanaged.passRetained(ProgressBox(progress))
+        defer { box.release() }
+        let rc = install(Self.nativeArchive.path, Self.nativeRoot.path, { done, total, opaque in
+            let b = Unmanaged<ProgressBox>.fromOpaque(opaque!).takeUnretainedValue()
+            b.fn(total > 0 ? Double(done) / Double(total) : 0)
+        }, box.toOpaque())
+        guard rc == 0 else {
+            throw NSError(domain: "Droid", code: 22, userInfo: [NSLocalizedDescriptionKey: "Installing Android failed (\(String(cString: strerror(-rc))))"])
+        }
+        try? FileManager.default.removeItem(at: Self.nativeArchive)
+    }
+
+    /// Starts Android with onirun: no virtual machine, its programs run translated in this process.
+    func startNative(settings: VMSettings, display: DisplayView) throws {
+        guard !started else { return }
+        usingJIT = droid_bridge_jit_available()
+        guard usingJIT else {
+            throw NSError(domain: "Droid", code: 23, userInfo: [NSLocalizedDescriptionKey: "The native engine needs JIT (StikDebug with a pairing file)."])
+        }
+        try loadNative()
+        let mvk = Bundle.main.privateFrameworksURL!.appendingPathComponent("MoltenVK.framework/MoltenVK").path
+        setenv("ANDROID_EMU_VK_ICD", "moltenvk", 1)
+        setenv("ANDROID_EMU_VK_LOADER_PATH", mvk, 1)
+        setenv("RUTABAGA_DISPLAY_WIDTH", String(settings.width), 1)
+        setenv("RUTABAGA_DISPLAY_HEIGHT", String(settings.height), 1)
+        setenv("RUTABAGA_RENDERER_FEATURES", "VulkanVirtualQueue:enabled", 1)
+        setenv("MVK_CONFIG_LOG_LEVEL", "1", 1)
+        setenv("TMPDIR", NSTemporaryDirectory(), 1)
+        struct Debug: Decodable { var env: [String: String]? }
+        let dbg = (try? Data(contentsOf: Paths.android.appendingPathComponent("debug.json"))).flatMap { try? JSONDecoder().decode(Debug.self, from: $0) }
+        for (k, v) in dbg?.env ?? [:] { setenv(k, v, 1) }
+        let args = ["onirun", "--root", Self.nativeRoot.path, "--init"]
+        Log.info("onirun " + args.joined(separator: " "))
+        display.attach(to: &qemu)
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setActive(true)
+        if freopen(Paths.logs.appendingPathComponent("onirun.log").path, "w", stderr) != nil {
+            setvbuf(stderr, nil, _IOLBF, 0)
+        }
+        started = true
+        let q = qemu
+        let thread = Thread {
+            var cargs = args.map { UnsafePointer<CChar>?(strdup($0)) }
+            var local = q
+            let status = cargs.withUnsafeMutableBufferPointer { buf -> Int32 in
+                droid_qemu_run(&local, Int32(args.count), buf.baseAddress)
+            }
+            Log.info("onirun exited with \(status)")
+            DispatchQueue.main.async { self.onExit?(status) }
+        }
+        thread.name = "onirun-main"
+        thread.stackSize = 16 << 20
+        thread.qualityOfService = .userInteractive
+        thread.start()
+    }
+
     // MARK: - Save states
 
     private func waitForRestore() {
@@ -321,6 +415,12 @@ final class VirtualMachine {
         UserDefaults.standard.set(s, forKey: "serial")
         return s
     }
+}
+
+/// Boxes an install-progress callback for the C callback.
+private final class ProgressBox {
+    let fn: (Double) -> Void
+    init(_ fn: @escaping (Double) -> Void) { self.fn = fn }
 }
 
 /// Boxes a save-state completion for the C callback.

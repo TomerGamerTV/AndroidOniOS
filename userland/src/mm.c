@@ -3,7 +3,13 @@
 // mach_vm_remap: private memory becomes copy-on-write, MAP_SHARED memory stays shared.
 #include <errno.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE   // the iOS SDK hides mach_vm.h, but the call is there (QEMU uses it too)
+kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t *, mach_vm_size_t, mach_vm_offset_t, int, vm_map_t,
+                            mach_vm_address_t, boolean_t, vm_prot_t *, vm_prot_t *, vm_inherit_t);
+#else
 #include <mach/mach_vm.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>

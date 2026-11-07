@@ -124,7 +124,10 @@ final class MainViewController: UIViewController {
     private lazy var actions = OverlayActions(
         back: { VirtualMachine.shared.tapKey(.acBack) },
         home: { VirtualMachine.shared.tapKey(.acHome) },
-        recents: { _ = try? ADBClient.shared.shell("input keyevent KEYCODE_APP_SWITCH") },
+        recents: {
+            if VMSettings.current.native { VirtualMachine.shared.tapCode(1000) }   // KEY_APPSELECT in Onirun
+            else { _ = try? ADBClient.shared.shell("input keyevent KEYCODE_APP_SWITCH") }
+        },
         power: { VirtualMachine.shared.tapKey(.power) },
         volumeUp: { VirtualMachine.shared.tapKey(.volumeUp) },
         volumeDown: { VirtualMachine.shared.tapKey(.volumeDown) },
@@ -136,6 +139,7 @@ final class MainViewController: UIViewController {
     // MARK: - Boot sequence
 
     private func boot() async {
+        if VMSettings.current.native { await prepareNative(); return }
         let store = ImageStore.shared
         store.onStage = { [weak self] stage in self?.render(stage) }
         do {
@@ -150,6 +154,30 @@ final class MainViewController: UIViewController {
         } catch {
             state.phase = .failed(error.localizedDescription)
             return
+        }
+        start()
+    }
+
+    /// The native engine's Android: installed from Library/Android/onirun-rootfs.tar the first time.
+    private func prepareNative() async {
+        state.phase = .preparing
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: VirtualMachine.nativeRoot.path) {
+            guard fm.fileExists(atPath: VirtualMachine.nativeArchive.path) else {
+                state.phase = .failed("The native engine's Android isn't installed. Copy onirun-rootfs.tar (tools/mkrootfs-tar.py) into the app's Library/Android folder.")
+                return
+            }
+            state.detail = "Installing Android"
+            state.progress = 0
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try VirtualMachine.shared.installNative { f in DispatchQueue.main.async { self.state.progress = f } }
+                }.value
+            } catch {
+                state.phase = .failed(error.localizedDescription)
+                return
+            }
+            state.progress = nil
         }
         start()
     }
@@ -183,7 +211,8 @@ final class MainViewController: UIViewController {
         }
         // Try to get JIT from the bundled StikJIT helper before QEMU starts (needs a pairing
         // file and LocalDevVPN). Without it we fall back to the slower interpreter.
-        if settings.preferJIT && !lastJITFailed && !droid_bridge_jit_available() && JITEnabler.shared.pairingFileURL != nil {
+        let wantJIT = settings.native || (settings.preferJIT && !lastJITFailed)   // native has no interpreter
+        if wantJIT && !droid_bridge_jit_available() && JITEnabler.shared.pairingFileURL != nil {
             state.phase = .booting
             state.detail = "Enabling JIT acceleration"
             // Bring up the bundled loopback tunnel StikJIT needs to reach 10.7.0.1, then ask the
@@ -216,6 +245,7 @@ final class MainViewController: UIViewController {
         state.progress = nil
         state.bootFraction = 0
         state.detail = "Starting Android"
+        if settings.native { launchNative(settings); return }
         GuestServices.shared.density = settings.density
         GuestServices.shared.start()
         Modem.shared.start()
@@ -259,6 +289,29 @@ final class MainViewController: UIViewController {
         }
     }
 
+    /// onirun: no ADB, modem or boot log; Android is up when it draws.
+    private func launchNative(_ settings: VMSettings) {
+        do {
+            try VirtualMachine.shared.startNative(settings: settings, display: display)
+        } catch {
+            state.phase = .failed(error.localizedDescription)
+            return
+        }
+        state.jitEnabled = true
+        state.detail = "Starting Android (native)"
+        let first = display.onFirstFrame
+        display.onFirstFrame = { [weak self] in
+            first?()
+            VirtualMachine.shared.ready = true
+            self?.state.bootFraction = 1
+            self?.state.phase = .running
+        }
+        VirtualMachine.shared.onExit = { [weak self] code in
+            self?.state.phase = .stopped
+            self?.state.detail = "Android stopped (\(code))."
+        }
+    }
+
     private func requestJIT() {
         let pid = getpid()
         let id = Bundle.main.bundleIdentifier ?? "com.tomergamertv.oni"
@@ -274,6 +327,10 @@ final class MainViewController: UIViewController {
 }
 
 extension VirtualMachine {
+    func tapCode(_ code: Int32) {
+        key(code, down: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.key(code, down: false) }
+    }
     func tapKey(_ k: KeyMap.Q) {
         key(k.rawValue, down: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.key(k.rawValue, down: false) }

@@ -21,10 +21,11 @@ void die(const char *fmt, ...) {
 static struct { const char *path; char **argv, **envp; const char **sockets; } run;
 static void run_guest(void *a) { (void)a; sys_main(run.path, run.argv, run.envp, run.sockets); }
 
-int main(int argc, char **argv) {
+int onirun_main(int argc, char **argv) {
     const char *root = getenv("ONIRUN_ROOT");
     const char *sockets[16] = {0};
     int nsock = 0, init_mode = 0, window = 0;
+    (void)window;
     int i = 1;
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (!strcmp(argv[i], "-v")) g_verbose = 1;
@@ -32,13 +33,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--socket") && i + 1 < argc && nsock < 15) sockets[nsock++] = argv[++i];
         else if (!strcmp(argv[i], "--init")) init_mode = 1;
         else if (!strcmp(argv[i], "--window")) window = 1;
+        else if (!strcmp(argv[i], "--install") && i + 2 < argc) {        // unpack a mkrootfs-tar.py archive
+            int r = onirun_install_rootfs(argv[i + 1], argv[i + 2], NULL, NULL);
+            if (r) fprintf(stderr, "onirun: install failed: %s\n", strerror(-r));
+            return r ? 1 : 0;
+        }
         else break;
     }
     if ((i >= argc && !init_mode) || !root) {
         fprintf(stderr, "usage: onirun [-v] [--socket NAME]... --root ROOTFS /guest/program [args...]\n"
                         "       onirun [-v] --root ROOTFS --init          start the services in ROOTFS/oni/init.txt\n"
                         "  --socket NAME  create /dev/socket/NAME listening and pass it as ANDROID_SOCKET_NAME (like init)\n"
-                        "  --window       show the guest's screen in a window\n");
+                        "  --window       show the guest's screen in a window\n"
+                        "       onirun --install ROOTFS.tar DIR   unpack a rootfs archive (tools/mkrootfs-tar.py)\n");
         return 2;
     }
     // The guest environment: Android's defaults, plus classpath variables from the host
@@ -66,6 +73,14 @@ int main(int argc, char **argv) {
     sys_init(root);
     input_init();
     run.path = init_mode ? NULL : argv[i]; run.argv = argv + i; run.envp = envp; run.sockets = sockets;
-    if (window) display_main(run_guest, NULL);
-    else run_guest(NULL);
+#ifndef ONIRUN_LIB
+    if (window) display_main(run_guest, NULL);     // --window: the macOS viewer (display.m)
+    else
+#endif
+    run_guest(NULL);
+    return 0;
 }
+
+#ifndef ONIRUN_LIB
+int main(int argc, char **argv) { return onirun_main(argc, argv); }
+#endif
