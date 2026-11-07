@@ -179,6 +179,7 @@ typedef struct Proc {
     char cmdline[512];        // argv, NUL-separated, for /proc/<pid>/cmdline
     size_t cmdline_len;
     uint64_t stack_start;     // initial sp, reported as startstack in /proc/<pid>/stat
+    uint64_t arg_start, arg_end;   // the argv strings on the guest stack (/proc/<pid>/cmdline reads them live)
     mode_t umask;
     uint64_t sigact[65][4];   // Linux struct sigaction: handler, flags, restorer, mask
     volatile uint64_t pending;   // process-directed signals
@@ -256,6 +257,6 @@ static inline void *gptr(uint64_t a) { return a ? (void *)(uintptr_t)(tr_cur->ba
 static inline const char *gstr(uint64_t a) { return (const char *)gptr(a); }
 
 // ---- loader.c ----
-typedef struct ExecImage { uint64_t entry; uint64_t sp; } ExecImage;
+typedef struct ExecImage { uint64_t entry; uint64_t sp; uint64_t arg_start, arg_end; } ExecImage;
 int load_check(Proc *p, const char *guest_path);
 int load_exec(Proc *p, Mm *m, const char *guest_path, char *const argv[], char *const envp[], ExecImage *out);

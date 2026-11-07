@@ -306,6 +306,10 @@ static void put_stat(uint64_t addr, const struct stat *st, const char *gpath) {
     uint32_t mode = st->st_mode;
     uint32_t bmode = st->st_mode & 07777;
     if (bpf_attrs(gpath, &owner, &group, &bmode)) mode = (st->st_mode & S_IFMT) | (bmode & 07777);
+    if (gpath && !strncmp(gpath, "/proc/", 6) && gpath[6] >= '1' && gpath[6] <= '9') {   // /proc/<pid>/...: the process's owner (ps reads it)
+        Proc *t;
+        LOCKED(t = proc_find(atoi(gpath + 6)); if (t) { owner = t->euid; group = t->egid; });
+    }
     uint64_t rdev = (uint64_t)st->st_rdev;
     if (is_devnode(gpath) && S_ISREG(st->st_mode)) { mode = S_IFCHR | 0666; rdev = dev_rdev(gpath + 5); }   // placeholder files stand in for device nodes
     uint8_t b[128] = {0};

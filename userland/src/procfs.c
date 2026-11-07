@@ -293,7 +293,16 @@ static int proc_open(Proc *p, const char *path, int lflags) {
             fd_set_path(o->rd, path);
             return fd_install_obj(p, o->rd, o, lflags & 02000000);
         }
-        else if (!strcmp(rest, "/cmdline")) { memcpy(buf, t->cmdline, t->cmdline_len); n = (int)t->cmdline_len; }
+        else if (!strcmp(rest, "/cmdline")) {
+            // Like Linux, the argv area as the process left it: zygote's children rewrite argv[0]
+            // with the app's name (and clear the rest), which is how ps and pidof name them.
+            uint64_t len = t->arg_end > t->arg_start ? t->arg_end - t->arg_start : 0;
+            if (len && t->mm && len < sizeof buf) {
+                memcpy(buf, t->mm->base + t->arg_start, len);
+                while (len > 1 && !buf[len - 1] && !buf[len - 2]) len--;     // drop the cleared tail
+                n = (int)len;
+            } else { memcpy(buf, t->cmdline, t->cmdline_len); n = (int)t->cmdline_len; }
+        }
         else if (!strcmp(rest, "/comm")) n = snprintf(buf, sizeof buf, "%.15s\n", tname);
         else if (!strcmp(rest, "/exe")) return 1;        // resolved by readlink/stat elsewhere
         else if (!strcmp(rest, "/status")) {

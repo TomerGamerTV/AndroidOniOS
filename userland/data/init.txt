@@ -51,6 +51,8 @@ start zygote
 service artd /apex/com.android.art/bin/artd
   oneshot
 interface aidl/artd artd
+service oni-shell /system/bin/sh /oni/shell.sh
+start oni-shell
 service boot-tasks /system/bin/sh /oni/boot-tasks.sh
   oneshot
 start boot-tasks

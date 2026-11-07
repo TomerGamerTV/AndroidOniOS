@@ -165,6 +165,9 @@ int load_exec(Proc *proc, Mm *m, const char *guest_path, char *const argv[], cha
     uint64_t platform = PUSH_STR("aarch64");
     for (int i = envc - 1; i >= 0; i--) envpp[i] = PUSH_STR(envp[i]);
     for (int i = argc - 1; i >= 0; i--) argp[i] = PUSH_STR(argv[i]);
+    uint64_t argp0 = argc ? argp[0] : 0, argbytes = argc ? (uint64_t)(m->base + STACK_TOP - top) : 0;   // contiguous, argv[0] lowest
+    for (int i = 0; i < envc; i++) argbytes -= strlen(envp[i]) + 1;
+    argbytes -= strlen(guest_path) + 1 + sizeof "aarch64";
     top = (uint8_t *)((uintptr_t)top & ~15ul);
     top -= 16;
     arc4random_buf(top, 16);
@@ -189,5 +192,7 @@ int load_exec(Proc *proc, Mm *m, const char *guest_path, char *const argv[], cha
     free(envpp);
     img->entry = entry;
     img->sp = G(sp);
+    img->arg_start = argc ? argp0 : 0;
+    img->arg_end = argc ? argp0 + argbytes : 0;
     return 0;
 }

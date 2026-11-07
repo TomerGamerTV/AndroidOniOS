@@ -318,6 +318,7 @@ def main():
     shutil.copy(os.path.join(REPO, 'userland/data/android-properties.txt'), os.path.join(R, 'oni/properties.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/init.txt'), os.path.join(R, 'oni/init.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/boot-tasks.sh'), os.path.join(R, 'oni/boot-tasks.sh'))
+    shutil.copy(os.path.join(REPO, 'userland/data/shell.sh'), os.path.join(R, 'oni/shell.sh'))
     shutil.copy(os.path.join(REPO, 'userland/data/android-env.sh'), os.path.join(R, 'data/local/tmp/android-env.sh'))
 
     # 6. From a booted device: property areas and linker configs

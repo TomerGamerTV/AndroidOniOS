@@ -908,6 +908,8 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->gid = p->gid;
     q->euid = p->euid;
     q->egid = p->egid;
+    q->arg_start = p->arg_start;
+    q->arg_end = p->arg_end;
     memcpy(q->caps, p->caps, sizeof q->caps);
     memcpy(q->groups, p->groups, sizeof q->groups);
     q->ngroups = p->ngroups;
@@ -987,6 +989,8 @@ uint64_t proc_execve(GuestCtx *c, const char *gpath, uint64_t argv_g, uint64_t e
     snprintf(p->exe, sizeof p->exe, "%s", path);
     set_cmdline(p, argv);
     p->stack_start = img.sp;
+    p->arg_start = img.arg_start;
+    p->arg_end = img.arg_end;
     p->vfork_done = true;
     pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);
@@ -1179,6 +1183,8 @@ static Proc *spawn(const char *path, char **argv, char **envp, const char **sock
     snprintf(p->exe, sizeof p->exe, "%s", path);
     set_cmdline(p, argv);
     p->stack_start = img.sp;
+    p->arg_start = img.arg_start;
+    p->arg_end = img.arg_end;
     GuestCtx *c = calloc(1, sizeof *c);
     c->proc = p;
     c->base = (uint64_t)(uintptr_t)p->mm->base;
