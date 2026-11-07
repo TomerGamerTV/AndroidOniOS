@@ -562,6 +562,20 @@ void sys_dispatch(GuestCtx *c) {
             }
         }
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, !(a2 & 0100000), &hfd))) { r = ERR(-e); break; }
+        if (a2 & 020000000) {    // O_TMPFILE: an unnamed file in that directory (see linkat for naming it)
+            int fd = -1;
+            for (int i = 0; i < 100 && fd < 0; i++) {
+                char tmp[1100];
+                snprintf(tmp, sizeof tmp, "%s/.oni-tmpfile-%08x", path, arc4random());
+                fd = openat(hfd, tmp, (open_flags(a2) & ~O_DIRECTORY) | O_CREAT | O_EXCL, (int)(a3 & ~p->umask));
+                if (fd >= 0) unlinkat(hfd, tmp, 0);
+                else if (errno != EEXIST) break;
+            }
+            if (fd < 0) { r = ERR(lx_errno(errno)); break; }
+            int g = fd_install(p, fd, 0, a2 & 02000000);
+            r = g < 0 ? ERR(-g) : (uint64_t)g;
+            break;
+        }
         int fd = openat(hfd, path, open_flags(a2), (int)(a3 & ~p->umask));
         // cgroup attribute files (cgroup.procs, cpu.shares, ...) under a directory the guest made:
         // they exist on a real kernel the moment the directory does, so create them on first use.
@@ -1075,6 +1089,23 @@ void sys_dispatch(GuestCtx *c) {
         break;
     }
     case 37: {               // linkat
+        // linkat(AT_FDCWD, "/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW) names an O_TMPFILE file (tombstoned).
+        // shortcut: macOS can't link an unlinked inode, so the new name gets a copy of the contents;
+        // fine for write-then-link users, wrong if someone keeps writing through the fd afterwards.
+        if ((a4 & 0x400) && gstr(a1) && !strncmp(gstr(a1), "/proc/self/fd/", 14)) {
+            int src = fd_host(p, atoi(gstr(a1) + 14));
+            if (src < 0) { r = ERR(9); break; }
+            if ((e = resolve_at(p, (int)a2, gstr(a3), path2, sizeof path2, false, &hfd2))) { r = ERR(-e); break; }
+            int dst = openat(hfd2, path2, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (dst < 0) { r = ERR(lx_errno(errno)); break; }
+            char buf[65536];
+            off_t off = 0;
+            ssize_t n;
+            while ((n = pread(src, buf, sizeof buf, off)) > 0 && write(dst, buf, (size_t)n) == n) off += n;
+            r = n < 0 ? ERR(lx_errno(errno)) : 0;
+            close(dst);
+            break;
+        }
         if ((e = resolve_at(p, (int)a0, gstr(a1), path, sizeof path, false, &hfd)) ||
             (e = resolve_at(p, (int)a2, gstr(a3), path2, sizeof path2, false, &hfd2))) { r = ERR(-e); break; }
         r = HOSTRET(linkat(hfd, path, hfd2, path2, 0));

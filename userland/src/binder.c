@@ -48,10 +48,13 @@
 #define BR_DEAD_BINDER BR(15, 8)
 #define BR_CLEAR_DEATH_NOTIFICATION_DONE BR(16, 8)
 #define BR_FAILED_REPLY BR(17, 0)
+#define BR_FROZEN_BINDER BR(21, 16)
+#define BR_CLEAR_FREEZE_NOTIFICATION_DONE BR(22, 8)
 enum {   // BC_* by ioctl number ('c')
     BC_TRANSACTION, BC_REPLY, BC_ACQUIRE_RESULT, BC_FREE_BUFFER, BC_INCREFS, BC_ACQUIRE, BC_RELEASE, BC_DECREFS,
     BC_INCREFS_DONE, BC_ACQUIRE_DONE, BC_ATTEMPT_ACQUIRE, BC_REGISTER_LOOPER, BC_ENTER_LOOPER, BC_EXIT_LOOPER,
     BC_REQUEST_DEATH_NOTIFICATION, BC_CLEAR_DEATH_NOTIFICATION, BC_DEAD_BINDER_DONE, BC_TRANSACTION_SG, BC_REPLY_SG,
+    BC_REQUEST_FREEZE_NOTIFICATION, BC_CLEAR_FREEZE_NOTIFICATION, BC_FREEZE_NOTIFICATION_DONE,
 };
 enum { LOOPER_REGISTERED = 1, LOOPER_ENTERED = 2, LOOPER_EXITED = 4, LOOPER_INVALID = 8, LOOPER_WAITING = 16 };
 
@@ -93,7 +96,7 @@ struct BRef {
     BRef *next_in_proc, *next_in_node;
 };
 
-enum { W_TRANSACTION, W_REPLY, W_COMPLETE, W_NODE, W_DEAD_BINDER, W_CLEAR_DEATH_DONE, W_ERROR };
+enum { W_TRANSACTION, W_REPLY, W_COMPLETE, W_NODE, W_DEAD_BINDER, W_CLEAR_DEATH_DONE, W_ERROR, W_FROZEN, W_CLEAR_FREEZE_DONE };
 struct BWork {
     int kind;
     BTrans *t;
@@ -354,6 +357,7 @@ static BBuf *buf_find(BProc *p, uint64_t gaddr) {
     for (BBuf *b = p->bufs; b; b = b->next) if (!b->free && p->buf_gaddr + b->off == gaddr) return b;
     return NULL;
 }
+#define T_TARGET 0u           // not an object: the transaction's own strong ref on its target node
 static void buf_record(BBuf *b, uint32_t type, BNode *n, BRef *r, int fd) {
     b->objs = realloc(b->objs, (size_t)(b->nobjs + 1) * sizeof *b->objs);
     b->objs[b->nobjs].type = type;
@@ -368,7 +372,8 @@ static void buf_record(BBuf *b, uint32_t type, BNode *n, BRef *r, int fd) {
 static void buf_release_objs(BProc *p, BBuf *b, bool failed) {
     for (int i = 0; i < b->nobjs; i++) {
         uint32_t ty = b->objs[i].type;
-        if (ty == T_BINDER || ty == T_WEAK_BINDER) node_dec(b->objs[i].node, ty == T_BINDER, false);
+        if (ty == T_TARGET) node_dec(b->objs[i].node, true, false);
+        else if (ty == T_BINDER || ty == T_WEAK_BINDER) node_dec(b->objs[i].node, ty == T_BINDER, false);
         else if (ty == T_HANDLE || ty == T_WEAK_HANDLE) {
             BRef *r = b->objs[i].ref;
             // The ref may already be gone if userspace released it; look it up by node.
@@ -639,6 +644,10 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
         t->from_parent = th->stack;
         th->stack = t;
     }
+    // Like the driver, the transaction holds a strong ref on its target until the buffer is freed:
+    // a client that drops its proxy right after a oneway call must not let BR_RELEASE/BR_DECREFS
+    // reach the owner (which would free the object) before the call itself is delivered.
+    if (target_node) { node_inc(target_node, true, false); buf_record(b, T_TARGET, target_node, NULL, -1); }
     BWork *done = work_new(W_COMPLETE);
     queue_thread(th, done);
     BWork *w = work_new(W_TRANSACTION);
@@ -785,6 +794,19 @@ static int do_write(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_t s
                 }
             break;
         }
+        // Freeze notifications (advertised in /dev/binderfs/features/freeze_notification; libbinder's
+        // addFrozenStateChangeCallback fails without them). Processes are never frozen here, so a
+        // request is answered once with "not frozen" and nothing follows.
+        case BC_REQUEST_FREEZE_NOTIFICATION: case BC_CLEAR_FREEZE_NOTIFICATION: {
+            uint64_t cookie;
+            memcpy(&cookie, a + 4, 8);
+            BWork *w = work_new(IOC_NR(cmd) == BC_REQUEST_FREEZE_NOTIFICATION ? W_FROZEN : W_CLEAR_FREEZE_DONE);
+            w->cookie = cookie;
+            if (w->kind == W_FROZEN) queue_proc(p, w); else queue_thread(th, w);
+            break;
+        }
+        case BC_FREEZE_NOTIFICATION_DONE:
+            break;
         case BC_ACQUIRE_RESULT: case BC_ATTEMPT_ACQUIRE:
             return -EINVAL;
         default:
@@ -826,8 +848,9 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
     for (;;) {
         bool proc_work = can_take_proc_work(th);
         BWork *w = NULL;
-        if (th->todo.head) w = work_pop(&th->todo);
-        else if (proc_work && p->todo.head) w = work_pop(&p->todo);
+        WorkList *src = NULL;
+        if (th->todo.head) w = work_pop(src = &th->todo);
+        else if (proc_work && p->todo.head) w = work_pop(src = &p->todo);
         if (!w) {
             if (pos > start) break;                           // delivered something already
             if (nonblock) break;
@@ -848,6 +871,10 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             if (c->kill) { *consumed = pos; return -EINTR; }
             continue;
         }
+        if (w->kind != W_TRANSACTION && w->kind != W_REPLY && w->kind != W_NODE && pos + 4 + 16 > size) {
+            work_push_front(src, w);   // no room: the next read gets it
+            break;
+        }
         switch (w->kind) {
         case W_TRANSACTION: case W_REPLY: {
             BTrans *t = w->t;
@@ -860,7 +887,7 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             }
             uint32_t cmd = w->kind == W_REPLY ? BR_REPLY : t->has_secctx ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION;
             uint64_t need = 4 + IOC_SIZE(cmd);
-            if (pos + need > size) { work_push_front(&th->todo, w); goto out; }   // leave it for the next read
+            if (pos + need > size) { work_push_front(src, w); goto out; }   // leave it for the next read
             if (w->kind == W_TRANSACTION && t->need_reply) {
                 t->to_thread = th;
                 t->to_parent = th->stack;
@@ -882,6 +909,8 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
         case W_ERROR: PUT32(w->error); free(w); break;
         case W_DEAD_BINDER: PUT32(BR_DEAD_BINDER); PUT(&w->cookie, 8); free(w); break;
         case W_CLEAR_DEATH_DONE: PUT32(BR_CLEAR_DEATH_NOTIFICATION_DONE); PUT(&w->cookie, 8); free(w); break;
+        case W_FROZEN: { uint64_t info[2] = { w->cookie, 0 }; PUT32(BR_FROZEN_BINDER); PUT(info, 16); free(w); break; }   // is_frozen = 0
+        case W_CLEAR_FREEZE_DONE: PUT32(BR_CLEAR_FREEZE_NOTIFICATION_DONE); PUT(&w->cookie, 8); free(w); break;
         case W_NODE: {
             BNode *n = w->node;
             n->queued = false;

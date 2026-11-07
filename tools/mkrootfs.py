@@ -153,7 +153,8 @@ def main():
                         continue
             mounts.append((name, ver, f'/{src}/{f}'))
             entries.append(f'  <apex-info moduleName="{name}" modulePath="/{src}/{f}" preinstalledModulePath="/{src}/{f}" '
-                           f'versionCode="{ver}" versionName="" isFactory="true" isActive="true" provideSharedApexLibs="false" partition="{part}"/>')
+                           f'versionCode="{ver}" versionName="" isFactory="true" isActive="true" provideSharedApexLibs="false" partition="{part}" '
+                           f'lastUpdateMillis="{int(os.stat(path).st_mtime * 1000)}"/>')    # odrefresh asserts it is present
     with open(os.path.join(R, 'apex/apex-info-list.xml'), 'w') as f:
         f.write('<?xml version="1.0" encoding="utf-8"?>\n<apex-info-list>\n' + '\n'.join(entries) + '\n</apex-info-list>\n')
     # apexd learns what is active from /proc/mounts (one loop device per APEX, onirun generates the
@@ -300,6 +301,8 @@ def main():
     for n in ('binder', 'hwbinder', 'vndbinder', 'ashmem', 'ashmem' + boot_id, 'kmsg', 'null', 'zero', 'urandom', 'random',
               'binderfs/binder', 'binderfs/hwbinder', 'binderfs/vndbinder', 'goldfish_pipe', 'goldfish_pipe_dprctd', 'qemu_pipe', 'tun'):
         open(os.path.join(R, 'dev', n), 'a').close()
+    os.makedirs(os.path.join(R, 'dev/binderfs/features'), exist_ok=True)
+    open(os.path.join(R, 'dev/binderfs/features/freeze_notification'), 'w').write('1\n')   # binder.c implements it
 
     # 5. SELinux tree, properties defaults, service table, environment
     run(os.path.join(HERE, 'mkselinuxfs.py'), os.path.join(REPO, 'userland/data/selinux-classes.txt'), R)
@@ -312,6 +315,7 @@ def main():
         open(os.path.join(R, 'sys/devices/system/cpu', name), 'w').write(f'0-{cpus - 1}\n')
     shutil.copy(os.path.join(REPO, 'userland/data/android-properties.txt'), os.path.join(R, 'oni/properties.txt'))
     shutil.copy(os.path.join(REPO, 'userland/data/init.txt'), os.path.join(R, 'oni/init.txt'))
+    shutil.copy(os.path.join(REPO, 'userland/data/dexopt.sh'), os.path.join(R, 'oni/dexopt.sh'))
     shutil.copy(os.path.join(REPO, 'userland/data/android-env.sh'), os.path.join(R, 'data/local/tmp/android-env.sh'))
 
     # 6. From a booted device: property areas and linker configs

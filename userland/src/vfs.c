@@ -470,6 +470,7 @@ int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event) {
     default: r = -EINVAL;
     }
     pthread_mutex_unlock(&o->lock);
+    if (r && op != 1 && getenv("ONIRUN_FAULTS")) fprintf(stderr, "onirun: [%d] epoll_ctl(%d, op %d, fd %d): %lld\n", c->proc->pid, epfd, op, fd, (long long)r);
     return r;
 }
 

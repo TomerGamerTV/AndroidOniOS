@@ -11,4 +11,9 @@ export ANDROID_EMU_VK_ICD=moltenvk ANDROID_EMU_VK_LOADER_PATH="$FW/MoltenVK.fram
 export DYLD_LIBRARY_PATH="$LIB" DYLD_FRAMEWORK_PATH="$FW" ANGLE_DEFAULT_PLATFORM=metal
 export RUTABAGA_DISPLAY_WIDTH="${WIDTH:-1080}" RUTABAGA_DISPLAY_HEIGHT="${HEIGHT:-2400}"
 set -a; . "$ROOT/userland/data/android-env.sh"; set +a
-exec "$ROOT/build/userland/onirun" --root "$ROOT/build/userland/rootfs" --init "$@"
+RFS="$ROOT/build/userland/rootfs"
+# The image ships no boot image; odrefresh compiles it (and system_server's jars) once into /data.
+# Without it every boot builds an uncompiled one in memory and the framework runs ~4x slower.
+[ -e "$RFS/data/misc/apexdata/com.android.art/dalvik-cache/arm64/boot.art" ] ||
+    "$ROOT/build/userland/onirun" --root "$RFS" /apex/com.android.art/bin/odrefresh --compile
+exec "$ROOT/build/userland/onirun" --root "$RFS" --init "$@"

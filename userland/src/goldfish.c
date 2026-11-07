@@ -70,7 +70,8 @@ static int64_t gp_write(FdObj *o, GuestCtx *c, const void *buf, size_t n, bool n
             const char *name = (const char *)g->in;
             if (strncmp(name, "pipe:", 5)) { pthread_mutex_unlock(&o->lock); return -EINVAL; }
             name += 5;
-            if (strcmp(name, "qemud:sensors") && strcmp(name, "qemud:gps")) {   // others: connect fails (gps: no fixes ever arrive)
+            // gps and fingerprintlisten: accepted, but no fix or touch ever arrives; others: connect fails
+            if (strcmp(name, "qemud:sensors") && strcmp(name, "qemud:gps") && strcmp(name, "qemud:fingerprintlisten")) {
                 LOGV("onirun: goldfish pipe: no service %s\n", name);
                 g->inlen = 0;
                 pthread_mutex_unlock(&o->lock);

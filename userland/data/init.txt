@@ -12,15 +12,18 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-s
   socket zygote
   socket usap_pool_primary
 
-# aconfig flag storage (/metadata/aconfig): the framework reads flags from the files these write
+# aconfig flag storage (/metadata/aconfig): the framework reads flags from the files these write;
+# the socket services answer one round of requests and exit (oneshot in aconfigd.rc too)
 service aconfigd-init /system/bin/aconfigd-system platform-init
   oneshot
 service aconfigd-mainline-init /apex/com.android.configinfrastructure/bin/aconfigd-mainline init
   oneshot
 service aconfigd /system/bin/aconfigd-system start-socket
   socket aconfigd_system
+  oneshot
 service aconfigd-mainline /apex/com.android.configinfrastructure/bin/aconfigd-mainline start-socket
   socket aconfigd_mainline
+  oneshot
 # stand-ins for daemons the host can't run (userland/stubs/stubsvc.c)
 service stubs /system/bin/onistub netd=android.net.INetd dnsresolver=android.net.IDnsResolver+android.net.resolv.unstable.IDnsResolverUnstable@17:b dnsresolver_unstable=android.net.resolv.unstable.IDnsResolverUnstable vold=android.os.IVold
 service idmap2d /system/bin/idmap2d
@@ -43,6 +46,14 @@ start tombstoned
 start keystore2
 start installd
 start zygote
+
+# dexopt: artd is started on demand; the job compiles the apps once (userland/data/dexopt.sh)
+service artd /apex/com.android.art/bin/artd
+  oneshot
+interface aidl/artd artd
+service dexopt /system/bin/sh /oni/dexopt.sh
+  oneshot
+start dexopt
 
 # HALs the emulator image provides in software
 service keymint /vendor/bin/hw/android.hardware.security.keymint-service
@@ -96,3 +107,25 @@ service bootanim /system/bin/bootanimation
 start allocator
 start hwcomposer
 start surfaceflinger
+
+# media, camera and storage daemons system_server waits for
+service mediaserver /system/bin/mediaserver
+service mediaextractor /system/bin/mediaextractor
+service mediametrics /system/bin/mediametrics
+service cameraserver /system/bin/cameraserver
+service camera-provider /vendor/bin/hw/android.hardware.camera.provider.ranchu
+service storaged /system/bin/storaged
+start mediametrics
+start mediaserver
+start mediaextractor
+start camera-provider
+start cameraserver
+start storaged
+
+# lazy HALs: servicemanager asks for them by interface (ctl.interface_start) when someone waits
+service mediaswcodec /apex/com.android.media.swcodec/bin/mediaswcodec
+interface aidl/android.hardware.media.c2.IComponentStore/software mediaswcodec
+service fingerprint /vendor/bin/hw/android.hardware.biometrics.fingerprint-service.ranchu
+interface aidl/android.hardware.biometrics.fingerprint.IFingerprint/default fingerprint
+service wifi-hal /vendor/bin/hw/android.hardware.wifi-service
+interface aidl/android.hardware.wifi.IWifi/default wifi-hal
