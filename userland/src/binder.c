@@ -126,6 +126,7 @@ struct BTrans {
     BNode *target;
     uint32_t code, flags;
     int sender_pid;
+    uint32_t sender_euid;     // taken when sent, like the driver (the sender may be gone by delivery)
     BBuf *buf;
     uint64_t data_size, offsets_size, secctx_off;
     bool need_reply, is_reply, has_secctx;
@@ -476,6 +477,7 @@ static void transact(GuestCtx *c, BProc *p, BThread *th, const uint8_t *trd, boo
     t->code = tr.code;
     t->flags = tr.flags;
     t->sender_pid = (tr.flags & TF_ONE_WAY) ? 0 : p->pid;
+    t->sender_euid = p->proc ? p->proc->euid : 0;
     t->target = target_node;
     t->need_reply = !reply && !(tr.flags & TF_ONE_WAY);
     if (t->need_reply) t->from = th;
@@ -830,7 +832,7 @@ static void put_tdata(BTrans *t, BProc *p, TData *tr) {
     tr->code = t->code;
     tr->flags = t->flags;
     tr->sender_pid = t->sender_pid;
-    tr->sender_euid = t->from_proc ? t->from_proc->proc->euid : 0;
+    tr->sender_euid = t->sender_euid;
     tr->data_size = t->data_size;
     tr->offsets_size = t->offsets_size;
     tr->buffer = p->buf_gaddr + t->buf->off;
@@ -1082,6 +1084,9 @@ static void binder_release(FdObj *o) {
     for (BProc *q = all_bprocs; q; q = q->next_all) {
         for (BWork *w = q->todo.head; w; w = w->next)
             if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t) { if (w->t->from_proc == p) w->t->from_proc = NULL; if (w->t->to_proc == p) w->t->to_proc = NULL; }
+        for (BNode *n = q->nodes; n; n = n->next)            // oneway calls waiting their turn on a node
+            for (BWork *w = ((WorkList *)&n->async_todo)->head; w; w = w->next)
+                if (w->t && w->t->from_proc == p) w->t->from_proc = NULL;
         for (BThread *o = q->threads; o; o = o->next) {
             for (BWork *w = o->todo.head; w; w = w->next)
                 if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t) { if (w->t->from_proc == p) w->t->from_proc = NULL; if (w->t->to_proc == p) w->t->to_proc = NULL; }
