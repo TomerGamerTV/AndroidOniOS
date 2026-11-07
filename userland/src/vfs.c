@@ -475,13 +475,13 @@ int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event) {
     return r;
 }
 
-// Linux drops an epoll registration when the registered file is closed, not when some other fd
-// with the same number is: copies of the table (fork, or debuggerd's pseudothread, which closes
-// every fd in its private table) dup the host fds, so the entry's host fd tells them apart.
+// Linux drops an epoll registration when the registered file is closed for good, not when some
+// other table's copy of the fd is (fork, or debuggerd's pseudothread, which closes every fd in its
+// private table): copies share the host fd, which only closes with its last reference.
 void vfs_fd_closed(Proc *p, int gfd) {
     if (!p->nepoll) return;
     int closing = fd_host(p, gfd);
-    if (closing < 0) return;
+    if (closing < 0 || fd_host_refs(closing) > 1) return;   // the file stays open in another table
     for (int i = 0; i < MAX_FDS; i++) {
         int h = p->fd[i].host;
         FdObj *o = h >= 0 ? fd_obj(h) : NULL;

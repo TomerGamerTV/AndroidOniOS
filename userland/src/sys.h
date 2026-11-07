@@ -111,6 +111,7 @@ int64_t vfs_timerfd_gettime(GuestCtx *c, int gfd, uint64_t curv);
 int64_t vfs_epoll_create(GuestCtx *c, int lflags);
 int64_t vfs_epoll_ctl(GuestCtx *c, int epfd, int op, int fd, uint64_t event);
 int64_t vfs_epoll_wait(GuestCtx *c, int epfd, uint64_t events, int maxevents, int64_t timeout_ms, uint64_t sigmask);
+int  fd_host_refs(int host);                               // guest fd-table entries sharing a host fd
 void vfs_fd_closed(struct Proc *p, int gfd);               // drops the fd from the process's epoll sets
 int  host_tmpfile(void);                                   // unlinked temporary file
 

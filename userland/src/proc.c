@@ -45,7 +45,11 @@ void post_signal_locked(Proc *p, GuestCtx *t, int sig);
 
 // ---- host fd metadata (indexed by host fd) ----
 #define HOST_FDS 16384
-typedef struct HostFd { char *path; FdObj *obj; } HostFd;   // guest path (for /proc/self/fd/N), object
+// Guest fd-table entries share host fds the way Linux processes share open files after fork:
+// refs counts the entries naming a host fd, which is closed when the last one goes. (Copying them
+// with dup() made every app process hold its own copy of everything zygote had open, and Android
+// ran into the host's per-process fd limit.)
+typedef struct HostFd { char *path; FdObj *obj; int refs; } HostFd;   // guest path (for /proc/self/fd/N), object
 static HostFd hfd[HOST_FDS];
 uint32_t g_uid = 2000;
 
@@ -78,8 +82,12 @@ static void copy_meta_locked(int from, int to) {
     attach_locked(to, hfd[from].obj);
 }
 
+static void host_ref_locked(int h) { if (h >= 0 && h < HOST_FDS) hfd[h].refs++; }
+int fd_host_refs(int h) { int r; LOCKED(r = h >= 0 && h < HOST_FDS ? hfd[h].refs : 0); return r; }
 static void host_close_locked(int h) {
     if (h < 0) return;
+    if (h < HOST_FDS && hfd[h].refs > 1) { hfd[h].refs--; return; }   // still in another table
+    if (h < HOST_FDS) hfd[h].refs = 0;
     dir_forget(h);
     set_path_locked(h, NULL);
     if (h < HOST_FDS && hfd[h].obj) { FdObj *o = hfd[h].obj; hfd[h].obj = NULL; obj_put_deferred(o); }   // g_lock is held
@@ -105,7 +113,7 @@ static void fdtrace(Proc *p, const char *what, int g, int host) {
 }
 static int fd_install_locked(Proc *p, int host, int min, bool cloexec) {
     for (int g = min < 0 ? 0 : min; g < MAX_FDS; g++)
-        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec, 0, 0, 0 }; fdtrace(p, "open", g, host); return g; }
+        if (p->fd[g].host < 0) { p->fd[g] = (FdEnt){ host, cloexec, 0, 0, 0 }; host_ref_locked(host); fdtrace(p, "open", g, host); return g; }
     fprintf(stderr, "onirun: pid %d: guest fd table full\n", p->pid);
     host_close_locked(host);
     return -EMFILE;
@@ -164,6 +172,7 @@ int fd_dup(Proc *p, int old, int target, bool exact, bool cloexec) {
     if (exact) {
         if (p->fd[target].host >= 0) { fdtrace(p, "dup-over", target, p->fd[target].host); note_closer(p, target, 'd'); host_close_locked(p->fd[target].host); }
         p->fd[target] = (FdEnt){ nh, cloexec, 0, 0, 0 };
+        host_ref_locked(nh);
         fdtrace(p, "dup-to", target, nh);
         r = target;
     } else {
@@ -815,9 +824,8 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
             mm_get(sh->mm);
             for (int i = 0; i < MAX_FDS; i++) {
                 if (p->fd[i].host < 0) continue;
-                int h = dup(p->fd[i].host);
-                sh->fd[i].host = h;
-                if (h >= 0) copy_meta_locked(p->fd[i].host, h);
+                sh->fd[i].host = p->fd[i].host;     // shared, as after fork
+                host_ref_locked(p->fd[i].host);
             }
             nc->proc = sh;
             p = sh;
@@ -868,13 +876,8 @@ uint64_t proc_clone(GuestCtx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
     q->exit_signal = (int)(flags & 0xff);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fd[i].host < 0) continue;
-        int h = dup(p->fd[i].host);
-        if (h < 0) {                       // the child would silently lack this fd (fdsan then aborts on reuse)
-            fprintf(stderr, "onirun: fork of pid %d: cannot copy fd %d (host fd %d): %s\n", p->pid, i, p->fd[i].host, strerror(errno));
-            continue;
-        }
-        copy_meta_locked(p->fd[i].host, h);
-        q->fd[i] = (FdEnt){ h, p->fd[i].cloexec };
+        q->fd[i] = (FdEnt){ p->fd[i].host, p->fd[i].cloexec };   // the child shares the open file
+        host_ref_locked(p->fd[i].host);
     }
     nc->proc = q;
     nc->tid = (uint64_t)q->pid;
@@ -1100,6 +1103,7 @@ static Proc *spawn(const char *path, char **argv, char **envp, const char **sock
     p->fd[0].host = open("/dev/null", O_RDONLY | O_CLOEXEC);
     p->fd[1].host = dup(1);
     p->fd[2].host = dup(2);
+    for (int i = 0; i < 3; i++) host_ref_locked(p->fd[i].host);
     for (int i = 0; i < 3; i++) fd_set_path(p->fd[i].host, "/dev/null");
     // Sockets init would have created for a service (zygote's, for example): listening, bound in
     // the guest namespace, and announced as ANDROID_SOCKET_<name>=<fd>.

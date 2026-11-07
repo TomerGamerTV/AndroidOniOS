@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <os/os_sync_wait_on_address.h>
 
 #include "sys.h"
 
@@ -138,7 +139,7 @@ struct BThread {
     int looper;
     BTrans *stack;
     WorkList todo;
-    int wake_rd, wake_wr;
+    uint32_t wake_seq;        // bumped to wake the thread, which waits on its address (no fds per thread)
     bool waiting_proc;
     BThread *next;
 };
@@ -196,8 +197,8 @@ static bool proc_has_work(BProc *p) {
 }
 
 static void thread_wake(BThread *t) {
-    // Non-blocking: a full pipe already means a wake is pending, and blocking here would hold blk.
-    if (t->wake_wr >= 0) { char b = 0x7d; (void)!write(t->wake_wr, &b, 1); }
+    __atomic_fetch_add(&t->wake_seq, 1, __ATOMIC_SEQ_CST);
+    os_sync_wake_by_address_all(&t->wake_seq, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
 }
 
 // Something changed in p's queues: wake a thread that waits for process work and update the fd.
@@ -391,12 +392,6 @@ static BThread *thread_get(BProc *p, uint64_t tid) {
     BThread *t = calloc(1, sizeof *t);
     t->proc = p;
     t->tid = tid;
-    int pf[2];
-    if (pipe(pf) == 0) {
-        t->wake_rd = pf[0]; t->wake_wr = pf[1];
-        for (int i = 0; i < 2; i++) { fcntl(pf[i], F_SETFD, FD_CLOEXEC); fcntl(pf[i], F_SETFL, O_NONBLOCK); }
-    }
-    else t->wake_rd = t->wake_wr = -1;
     t->next = p->threads;
     p->threads = t;
     return t;
@@ -424,8 +419,6 @@ static void thread_free(BProc *p, BThread *t) {
             for (BWork *w = o->todo.head; w; w = w->next) if ((w->kind == W_TRANSACTION || w->kind == W_REPLY) && w->t && w->t->from == t) w->t->from = NULL;
     }
     for (BWork *w; (w = work_pop(&t->todo));) free(w);
-    if (t->wake_rd >= 0) close(t->wake_rd);
-    if (t->wake_wr >= 0) close(t->wake_wr);
     free(t);
 }
 
@@ -865,15 +858,14 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             th->waiting_proc = proc_work;
             if (proc_work) p->ready_threads++;
             th->looper |= LOOPER_WAITING;
+            uint32_t seq = __atomic_load_n(&th->wake_seq, __ATOMIC_SEQ_CST);   // wakes after this are seen
             pthread_mutex_unlock(&blk);
-            struct pollfd pf = { th->wake_rd, POLLIN, 0 };
-            int r = poll(&pf, 1, -1);
+            int r = os_sync_wait_on_address(&th->wake_seq, seq, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE);
+            if (r < 0 && errno != EINTR) r = 0;                // only a signal (the kick) interrupts
             BLK_LOCK(__func__);
             th->looper &= ~LOOPER_WAITING;
             if (th->waiting_proc) p->ready_threads--;
             th->waiting_proc = false;
-            char junk[64];
-            while (read(th->wake_rd, junk, sizeof junk) > 0) {}      // drain every pending wake
             if (r < 0) { *consumed = pos; return -EINTR; }
             if (c->kill) { *consumed = pos; return -EINTR; }
             proc_work = can_take_proc_work(th);
