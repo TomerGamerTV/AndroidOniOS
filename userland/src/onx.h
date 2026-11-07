@@ -85,6 +85,7 @@ extern __thread GuestCtx *tr_cur;
 
 // syscall.c / proc.c
 void sys_init(const char *rootfs);
+void display_main(void (*fn)(void *), void *arg);   // display.m: --window; runs fn on a thread, AppKit on this one
 __attribute__((noreturn)) void sys_main(const char *path, char **argv, char **envp, const char **sockets);   // path NULL: init mode
 void sys_dispatch(GuestCtx *c);
 void sys_deliver_signals(GuestCtx *c);          // may not return (thread leaves)

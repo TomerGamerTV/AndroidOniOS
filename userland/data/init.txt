@@ -104,6 +104,7 @@ service allocator /vendor/bin/hw/android.hardware.graphics.allocator-service.min
 service hwcomposer /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu
 service surfaceflinger /system/bin/surfaceflinger
 service bootanim /system/bin/bootanimation
+  oneshot
 start allocator
 start hwcomposer
 start surfaceflinger

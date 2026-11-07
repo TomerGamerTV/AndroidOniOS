@@ -337,7 +337,13 @@ static void present_locked(GpuRes *r, uint32_t w, uint32_t h) {
     struct iovec iov = { G.frame, (size_t)G.width * G.height * 4 };
     int32_t rc = rutabaga_resource_transfer_read(G.r, 0, r->res_id, &t, &iov);
     G.frames++;
-    if (rc) LOGV("onirun: present: transfer_read of res %u failed: %d\n", r->res_id, rc);
+    static int faults = -1;
+    if (faults < 0) faults = getenv("ONIRUN_FAULTS") != NULL;
+    if (rc && (g_verbose || faults)) fprintf(stderr, "onirun: present: transfer_read of res %u (blob_mem %u) failed: %d\n", r->res_id, r->blob_mem, rc);
+    static uint32_t last_res;
+    if (faults && r->res_id != last_res) fprintf(stderr, "onirun: frame %llu now from res %u (blob_mem %u, %ux%u, rc %d)\n", (unsigned long long)G.frames, r->res_id, r->blob_mem, w, h, rc);
+    last_res = r->res_id;
+    if (faults && (G.frames == 1 || G.frames % 300 == 0)) fprintf(stderr, "onirun: frame %llu (%ux%u, res %u)\n", (unsigned long long)G.frames, w, h, r->res_id);
     if (G.frames == 1 || G.frames % 60 == 0) LOGV("onirun: frame %llu (%ux%u, res %u)\n", (unsigned long long)G.frames, w, h, r->res_id);
     if (G.frames_dir && (G.frames <= 3 || G.frames % 120 == 0)) {
         char path[512];
@@ -350,6 +356,25 @@ static void present_locked(GpuRes *r, uint32_t w, uint32_t h) {
             fclose(fp);
         }
     }
+}
+
+// For the --window display (display.m): the last presented frame (RGBX, width*4 stride). With dst
+// NULL only the size and the frame sequence number are returned.
+bool gpu_frame_copy(uint8_t *dst, size_t cap, uint32_t *w, uint32_t *h, uint64_t *seq) {
+    LOCK();
+    bool ok = G.frame != NULL;
+    if (ok) {
+        *w = G.width; *h = G.height; *seq = G.frames;
+        size_t n = (size_t)G.width * G.height * 4;
+        if (dst) { if (cap >= n) memcpy(dst, G.frame, n); else ok = false; }
+    }
+    UNLOCK();
+    return ok;
+}
+void gpu_display_size(uint32_t *w, uint32_t *h) {
+    const char *ew = getenv("RUTABAGA_DISPLAY_WIDTH"), *eh = getenv("RUTABAGA_DISPLAY_HEIGHT");
+    if (ew) *w = (uint32_t)atoi(ew);
+    if (eh) *h = (uint32_t)atoi(eh);
 }
 
 // ---- KMS object model ----

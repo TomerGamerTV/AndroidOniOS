@@ -299,7 +299,9 @@ def main():
     # 4. Device-node placeholders (onirun intercepts opens; stat() sees character devices)
     boot_id = '0f3a6d9e-7c1b-4b2a-9d6e-0a1b2c3d4e5f'   # must match procfs.c
     for n in ('binder', 'hwbinder', 'vndbinder', 'ashmem', 'ashmem' + boot_id, 'kmsg', 'null', 'zero', 'urandom', 'random',
-              'binderfs/binder', 'binderfs/hwbinder', 'binderfs/vndbinder', 'goldfish_pipe', 'goldfish_pipe_dprctd', 'qemu_pipe', 'tun'):
+              'binderfs/binder', 'binderfs/hwbinder', 'binderfs/vndbinder', 'goldfish_pipe', 'goldfish_pipe_dprctd', 'qemu_pipe', 'tun',
+              'input/event0'):
+        os.makedirs(os.path.dirname(os.path.join(R, 'dev', n)), exist_ok=True)
         open(os.path.join(R, 'dev', n), 'a').close()
     os.makedirs(os.path.join(R, 'dev/binderfs/features'), exist_ok=True)
     open(os.path.join(R, 'dev/binderfs/features/freeze_notification'), 'w').write('1\n')   # binder.c implements it

@@ -241,7 +241,7 @@ static bool shell_owned(const char *gpath) {
 static bool is_devnode(const char *gpath) {
     return gpath && !strncmp(gpath, "/dev/", 5) && strncmp(gpath, "/dev/__properties__", 19) &&
            strncmp(gpath, "/dev/socket", 11) && !strchr(gpath + 5, '/') ? true :
-           gpath && (!strncmp(gpath, "/dev/binderfs/", 14) || !strncmp(gpath, "/dev/dri/", 9));
+           gpath && (!strncmp(gpath, "/dev/binderfs/", 14) || !strncmp(gpath, "/dev/dri/", 9) || !strncmp(gpath, "/dev/input/", 11));
 }
 
 // Pinned BPF objects carry the owner and mode netbpfload would have given them (mkbpffs.py stores
