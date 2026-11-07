@@ -200,6 +200,7 @@ struct SettingsView: View {
     @ObservedObject var state: AppState
     @State private var s = VMSettings.current
     @State private var confirmReset = false
+    @State private var adb = ADBRelay.shared.enabled
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -222,6 +223,12 @@ struct SettingsView: View {
                 Section(footer: Text("Saves Android when you leave the app, so it opens where you left off instead of starting again. Each save writes about as much as Android's memory size to storage.")) {
                     Toggle("Quick resume", isOn: $s.saveState)
                 }
+                Section(footer: Text(adb
+                    ? "On your computer: adb connect \(ADBRelay.addresses().first ?? "<iPhone IP>"):\(ADBRelay.port). Android asks once to allow it. Anyone on this network can try to connect, so turn it off when you're done."
+                    : "Lets adb on a computer on the same Wi-Fi network reach Android.")) {
+                    Toggle("ADB over Wi-Fi", isOn: $adb)
+                        .onChange(of: adb) { _, on in ADBRelay.shared.enabled = on }
+                }
                 Section("Status") {
                     LabeledContent("Engine", value: VMSettings.current.native ? "Native (onirun)" : "Virtual machine (QEMU)")
                     LabeledContent("Acceleration", value: state.jitEnabled ? "JIT" : "Interpreter (TCTI)")
@@ -236,8 +243,7 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
-                        let screen = UIScreen.main.nativeBounds.size
-                        s.height = Int((Double(s.width) * Double(screen.height) / Double(screen.width)).rounded() / 2) * 2
+                        s.height = VMSettings.height(forWidth: s.width)
                         s.save()
                         dismiss()
                     }

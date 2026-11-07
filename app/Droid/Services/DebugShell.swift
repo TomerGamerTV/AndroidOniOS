@@ -19,6 +19,7 @@ final class DebugShell {
             l.start(queue: .global(qos: .utility))
             listener = l
             Log.info("debug shell listening on :4445")
+            startFileChannel()
         } catch {
             Log.info("debug shell: \(error)")
         }
@@ -43,5 +44,53 @@ final class DebugShell {
             }
         }
         read()
+    }
+
+    /// The same, through files (works whenever `devicectl device copy` does, no networking):
+    /// write Library/Android/debug-cmd, read debug-cmd.out once it appears. A line starting with
+    /// "monitor " goes to QEMU's monitor (when debug.json enables it on port 4444) instead.
+    private func startFileChannel() {
+        let cmdURL = Paths.android.appendingPathComponent("debug-cmd")
+        let outURL = Paths.android.appendingPathComponent("debug-cmd.out")
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler {
+            guard let cmd = try? String(contentsOf: cmdURL, encoding: .utf8) else { return }
+            try? FileManager.default.removeItem(at: cmdURL)
+            var out = ""
+            for line in cmd.split(separator: "\n").map(String.init) where !line.isEmpty {
+                if line.hasPrefix("monitor ") { out += Self.monitor(String(line.dropFirst(8))) }
+                else { do { out += try ADBClient.shared.shell(line) } catch { out += "error: \(error)\n" } }
+            }
+            try? out.write(to: outURL, atomically: true, encoding: .utf8)
+        }
+        timer.resume()
+        fileTimer = timer
+    }
+    private var fileTimer: DispatchSourceTimer?
+
+    /// One QEMU monitor command over 127.0.0.1:4444; returns what QEMU printed.
+    static func monitor(_ cmd: String) -> String {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return "monitor: socket failed\n" }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(4444).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard ok == 0 else { return "monitor: not listening (debug.json extraArgs -monitor tcp:...:4444)\n" }
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let line = cmd + "\n"
+        _ = line.withCString { write(fd, $0, strlen($0)) }
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n <= 0 { break }
+            data.append(buf, count: n)
+        }
+        return String(decoding: data, as: UTF8.self)
     }
 }

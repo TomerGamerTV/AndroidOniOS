@@ -17,19 +17,46 @@ struct VMSettings {
     var engine: String
     var native: Bool { engine == "native" }
 
+    /// The part of the screen Android gets, in portrait points: everything inside iOS's safe area,
+    /// so the Dynamic Island, rounded corners and home indicator never cover Android's status and
+    /// navigation bars. Works out per device.
+    static var screenArea: CGSize {
+        let b = UIScreen.main.bounds.size
+        let w = min(b.width, b.height), h = max(b.width, b.height)
+        let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }.first { $0.isKeyWindow }
+        var inset = window.map { $0.safeAreaInsets.top + $0.safeAreaInsets.bottom } ?? 0
+        if inset == 0 && h / w > 2 { inset = 59 + 34 }   // before the window exists: Face ID iPhones
+        return CGSize(width: w, height: h - inset)
+    }
+
+    /// Android pixels tall for a given width, matching the screen area's shape.
+    static func height(forWidth width: Int) -> Int {
+        let a = screenArea
+        return Int((Double(width) * Double(a.height) / Double(a.width) / 2).rounded()) * 2
+    }
+
+    /// Density that makes Android's sizes match iOS points (160 dpi = 1 dp per point).
+    static func density(forWidth width: Int) -> Int {
+        Int((160 * Double(width) / Double(screenArea.width) / 10).rounded()) * 10
+    }
+
     static var current: VMSettings {
         let d = UserDefaults.standard
-        let screen = UIScreen.main.nativeBounds.size // portrait pixels
+        if !d.bool(forKey: "layoutV2") {          // sizes are derived now; drop ones saved by older versions
+            d.removeObject(forKey: "height")
+            d.removeObject(forKey: "density")
+            d.set(true, forKey: "layoutV2")
+        }
         let defW = 1080
-        let defH = Int((Double(defW) * Double(screen.height) / Double(screen.width)).rounded() / 2) * 2
         let mem = ProcessInfo.processInfo.physicalMemory
         let defMem = mem >= 11 << 30 ? 4096 : (mem >= 7 << 30 ? 3072 : 2048)
         return VMSettings(
             memoryMB: d.object(forKey: "memoryMB") as? Int ?? defMem,
             cpus: d.object(forKey: "cpus") as? Int ?? min(ProcessInfo.processInfo.activeProcessorCount, 4),
             width: d.object(forKey: "width") as? Int ?? defW,
-            height: d.object(forKey: "height") as? Int ?? defH,
-            density: d.object(forKey: "density") as? Int ?? 420,
+            height: height(forWidth: d.object(forKey: "width") as? Int ?? defW),
+            density: d.object(forKey: "density") as? Int ?? density(forWidth: d.object(forKey: "width") as? Int ?? defW),
             preferJIT: d.object(forKey: "preferJIT") as? Bool ?? true,
             navButtons: d.object(forKey: "navButtons") as? Bool ?? true,
             saveState: SaveState.enabled,
@@ -47,7 +74,6 @@ struct VMSettings {
         d.set(memoryMB, forKey: "memoryMB")
         d.set(cpus, forKey: "cpus")
         d.set(width, forKey: "width")
-        d.set(height, forKey: "height")
         d.set(density, forKey: "density")
         d.set(navButtons, forKey: "navButtons")
         d.set(preferJIT, forKey: "preferJIT")

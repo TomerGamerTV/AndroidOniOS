@@ -47,8 +47,9 @@ final class MainViewController: UIViewController {
         NSLayoutConstraint.activate([
             display.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             display.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            display.topAnchor.constraint(equalTo: view.topAnchor),
-            display.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            // Inside the safe area: the Dynamic Island and corners would hide Android's status bar.
+            display.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            display.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
         ])
 
         overlay = UIHostingController(rootView: OverlayView(state: state, actions: actions))
@@ -197,6 +198,7 @@ final class MainViewController: UIViewController {
     private func start() {
         let settings = VMSettings.current
         DebugShell.shared.startIfEnabled()
+        ADBRelay.shared.startIfEnabled()
         Log.info("jit reservation: \(ProcessInfo.processInfo.environment["DROID_JIT_RESERVE"] ?? "none")")
         if let diag = ProcessInfo.processInfo.environment["DROID_JIT_RESERVE_DIAG"] {
             Log.info("jit reservation map: \(diag)")
