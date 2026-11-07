@@ -845,8 +845,13 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
 #define PUT32(v) do { uint32_t _v = (v); PUT(&_v, 4); } while (0)
     if (pos == 0 && size >= 4) PUT32(BR_NOOP);
     uint64_t start = pos;
+    // Like the driver, whether this read may take process work is decided once, before anything is
+    // delivered (and again after sleeping). Re-deciding after a thread item let a oneway sender's
+    // read carry a BR_DEAD_BINDER behind its BR_TRANSACTION_COMPLETE; libbinder stops at the
+    // complete and ran the death notice inside its next outgoing call, re-entering held locks
+    // (system_server deadlocked in SurfaceComposerClient and the watchdog killed it).
+    bool proc_work = can_take_proc_work(th);
     for (;;) {
-        bool proc_work = can_take_proc_work(th);
         BWork *w = NULL;
         WorkList *src = NULL;
         if (th->todo.head) w = work_pop(src = &th->todo);
@@ -869,6 +874,7 @@ static int64_t do_read(GuestCtx *c, BProc *p, BThread *th, uint64_t buf, uint64_
             while (read(th->wake_rd, junk, sizeof junk) > 0) {}      // drain every pending wake
             if (r < 0) { *consumed = pos; return -EINTR; }
             if (c->kill) { *consumed = pos; return -EINTR; }
+            proc_work = can_take_proc_work(th);
             continue;
         }
         if (w->kind != W_TRANSACTION && w->kind != W_REPLY && w->kind != W_NODE && pos + 4 + 16 > size) {

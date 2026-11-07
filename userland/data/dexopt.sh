@@ -13,6 +13,6 @@ for p in com.android.systemui com.google.android.apps.nexuslauncher com.android.
          com.google.android.networkstack com.android.settings com.google.android.as com.google.android.nfc \
          com.android.providers.contacts com.google.android.bluetooth com.android.vending com.google.android.googlequicksearchbox \
          com.android.se com.android.keychain com.android.printspooler com.android.localtransport; do
-    pm compile -m speed -f "$p"
+    pm compile -m speed "$p"          # already-compiled packages are skipped (no -f)
 done
 touch /data/misc/oni-dexopt-done
