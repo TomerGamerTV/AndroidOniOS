@@ -40,8 +40,8 @@ Android 17's own programs run, as many guest processes inside one host process:
 - `/system/bin/sh` (mksh) and toybox: scripts, pipes, subshells, command substitution, background jobs, `wait`, `trap`
 - multithreaded programs: mutexes, condition variables, thread-directed signals
 - **`servicemanager`**, Android's service directory, unmodified, with the stock `service` tool talking to it over binder from another process. Its SELinux checks run against a permissive policy that onirun serves from `/sys/fs/selinux`.
-- **ART**, Android's Java runtime (`dalvikvm64` from the ART APEX), both interpreting and with its JIT compiler: hand-written dex programs (`tools/mkdex.py`) print, catch a `NullPointerException` that ART detects through our fault delivery, and run a 30-million-iteration loop (1.1 s in total with the JIT, 1.6 s interpreted). The boot class path runs imageless, because the image's boot image was built for a garbage collector that needs `userfaultfd`.
-- **The boot sequence**, with onirun playing init (`onirun --root R --init`, service table in `/oni/init.txt`): servicemanager, hwservicemanager, keystore2, installd, apexd (lazily, when servicemanager asks), the software HALs the emulator image carries (KeyMint, gatekeeper, lights, health, usb, suspend, power, power.stats, thermal, vibrator), then the real **zygote**, which preloads the framework (about 90 s, imageless) and forks **system_server**. system_server starts its bootstrap services (ActivityManager, PowerManager, Thermal, Lights, ...) up to DisplayManagerService, which waits for SurfaceFlinger. Graphics is the next phase.
+- **ART**, Android's Java runtime (`dalvikvm64` from the ART APEX), both interpreting and with its JIT compiler: hand-written dex programs (`tools/mkdex.py`) print, catch a `NullPointerException` that ART detects through our fault delivery, and run a 30-million-iteration loop (1.1 s in total with the JIT, 1.6 s interpreted). The image carries no usable boot image (its compiled code targets a garbage collector that needs `userfaultfd`), so `odrefresh` compiles one into `/data` the first time.
+- **The full boot**, with onirun playing init (`onirun --root R --init`, service table in `/oni/init.txt`): servicemanager, hwservicemanager, keystore2, installd, apexd, the emulator image's software HALs, audioserver with the emulator's audio HAL, media/camera daemons, gralloc, the composer and SurfaceFlinger over gfxstream, then the real **zygote** and **system_server**. Android 17 reaches the launcher and `sys.boot_completed` in about 90 seconds on an M-series Mac, with a compiled boot image that `odrefresh` builds once (the image ships none). `--window` shows the screen in a Mac window and turns the mouse into a touchscreen (`/dev/input/event0`). Apps stay slow until a one-time job (`/oni/dexopt.sh`) has compiled them: the image's prebuilt app code targets ART's userfaultfd collector, which onirun can't offer, so it is rejected.
 
 ### Linux services provided by onirun
 
@@ -105,6 +105,9 @@ python3 -I tools/ext4pull.py build/userland/pull/com.android.runtime.apex pull /
 python3 -I tools/mkselinuxfs.py userland/data/selinux-classes.txt build/userland/rootfs   # the SELinux class tree
 # Or all of it at once (plus /dev/__properties__ and /linkerconfig copied from a booted Android via adb):
 python3 -I tools/mkrootfs.py build/vm-macos/system.img build/userland/rootfs --properties-dir PROPS --linkerconfig LDCFG
-# Boot the services (servicemanager ... zygote, system_server):
-build/userland/onirun --root build/userland/rootfs --init
+# Boot Android (runs odrefresh first if the boot image is missing); --window shows the screen:
+userland/run-init.sh --window
+#   mouse = touch; Esc = Back, F1 = Home, F2 = Recents, F12 = Power
+#   ONIRUN_INPUT_FIFO=/path/fifo: scripted input, lines "down|move|up X Y" or "key CODE 1|0"
+#   ONIRUN_LOGCAT=1 shows the whole log, ONIRUN_FAULTS=1 adds onirun's own diagnostics
 ```
