@@ -134,6 +134,10 @@ final class MainViewController: UIViewController {
         volumeDown: { VirtualMachine.shared.tapKey(.volumeDown) },
         rotate: { DispatchQueue.global().async { _ = try? ADBClient.shared.shell("cmd window user-rotation lock $(( ($(settings get system user_rotation) + 1) % 4 ))") } },
         reboot: { VirtualMachine.shared.reset() },
+        saveAndClose: { [weak self] in
+            self?.state.flash("Saving Android…")
+            VirtualMachine.shared.saveAndQuit { ok in if !ok { self?.state.flash("Couldn't save Android") } }
+        },
         enableJIT: { [weak self] in self?.requestJIT() }
     )
 

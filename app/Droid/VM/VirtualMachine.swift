@@ -1,4 +1,5 @@
 import AVFoundation
+import os
 import Foundation
 import UIKit
 
@@ -96,7 +97,6 @@ final class VirtualMachine {
     /// Android is up (booted, or resumed from a save): a save state may be taken.
     var ready = false
     private(set) var saving = false
-    private var resumeAfterSave = false
     private var fingerprint = ""
     private var writableDisks: [URL] = []
     /// Called on the main thread when a restore has loaded (true) or the VM was not restored.
@@ -376,15 +376,29 @@ final class VirtualMachine {
         }
     }
 
-    /// App going to the background: pause Android and, if enabled, save it so a later launch
-    /// can resume it after iOS ends the app.
-    func enterBackground() {
-        setRunning(false)
-        guard started, ready, !restoring, !saving, VMSettings.current.saveState,
-              let save = qemu.save_state else { return }
+    /// In the background Android just pauses. It can't be saved on the way out: iOS lowers the app's
+    /// memory limit as soon as it resigns (and refuses GPU work in the background), and a save
+    /// started then gets the app killed (jetsam per-process-limit, seen on an iPhone 18 Pro Max).
+    func enterBackground() { setRunning(false) }
+
+    /// Menu › Save & close: saves Android while the app is in front (a few seconds), then quits,
+    /// so the next launch continues where it left off. done(false) when it couldn't save.
+    func saveAndQuit(done: @escaping (Bool) -> Void) {
+        let started = startSave { ok in
+            if ok { Log.info("save state: quitting after save"); exit(0) }
+            done(false)
+        }
+        if !started { done(false) }
+    }
+
+    /// Pauses Android and writes its save state; false when there is nothing to do. completion runs
+    /// on the main thread once the save is committed (true) or failed (false; Android resumes).
+    private func startSave(completion: @escaping (Bool) -> Void) -> Bool {
+        guard started, ready, !restoring, !saving, !SaveState.exists, VMSettings.current.saveState,
+              let save = qemu.save_state else { return false }
         saving = true
-        resumeAfterSave = false
         let began = Date()
+        Log.info("save state: saving (memory headroom \(os_proc_available_memory() >> 20) MiB)")
         var task = UIBackgroundTaskIdentifier.invalid
         task = UIApplication.shared.beginBackgroundTask(withName: "save-android") {
             // Out of background time: iOS suspends us mid-save; the partial file is ignored.
@@ -400,14 +414,16 @@ final class VirtualMachine {
             } else {
                 Log.info("save state: failed (\(status))")
                 SaveState.discard()
+                self.resume()
             }
-            if self.resumeAfterSave { self.resume() }
             UIApplication.shared.endBackgroundTask(task)
+            completion(status == 0)
         }
         save(SaveState.partial.path, { opaque, status in
             let done = Unmanaged<SaveDone>.fromOpaque(opaque!).takeRetainedValue()
             DispatchQueue.main.async { done.fn(status) }
         }, Unmanaged.passRetained(done).toOpaque())
+        return true
     }
 
     /// App back in front: continue Android (dropping the save it can no longer match).
@@ -415,7 +431,7 @@ final class VirtualMachine {
 
     private func resume() {
         guard started, !restoring else { return }
-        if saving { resumeAfterSave = true; return }
+        if saving { return }                   // the save's completion quits or resumes
         if SaveState.exists { SaveState.discard() }
         setRunning(true)
         if ready { GuestSetup.syncClock() }

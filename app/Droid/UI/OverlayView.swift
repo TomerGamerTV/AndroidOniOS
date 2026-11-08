@@ -9,6 +9,7 @@ struct OverlayActions {
     var volumeDown: () -> Void
     var rotate: () -> Void
     var reboot: () -> Void
+    var saveAndClose: () -> Void
     var enableJIT: () -> Void
 }
 
@@ -172,6 +173,9 @@ struct ControlsSheet: View {
                     }
                 }
                 Section {
+                    if SaveState.enabled && VirtualMachine.shared.ready {
+                        Button("Save & close") { actions.saveAndClose(); dismiss() }
+                    }
                     Button("Restart Android", role: .destructive) { actions.reboot(); dismiss() }
                     if !state.jitEnabled {
                         Button("Enable JIT with StikDebug") { actions.enableJIT(); dismiss() }
@@ -220,7 +224,7 @@ struct SettingsView: View {
                         Text("Native (experimental)").tag("native")
                     }
                 }
-                Section(footer: Text("Saves Android when you leave the app, so it opens where you left off instead of starting again. Each save writes about as much as Android's memory size to storage.")) {
+                Section(footer: Text("Adds Save & close to the menu (long-press): Android is saved and the next launch continues where you left off instead of starting again. Each save writes about as much as Android's memory size to storage.")) {
                     Toggle("Quick resume", isOn: $s.saveState)
                 }
                 Section(footer: Text(adb

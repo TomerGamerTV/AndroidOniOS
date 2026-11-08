@@ -60,6 +60,10 @@ final class DebugShell {
             var out = ""
             for line in cmd.split(separator: "\n").map(String.init) where !line.isEmpty {
                 if line.hasPrefix("monitor ") { out += Self.monitor(String(line.dropFirst(8))) }
+                else if line == "app save-and-quit" {   // the menu's Save & close
+                    DispatchQueue.main.async { VirtualMachine.shared.saveAndQuit { ok in Log.info("save-and-quit: \(ok)") } }
+                    out += "saving\n"
+                }
                 else { do { out += try ADBClient.shared.shell(line) } catch { out += "error: \(error)\n" } }
             }
             try? out.write(to: outURL, atomically: true, encoding: .utf8)
