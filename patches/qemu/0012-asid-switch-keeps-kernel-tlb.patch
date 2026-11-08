@@ -1,0 +1,17 @@
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -4340,7 +4340,13 @@
+     if (cpreg_field_is_64bit(ri) &&
+         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
+         ARMCPU *cpu = env_archcpu(env);
+-        tlb_flush(CPU(cpu));
++        /*
++         * Oni: an ASID change only retires non-global translations. Linux maps the kernel global
++         * and runs it with PAN set, so the EL1&0 PAN regime's TLB never holds a user (nG) page
++         * (PAN faults those accesses, so they're never filled). Keeping it saves re-walking the
++         * kernel's working set on every context switch.
++         */
++        tlb_flush_by_mmuidx(CPU(cpu), ((1 << NB_MMU_MODES) - 1) & ~ARMMMUIdxBit_E10_1_PAN);
+     }
+     raw_write(env, ri, value);
+ }

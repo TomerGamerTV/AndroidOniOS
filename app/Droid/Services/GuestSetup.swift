@@ -25,11 +25,11 @@ enum GuestSetup {
                 : "com.android.internal.systemui.navbar.gestural"
             let commands = [
                 "cmd overlay enable-exclusive --category \(nav)",
-                // The VM has no Bluetooth, NFC or UWB hardware. Leaving them on makes their HALs
-                // retry forever (constant CPU use and log spam), so switch them off.
+                // The VM has no Bluetooth or UWB hardware. Leaving them on makes their HALs retry
+                // forever (constant CPU use and log spam), so switch them off. (NFC idles; the
+                // shell user isn't allowed to switch it off anyway.)
                 "cmd bluetooth_manager disable",
                 "settings put global ble_scan_always_enabled 0",
-                "svc nfc disable",
                 "cmd uwb disable-uwb",
                 // One-time performance defaults (the user can change them back in Android
                 // Settings): shorter animations, and no Digital Wellbeing or setup-only restore
