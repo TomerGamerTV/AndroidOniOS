@@ -28,6 +28,10 @@ final class DisplayView: UIView {
     private(set) var guestSize = CGSize(width: 1080, height: 2400)
     var onFirstFrame: (() -> Void)?
     private var sawFirstFrame = false
+    /// Quarter turns Android's content is rotated by (its Surface rotation: 1 = 90°, landscape with
+    /// the device's top on the left). Android draws rotated content into its portrait framebuffer;
+    /// the view turns it back upright and maps touches into the framebuffer's natural orientation.
+    var rotation = 0 { didSet { dirty = true; setNeedsLayout() } }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -57,12 +61,13 @@ final class DisplayView: UIView {
         #include <metal_stdlib>
         using namespace metal;
         struct V { float4 pos [[position]]; float2 uv; };
-        vertex V vtx(uint vid [[vertex_id]], constant float4 &rect [[buffer(0)]]) {
+        vertex V vtx(uint vid [[vertex_id]], constant float4 &rect [[buffer(0)]], constant int &rot [[buffer(1)]]) {
             float2 p[4] = { float2(0,0), float2(1,0), float2(0,1), float2(1,1) };
             float2 q = p[vid];
             V o;
             o.pos = float4(rect.x + q.x * rect.z, rect.y - q.y * rect.w, 0, 1);
-            o.uv = q;
+            // displayed point -> framebuffer point (the content is turned back by rot quarter turns)
+            o.uv = rot == 1 ? float2(1 - q.y, q.x) : rot == 2 ? float2(1 - q.x, 1 - q.y) : rot == 3 ? float2(q.y, 1 - q.x) : q;
             return o;
         }
         fragment float4 frag(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
@@ -150,8 +155,9 @@ final class DisplayView: UIView {
     var contentRect: CGRect {
         let b = bounds
         guard guestSize.width > 0, guestSize.height > 0, b.width > 0 else { return b }
-        let scale = min(b.width / guestSize.width, b.height / guestSize.height)
-        let w = guestSize.width * scale, h = guestSize.height * scale
+        let shown = rotation % 2 == 1 ? CGSize(width: guestSize.height, height: guestSize.width) : guestSize
+        let scale = min(b.width / shown.width, b.height / shown.height)
+        let w = shown.width * scale, h = shown.height * scale
         return CGRect(x: (b.width - w) / 2, y: (b.height - h) / 2, width: w, height: h)
     }
 
@@ -176,6 +182,8 @@ final class DisplayView: UIView {
                                 Float(r.width / b.width * 2), Float(r.height / b.height * 2))
         enc.setRenderPipelineState(pipeline)
         enc.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
+        var rot = Int32(rotation)
+        enc.setVertexBytes(&rot, length: MemoryLayout<Int32>.size, index: 1)
         enc.setFragmentTexture(tex, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -191,8 +199,10 @@ final class DisplayView: UIView {
     private func guestPoint(_ t: UITouch) -> (Int, Int) {
         let r = contentRect
         let p = t.location(in: self)
-        let x = (p.x - r.minX) / r.width * guestSize.width
-        let y = (p.y - r.minY) / r.height * guestSize.height
+        let dx = (p.x - r.minX) / r.width, dy = (p.y - r.minY) / r.height
+        let (u, v) = rotation == 1 ? (1 - dy, dx) : rotation == 2 ? (1 - dx, 1 - dy) : rotation == 3 ? (dy, 1 - dx) : (dx, dy)
+        let x = u * guestSize.width
+        let y = v * guestSize.height
         return (Int(max(0, min(guestSize.width - 1, x))), Int(max(0, min(guestSize.height - 1, y))))
     }
 

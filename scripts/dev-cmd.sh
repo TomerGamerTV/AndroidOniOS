@@ -6,6 +6,7 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/build/local.env"
+DEV=${ONI_DEV:-$DEV}   # ONI_DEV=<UDID> targets another device (e.g. an iPad)
 T=$(mktemp -d)
 { echo "echo ==== $RANDOM$RANDOM"; printf '%s\n' "$@"; } > "$T/cmd"   # the marker makes every answer new
 cp() { xcrun devicectl device copy "$@" --device "$DEV" --domain-type appDataContainer --domain-identifier com.tomergamertv.oni >/dev/null 2>&1; }

@@ -45,8 +45,8 @@ final class MainViewController: UIViewController {
         display.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(display)
         NSLayoutConstraint.activate([
-            display.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            display.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            display.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            display.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             // Inside the safe area: the Dynamic Island and corners would hide Android's status bar.
             display.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             display.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
@@ -104,6 +104,7 @@ final class MainViewController: UIViewController {
             VirtualMachine.shared.ready = true
             self.state.bootFraction = 1
             GuestSetup.apply(VMSettings.current)
+            self.applyRotation(self.interfaceRotation)
             Log.info("boot completed; memory headroom \(os_proc_available_memory() >> 20) MiB, thermal state \(ProcessInfo.processInfo.thermalState.rawValue)")
             Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in
                 Log.info("memory headroom \(os_proc_available_memory() >> 20) MiB, thermal state \(ProcessInfo.processInfo.thermalState.rawValue)")
@@ -111,6 +112,35 @@ final class MainViewController: UIViewController {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.state.phase = .running }
         }
         Task { await boot() }
+    }
+
+    // MARK: - Rotation
+
+    /// Android's rotation for the current iOS interface orientation (landscape right = device turned
+    /// counter-clockwise = Android's ROTATION_90).
+    private var interfaceRotation: Int {
+        switch view.window?.windowScene?.interfaceOrientation {
+        case .landscapeRight: return 1
+        case .portraitUpsideDown: return 2
+        case .landscapeLeft: return 3
+        default: return 0
+        }
+    }
+
+    /// Turns Android to r quarter turns: locks its rotation there and shows its framebuffer turned back.
+    private func applyRotation(_ r: Int) {
+        display.rotation = r
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = try? ADBClient.shared.shell("cmd window user-rotation lock \(r)")
+        }
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            guard let self, VirtualMachine.shared.ready else { return }
+            self.applyRotation(self.interfaceRotation)
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -132,7 +162,7 @@ final class MainViewController: UIViewController {
         power: { VirtualMachine.shared.tapKey(.power) },
         volumeUp: { VirtualMachine.shared.tapKey(.volumeUp) },
         volumeDown: { VirtualMachine.shared.tapKey(.volumeDown) },
-        rotate: { DispatchQueue.global().async { _ = try? ADBClient.shared.shell("cmd window user-rotation lock $(( ($(settings get system user_rotation) + 1) % 4 ))") } },
+        rotate: { [weak self] in self.map { $0.applyRotation(($0.display.rotation + 1) % 4) } },
         reboot: { VirtualMachine.shared.reset() },
         saveAndClose: { [weak self] in
             self?.state.flash("Saving Android…")
