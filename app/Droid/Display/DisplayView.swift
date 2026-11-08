@@ -119,7 +119,8 @@ final class DisplayView: UIView {
             front = -1
             DispatchQueue.main.async { self.guestSize = CGSize(width: width, height: height); self.setNeedsLayout() }
         }
-        copyFrameLocked()
+        // No copy here: the guest switches to a buffer before drawing the frame into it, so it
+        // still holds an older frame (shown, that's a jump back). The flush that follows copies it.
     }
 
     private func surfaceUpdated() {

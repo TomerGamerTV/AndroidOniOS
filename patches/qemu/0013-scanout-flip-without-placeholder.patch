@@ -1,0 +1,16 @@
+--- a/hw/display/virtio-gpu-rutabaga.c
++++ b/hw/display/virtio-gpu-rutabaga.c
+@@ -338,9 +338,11 @@
+ 
+     vb->enable = 1;
+ 
+-    /* realloc the surface ptr */
++    /*
++     * realloc the surface ptr. Oni: straight to the new surface; the guest flips between buffers
++     * every frame, and going through NULL built (and drew) a full-size placeholder each time.
++     */
+     scanout->ds = qemu_create_displaysurface_pixman(res->image);
+-    dpy_gfx_replace_surface(scanout->con, NULL);
+     dpy_gfx_replace_surface(scanout->con, scanout->ds);
+     res->scanout_bitmask = ss.scanout_id;
+     vr->scanout_resource[ss.scanout_id] = ss.resource_id;
