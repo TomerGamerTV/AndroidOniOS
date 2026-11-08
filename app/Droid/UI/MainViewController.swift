@@ -37,8 +37,8 @@ final class MainViewController: UIViewController {
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-        // Android rotates its own content from the accelerometer; keep the framebuffer upright.
-        UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
+        // Android follows the interface orientation (applyRotation); iPhones don't do upside down.
+        UIDevice.current.userInterfaceIdiom == .pad ? .all : .allButUpsideDown
     }
 
     override func viewDidLoad() {
