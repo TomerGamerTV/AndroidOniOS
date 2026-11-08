@@ -18,12 +18,17 @@ struct VMSettings {
     var engine: String
     var native: Bool { engine == "native" }
 
-    /// The part of the screen Android gets, in portrait points: everything inside iOS's safe area,
-    /// so the Dynamic Island, rounded corners and home indicator never cover Android's status and
-    /// navigation bars. Works out per device.
+    /// Android fills the whole screen on iPad: nothing covers it there, and a full-screen portrait
+    /// framebuffer turned sideways fills landscape exactly (no bars when Android rotates).
+    static var fullScreen: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+
+    /// The part of the screen Android gets, in portrait points. On iPhone that's everything inside
+    /// iOS's safe area, so the Dynamic Island, rounded corners and home indicator never cover
+    /// Android's status and navigation bars. Works out per device.
     static var screenArea: CGSize {
         let b = UIScreen.main.bounds.size
         let w = min(b.width, b.height), h = max(b.width, b.height)
+        if fullScreen { return CGSize(width: w, height: h) }
         let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             .flatMap { $0.windows }.first { $0.isKeyWindow }
         var inset = window.map { $0.safeAreaInsets.top + $0.safeAreaInsets.bottom } ?? 0

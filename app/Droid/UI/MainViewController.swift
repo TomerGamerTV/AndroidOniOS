@@ -26,6 +26,16 @@ final class AppState: ObservableObject {
     }
 }
 
+/// What the display is pinned to: the whole view or its safe area.
+private protocol LayoutAnchors {
+    var leadingAnchor: NSLayoutXAxisAnchor { get }
+    var trailingAnchor: NSLayoutXAxisAnchor { get }
+    var topAnchor: NSLayoutYAxisAnchor { get }
+    var bottomAnchor: NSLayoutYAxisAnchor { get }
+}
+extension UIView: LayoutAnchors {}
+extension UILayoutGuide: LayoutAnchors {}
+
 final class MainViewController: UIViewController {
     private let display = DisplayView(frame: .zero)
     private let state = AppState()
@@ -46,12 +56,14 @@ final class MainViewController: UIViewController {
         view.backgroundColor = .black
         display.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(display)
+        // iPhone: inside the safe area (the Dynamic Island and corners would hide Android's status
+        // bar). iPad: edge to edge (VMSettings.fullScreen).
+        let area: LayoutAnchors = VMSettings.fullScreen ? view : view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            display.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            display.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            // Inside the safe area: the Dynamic Island and corners would hide Android's status bar.
-            display.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            display.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            display.leadingAnchor.constraint(equalTo: area.leadingAnchor),
+            display.trailingAnchor.constraint(equalTo: area.trailingAnchor),
+            display.topAnchor.constraint(equalTo: area.topAnchor),
+            display.bottomAnchor.constraint(equalTo: area.bottomAnchor),
         ])
 
         overlay = UIHostingController(rootView: OverlayView(state: state, actions: actions))
