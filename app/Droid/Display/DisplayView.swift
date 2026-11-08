@@ -224,18 +224,30 @@ final class DisplayView: UIView {
         }
     }
 
-    private var loggedTouches = 0
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if loggedTouches < 3, let t = touches.first {
-            loggedTouches += 1
-            let (x, y) = guestPoint(t)
-            Log.info("touch began at guest \(x),\(y) (VM started: \(VirtualMachine.shared.started))")
+    // One log line per finger stroke (first 100 per launch): where it went down and up, how long it
+    // took, how many moves were sent and whether iOS cancelled it. Taps that "press but don't open"
+    // show whether the lift reached the VM.
+    private struct Stroke { var start: (Int, Int); var began: Date; var moves = 0 }
+    private var strokes: [ObjectIdentifier: Stroke] = [:]
+    private var loggedStrokes = 0
+    private func note(_ touches: Set<UITouch>, phase: Int32, cancelled: Bool = false) {
+        guard loggedStrokes < 100 else { return }
+        for t in touches {
+            let id = ObjectIdentifier(t)
+            if phase == 0 { strokes[id] = Stroke(start: guestPoint(t), began: Date()); continue }
+            if phase == 1 { strokes[id]?.moves += 1; continue }
+            guard let st = strokes.removeValue(forKey: id) else { continue }
+            loggedStrokes += 1
+            let end = guestPoint(t)
+            Log.info(String(format: "touch: %d,%d -> %d,%d in %.0f ms, %d moves%@ (rotation %d, VM %@)", st.start.0, st.start.1, end.0, end.1,
+                            Date().timeIntervalSince(st.began) * 1000, st.moves, cancelled ? ", cancelled" : "", rotation,
+                            VirtualMachine.shared.started ? "running" : "not started"))
         }
-        send(touches, phase: 0)
     }
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 1) }
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 2) }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, phase: 2) }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { note(touches, phase: 0); send(touches, phase: 0) }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { note(touches, phase: 1); send(touches, phase: 1) }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { note(touches, phase: 2); send(touches, phase: 2) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { note(touches, phase: 2, cancelled: true); send(touches, phase: 2) }
 
     // MARK: - Hardware keyboard
 
