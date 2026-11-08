@@ -1,0 +1,68 @@
+--- a/host/vulkan/vk_common_operations.cpp
++++ b/host/vulkan/vk_common_operations.cpp
+@@ -3518,6 +3518,17 @@
+     return readColorBufferToBytesLocked(colorBufferHandle, x, y, w, h, outPixels, outPixelsSize);
+ }
+ 
++// A failed readback fails the read instead of aborting: on iOS a backgrounded app may not use the
++// GPU, and a save state taken then must fail cleanly (the app is otherwise killed mid-save).
++#define VK_TRY_READ(x)                                                                \
++    do {                                                                              \
++        VkResult tryErr = x;                                                          \
++        if (tryErr != VK_SUCCESS) {                                                   \
++            GFXSTREAM_ERROR("readColorBufferToBytesLocked: " #x " failed with %s",    \
++                            string_VkResult(tryErr));                                 \
++            return false;                                                             \
++        }                                                                             \
++    } while (0)
+ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint32_t x, uint32_t y,
+                                                uint32_t w, uint32_t h, void* outPixels,
+                                                uint64_t outPixelsSize) {
+@@ -3578,7 +3589,7 @@
+         .pNext = nullptr,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+     };
+-    VK_CHECK(vk->vkBeginCommandBuffer(mCommandBuffer, &beginInfo));
++    VK_TRY_READ(vk->vkBeginCommandBuffer(mCommandBuffer, &beginInfo));
+ 
+     mDebugUtilsHelper.cmdBeginDebugLabel(mCommandBuffer, "readColorBufferToBytes(ColorBuffer:%d)",
+                                          colorBufferHandle);
+@@ -3647,7 +3658,7 @@
+ 
+     mDebugUtilsHelper.cmdEndDebugLabel(mCommandBuffer);
+ 
+-    VK_CHECK(vk->vkEndCommandBuffer(mCommandBuffer));
++    VK_TRY_READ(vk->vkEndCommandBuffer(mCommandBuffer));
+ 
+     const VkSubmitInfo submitInfo = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+@@ -3663,7 +3674,7 @@
+ 
+     {
+         gfxstream::base::AutoLock queueLock(*mQueueLock);
+-        VK_CHECK(vk->vkQueueSubmit(mQueue, 1, &submitInfo, mCommandBufferFence));
++        VK_TRY_READ(vk->vkQueueSubmit(mQueue, 1, &submitInfo, mCommandBufferFence));
+     }
+ 
+     static constexpr uint64_t ANB_MAX_WAIT_NS = 5ULL * 1000ULL * 1000ULL * 1000ULL;
+@@ -3679,9 +3690,9 @@
+             vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS * 2);
+     }
+ 
+-    VK_CHECK(waitRes);
++    VK_TRY_READ(waitRes);
+ 
+-    VK_CHECK(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
++    VK_TRY_READ(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
+ 
+     if (!mStaging.mIsHostCoherent) {
+         // Invalidate host cache lines to ensure the subsequent readback
+@@ -3694,7 +3705,7 @@
+             .size = VK_WHOLE_SIZE,
+         };
+ 
+-        VK_CHECK(vk->vkInvalidateMappedMemoryRanges(mDevice, 1, &toInvalidate));
++        VK_TRY_READ(vk->vkInvalidateMappedMemoryRanges(mDevice, 1, &toInvalidate));
+     }
+ 
+     if (transferInfo.unpackFunction) {
