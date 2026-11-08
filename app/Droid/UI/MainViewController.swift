@@ -15,6 +15,8 @@ final class AppState: ObservableObject {
     @Published var jitEnabled = false
     @Published var bootFraction: Double = 0
     @Published var guestVisible = false
+    /// Setup failed before Android started (e.g. the download), so it can simply be tried again.
+    @Published var canRetry = false
 
     func flash(_ message: String) {
         toast = message
@@ -129,6 +131,7 @@ final class MainViewController: UIViewController {
 
     /// Turns Android to r quarter turns: locks its rotation there and shows its framebuffer turned back.
     private func applyRotation(_ r: Int) {
+        Log.info("rotation \(r) (view \(Int(view.bounds.width))x\(Int(view.bounds.height)))")
         display.rotation = r
         DispatchQueue.global(qos: .userInitiated).async {
             _ = try? ADBClient.shared.shell("cmd window user-rotation lock \(r)")
@@ -168,7 +171,12 @@ final class MainViewController: UIViewController {
             self?.state.flash("Saving Android…")
             VirtualMachine.shared.saveAndQuit { ok in if !ok { self?.state.flash("Couldn't save Android") } }
         },
-        enableJIT: { [weak self] in self?.requestJIT() }
+        enableJIT: { [weak self] in self?.requestJIT() },
+        retry: { [weak self] in
+            guard let self, self.state.canRetry else { return }
+            self.state.canRetry = false
+            Task { await self.boot() }
+        }
     )
 
     // MARK: - Boot sequence
@@ -188,6 +196,7 @@ final class MainViewController: UIViewController {
             }
         } catch {
             state.phase = .failed(error.localizedDescription)
+            state.canRetry = true
             return
         }
         start()
@@ -219,7 +228,11 @@ final class MainViewController: UIViewController {
 
     private func render(_ stage: ImageStore.Stage) {
         switch stage {
-        case .downloading(let f): state.detail = "Downloading Android 17 · 2.4 GB"; state.progress = f
+        case .downloading(let f, let speed):
+            let total = Double(ImageStore.shared.manifest.size) / 1e9
+            let rate = speed > 0 ? String(format: " · %.1f MB/s", speed / 1e6) : ""
+            state.detail = String(format: "Downloading Android 17 · %.1f of %.1f GB", f * total, total) + rate
+            state.progress = f
         case .verifying(let f): state.detail = "Verifying download"; state.progress = f
         case .extracting(_, let f): state.detail = "Unpacking system image"; state.progress = f
         case .finishing: state.detail = "Finishing setup"; state.progress = 1

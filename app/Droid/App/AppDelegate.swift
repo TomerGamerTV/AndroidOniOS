@@ -12,6 +12,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         return true
     }
 
+    /// The image download runs on a background URLSession; iOS relaunches the app to deliver its events.
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        Downloader.shared.backgroundCompletion = completionHandler
+        Downloader.shared.attach()
+    }
+
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession,
                      options: UIScene.ConnectionOptions) -> UISceneConfiguration {
         UISceneConfiguration(name: "Default", sessionRole: connectingSceneSession.role)

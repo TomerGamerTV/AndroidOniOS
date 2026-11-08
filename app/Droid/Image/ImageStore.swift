@@ -4,7 +4,7 @@ import Compression
 
 /// Owns the Android disk images: first-run download/import, extraction, patching,
 /// user data creation and per-boot initrd generation.
-final class ImageStore: NSObject {
+final class ImageStore {
     struct Manifest: Decodable {
         struct Patch: Decodable {
             let file: String
@@ -22,7 +22,7 @@ final class ImageStore: NSObject {
 
     enum Stage: Equatable {
         case idle
-        case downloading(Double)
+        case downloading(Double, Double)   // fraction, bytes per second
         case verifying(Double)
         case extracting(String, Double)
         case finishing
@@ -34,13 +34,10 @@ final class ImageStore: NSObject {
     let manifest: Manifest
     var onStage: ((Stage) -> Void)?
 
-    private var downloadContinuation: CheckedContinuation<URL, Error>?
-    private var session: URLSession!
 
-    override init() {
+    init() {
         let url = Bundle.main.url(forResource: "android", withExtension: "json")!
         manifest = try! JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
-        super.init()
     }
 
     private var readyMarker: URL { Paths.images.appendingPathComponent(".ready") }
@@ -110,18 +107,10 @@ final class ImageStore: NSObject {
     }
 
     private func download(to dest: URL) async throws -> URL {
-        report(.downloading(0))
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForResource = 6 * 3600
-        config.waitsForConnectivity = true
-        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        let tmp = try await withCheckedThrowingContinuation { (c: CheckedContinuation<URL, Error>) in
-            downloadContinuation = c
-            session.downloadTask(with: URL(string: manifest.url)!).resume()
+        report(.downloading(0, 0))
+        return try await Downloader.shared.download(URL(string: manifest.url)!, size: Int64(manifest.size), to: dest) { f, speed in
+            self.report(.downloading(f, speed))
         }
-        try? FileManager.default.removeItem(at: dest)
-        try FileManager.default.moveItem(at: tmp, to: dest)
-        return dest
     }
 
     private func verify(_ zip: URL) throws {
@@ -252,33 +241,5 @@ final class ImageStore: NSObject {
         withUnsafeBytes(of: csum.littleEndian) { data.append(contentsOf: $0) }
         data.append(Data("#BOOTCONFIG\n".utf8))
         try data.write(to: initrd)
-    }
-}
-
-extension ImageStore: URLSessionDownloadDelegate {
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
-                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        let total = totalBytesExpectedToWrite > 0 ? Double(totalBytesExpectedToWrite) : Double(manifest.size)
-        report(.downloading(Double(totalBytesWritten) / total))
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        // The temp file is deleted when this returns: move it somewhere stable first.
-        let keep = Paths.android.appendingPathComponent("download.partial")
-        try? FileManager.default.removeItem(at: keep)
-        do {
-            try FileManager.default.moveItem(at: location, to: keep)
-            downloadContinuation?.resume(returning: keep)
-        } catch {
-            downloadContinuation?.resume(throwing: error)
-        }
-        downloadContinuation = nil
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error {
-            downloadContinuation?.resume(throwing: error)
-            downloadContinuation = nil
-        }
     }
 }

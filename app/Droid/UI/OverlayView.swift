@@ -11,6 +11,7 @@ struct OverlayActions {
     var reboot: () -> Void
     var saveAndClose: () -> Void
     var enableJIT: () -> Void
+    var retry: () -> Void
 }
 
 struct OverlayView: View {
@@ -80,9 +81,16 @@ struct OverlayView: View {
                         .foregroundStyle(.white.opacity(0.75))
                         .multilineTextAlignment(.center)
                         .padding(.bottom, 20)
-                    Button("Settings") { state.showSettings = true }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.white.opacity(0.2))
+                    HStack(spacing: 12) {
+                        if state.canRetry {
+                            Button("Try again") { actions.retry() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.white.opacity(0.3))
+                        }
+                        Button("Settings") { state.showSettings = true }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.white.opacity(0.2))
+                    }
                 } else if state.phase == .stopped {
                     Text("Close and reopen the app to start it again.")
                         .font(.callout)
