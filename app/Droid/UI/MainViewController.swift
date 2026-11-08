@@ -321,7 +321,18 @@ final class MainViewController: UIViewController {
         if VirtualMachine.shared.usingJIT {
             let marker = Paths.android.appendingPathComponent("jit-attempt")
             FileManager.default.createFile(atPath: marker.path, contents: nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { try? FileManager.default.removeItem(at: marker) }
+            // Cleared as soon as the guest has run code (kernel output, or a finished restore): a
+            // JIT failure stops QEMU before that, and an unrelated crash later must not cost the
+            // next launch its JIT (the interpreter can't even finish booting before Android's watchdog).
+            let began = Date(), log = VirtualMachine.shared.kernelLog
+            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { t in
+                let a = try? FileManager.default.attributesOfItem(atPath: log.path)
+                let wrote = ((a?[.size] as? Int) ?? 0) > 0 && ((a?[.modificationDate] as? Date) ?? .distantPast) > began
+                if wrote || VirtualMachine.shared.ready {
+                    try? FileManager.default.removeItem(at: marker)
+                    t.invalidate()
+                }
+            }
         }
         VirtualMachine.shared.onExit = { [weak self] code in
             self?.state.phase = .stopped
