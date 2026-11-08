@@ -146,6 +146,7 @@ final class MainViewController: UIViewController {
         Log.info("rotation \(r) (view \(Int(view.bounds.width))x\(Int(view.bounds.height)))")
         display.rotation = r
         DispatchQueue.global(qos: .userInitiated).async {
+            guard ADBClient.shared.connect(timeout: 60) else { return }   // just after a restore ADB is still reconnecting
             _ = try? ADBClient.shared.shell("cmd window user-rotation lock \(r)")
         }
     }
@@ -336,6 +337,7 @@ final class MainViewController: UIViewController {
                 self.bootProgress.finish()
                 self.state.bootFraction = 1
                 self.state.phase = .running
+                self.applyRotation(self.interfaceRotation)   // the app starts upright; Android kept its rotation
             }
         } else {
             bootProgress.start(kernelLog: VirtualMachine.shared.kernelLog)
