@@ -131,6 +131,7 @@ typedef struct DroidTouch {
 
 static int droid_tracking_ids[DROID_MAX_SLOTS];
 static int droid_next_tracking_id = 1;
+static int droid_active_slots;
 
 static void droid_touch_bh(void *opaque)
 {
@@ -142,6 +143,9 @@ static void droid_touch_bh(void *opaque)
     }
     switch (t->phase) {
     case DROID_TOUCH_BEGIN:
+        if (!droid_tracking_ids[slot]) {
+            droid_active_slots++;
+        }
         droid_tracking_ids[slot] = droid_next_tracking_id++;
         if (droid_next_tracking_id > 0xffff) {
             droid_next_tracking_id = 1;
@@ -157,12 +161,19 @@ static void droid_touch_bh(void *opaque)
                              slot, id);
         qemu_input_queue_mtt_abs(NULL, INPUT_AXIS_X, t->x, 0, t->w - 1, slot, id);
         qemu_input_queue_mtt_abs(NULL, INPUT_AXIS_Y, t->y, 0, t->h - 1, slot, id);
+        /* Android's evdev mapper treats a BTN_TOUCH device without the button down as hovering */
+        if (t->phase == DROID_TOUCH_BEGIN && droid_active_slots == 1) {
+            qemu_input_queue_btn(NULL, INPUT_BUTTON_TOUCH, true);
+        }
         qemu_input_event_sync();
         break;
     }
     case DROID_TOUCH_END:
         if (droid_tracking_ids[slot]) {
             qemu_input_queue_mtt(NULL, INPUT_MULTI_TOUCH_TYPE_END, slot, -1);
+            if (--droid_active_slots == 0) {
+                qemu_input_queue_btn(NULL, INPUT_BUTTON_TOUCH, false);
+            }
             qemu_input_event_sync();
             droid_tracking_ids[slot] = 0;
         }

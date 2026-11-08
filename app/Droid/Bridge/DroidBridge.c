@@ -111,6 +111,26 @@ int droid_bridge_set_nonblock(int fd, bool nonblock) {
     if (!out->field) { snprintf(errbuf, errlen, "missing symbol %s", name); return -1; } \
 } while (0)
 
+/* How much address space can this process reserve (GiB), and the largest single piece? Reserves
+ * 1 GiB PROT_NONE pieces (free of memory) until refused, then releases them. The native engine
+ * gives every Android process its own window, so this decides whether it can run on a device. */
+void droid_bridge_address_space(int *total_gib, int *largest_gib) {
+    static void *got[8192];
+    int n = 0;
+    *largest_gib = 0;
+    for (unsigned long long sz = 1ull << 44; sz >= (1ull << 30); sz >>= 1) {
+        void *r = mmap(NULL, sz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (r != MAP_FAILED) { munmap(r, sz); *largest_gib = (int)(sz >> 30); break; }
+    }
+    while (n < 8192) {
+        void *r = mmap(NULL, 1ull << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (r == MAP_FAILED) break;
+        got[n++] = r;
+    }
+    for (int i = 0; i < n; i++) munmap(got[i], 1ull << 30);
+    *total_gib = n;
+}
+
 int droid_qemu_load(const char *path, DroidQEMU *out, char *errbuf, size_t errlen) {
     memset(out, 0, sizeof(*out));
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);

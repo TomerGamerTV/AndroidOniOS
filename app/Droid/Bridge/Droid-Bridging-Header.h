@@ -12,6 +12,8 @@ bool droid_bridge_jit_available(void);
 bool droid_bridge_debugger_attached(void);
 /* Raise the jetsam memory limit as far as the entitlement allows. */
 void droid_bridge_raise_memory_limit(void);
+/* Reservable address space in GiB (total, largest single piece). */
+void droid_bridge_address_space(int *total_gib, int *largest_gib);
 
 /* ---- sockets ---- */
 int droid_bridge_unix_listen(const char *path);

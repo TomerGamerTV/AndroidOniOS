@@ -64,6 +64,9 @@ final class DebugShell {
                     DispatchQueue.main.async { VirtualMachine.shared.saveAndQuit { ok in Log.info("save-and-quit: \(ok)") } }
                     out += "saving\n"
                 }
+                else if line.hasPrefix("app tap ") || line.hasPrefix("app swipe ") {   // a finger, in guest pixels
+                    out += Self.fakeFinger(line.split(separator: " ").dropFirst(2).compactMap { Int($0) })
+                }
                 else { do { out += try ADBClient.shared.shell(line) } catch { out += "error: \(error)\n" } }
             }
             try? out.write(to: outURL, atomically: true, encoding: .utf8)
@@ -72,6 +75,22 @@ final class DebugShell {
         fileTimer = timer
     }
     private var fileTimer: DispatchSourceTimer?
+
+    /// [x, y] taps; [x1, y1, x2, y2] swipes over 300 ms. Goes through the same path as the screen.
+    private static func fakeFinger(_ p: [Int]) -> String {
+        guard p.count == 2 || p.count == 4 else { return "usage: app tap X Y | app swipe X1 Y1 X2 Y2\n" }
+        let s = DispatchQueue.main.sync { VMSettings.current }
+        let vm = VirtualMachine.shared
+        let (x2, y2) = p.count == 4 ? (p[2], p[3]) : (p[0], p[1])
+        vm.touch(slot: 0, phase: 0, x: p[0], y: p[1], width: s.width, height: s.height)
+        for i in 1...10 where p.count == 4 {
+            usleep(30_000)
+            vm.touch(slot: 0, phase: 1, x: p[0] + (x2 - p[0]) * i / 10, y: p[1] + (y2 - p[1]) * i / 10, width: s.width, height: s.height)
+        }
+        usleep(50_000)
+        vm.touch(slot: 0, phase: 2, x: x2, y: y2, width: s.width, height: s.height)
+        return "touched\n"
+    }
 
     /// One QEMU monitor command over 127.0.0.1:4444; returns what QEMU printed.
     static func monitor(_ cmd: String) -> String {

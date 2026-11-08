@@ -6,6 +6,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         droid_bridge_raise_memory_limit()
         Log.info("launch: JIT available=\(droid_bridge_jit_available()) debugger=\(droid_bridge_debugger_attached())")
+        var vaTotal: Int32 = 0, vaLargest: Int32 = 0
+        droid_bridge_address_space(&vaTotal, &vaLargest)
+        Log.info("address space: \(vaTotal) GiB reservable, largest piece \(vaLargest) GiB, RAM \(ProcessInfo.processInfo.physicalMemory >> 30) GiB")
         return true
     }
 

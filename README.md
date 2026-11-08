@@ -9,7 +9,9 @@
 - **Android 17 with Google Play.** The official Android Emulator system image, downloaded from Google on first launch. It's never shipped with the app.
 - **Fast CPU emulation with JIT.** QEMU's code translator runs with JIT, which the bundled StikJIT helper enables through a loopback VPN. Without JIT, Oni falls back to a slower interpreter (TCTI).
 - **GPU acceleration.** Android's Vulkan and GLES rendering go through gfxstream to Vulkan, then MoltenVK, then Metal. App UI renders with Skia on Vulkan.
-- **Quick resume.** When you leave the app, Android's whole state (memory, devices and the GPU) is saved. The next launch continues where you left off instead of booting again.
+- **Quick resume.** Menu › Save & close saves Android's whole state (memory, devices and the GPU). The next launch continues where you left off instead of booting again. (iOS doesn't leave enough memory or GPU access to save in the background, so leaving the app just pauses Android.)
+- **ADB over Wi-Fi.** Settings › ADB over Wi-Fi, then `adb connect <iPhone IP>:5555` from a computer on the same network.
+- **Fits every iPhone.** Android's screen size and density follow the safe area, and Android rotates with the phone.
 - **Sound**, multitouch and hardware keyboards.
 - **iPhone sensors and GPS** passed through to Android.
 - **Shared folder.** Android's shared storage is mirrored to Files › On My iPhone › Oni › Android Storage.
@@ -76,6 +78,12 @@ You need an Apple Silicon Mac with Xcode, Rust (`rustup`), Python 3, Meson and N
 ## Experimental: Android without a virtual machine
 
 `userland/` holds **onirun**, a prototype that runs Android's own arm64 programs directly on the host. There's no virtual machine and no Linux kernel: a block translator copies Android code almost unchanged, and a Linux system-call layer runs on Darwin. On macOS it currently runs Android's shell, toybox, the unmodified `servicemanager` and ART (Android's Java runtime, with its JIT), with threads, binder IPC, system properties and many Android processes inside one host process, the way iOS needs it. See [userland/README.md](userland/README.md).
+
+## To do
+
+- **iPad support.** Test the layout and landscape on iPad, JIT pairing for iPad, and the iPad's address space for the VM-less engine.
+- **Android without a virtual machine on iOS.** iOS gives an app about 64 GiB of address space, less than Android's processes reserve together; see [userland/README.md](userland/README.md).
+- **Game performance.** Profile the CPU emulator and the GPU path with real games.
 
 ## Credits and licenses
 
